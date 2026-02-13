@@ -1,0 +1,8 @@
+[package]
+name = "mooodb"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+paste = "1.0.15"
+xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
