@@ -1,0 +1,15 @@
+edition = "2024"
+# # Maximum line width (adjust as you like)
+max_width = 120
+
+# Struct and tuple formatting
+struct_lit_width = 120      # keep struct literals on one line if <= 120 chars
+struct_variant_width = 120  # keep enum variants on one line if <= 120 chars
+enum_variant_width = 120    # same as above
+tuple_width = 120           # keep tuples on one line if <= 120 chars
+fn_args_layout = "Compressed"  # compress function arguments onto single line if possible
+fn_call_width = 120         # keep function calls on one line if <= 120 chars
+
+# # Other options
+# use_small_heuristics = "Max" # prevents small structs/enums from being split unnecessarily
+format_code_in_doc_comments = false

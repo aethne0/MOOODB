@@ -1,0 +1,30 @@
+#![allow(dead_code)]
+#![warn(clippy::pedantic)]
+#![warn(clippy::perf)]
+#![warn(unreachable_pub)]
+#![warn(clippy::redundant_clone)]
+#![warn(clippy::let_and_return)]
+#![warn(clippy::needless_pub_self)]
+#![allow(clippy::explicit_iter_loop)]
+#![allow(clippy::too_many_arguments)]
+#![allow(clippy::doc_markdown)]
+#![allow(clippy::cast_possible_truncation)]
+#![allow(clippy::struct_field_names)]
+
+//! • ▌ ▄ ·.                   ·▄▄▄▄  ▄▄▄▄·
+//! ·██ ▐███▪▪     ▪     ▪     ██▪ ██ ▐█ ▀█▪
+//! ▐█ ▌▐▌▐█· ▄█▀▄  ▄█▀▄  ▄█▀▄ ▐█· ▐█▌▐█▀▀█▄
+//! ██ ██▌▐█▌▐█▌.▐▌▐█▌.▐▌▐█▌.▐▌██. ██ ██▄▪▐█
+//! ▀▀  █▪▀▀▀ ▀█▄▀▪ ▀█▄▀▪ ▀█▄▀▪▀▀▀▀▀• ·▀▀▀▀
+//!
+//! **MOOODB** is a relational database management system
+
+pub(crate) const PAGE_SIZE: u16 = 4096;
+
+mod executor;
+mod storage;
+
+// TODO we are literally checksumming nothing
+// TODO we should have a checksum trait that the page-buffer can call at writeout/read-in etc
+//
+// TODO im an idiot the frame buffers have to be 4k aligned
