@@ -404,14 +404,14 @@ mod test {
     };
 
     pub fn hexdump(buf: &[u8; PAGE_SIZE]) {
-        // Only display the first 256 bytes for a 16x16 grid
         println!();
-        for (i, chunk) in buf[..256].chunks(16).enumerate() {
+        const CHUNK: usize = 32;
+        for (i, chunk) in buf[..PAGE_SIZE].chunks(CHUNK).enumerate() {
             // Print address/row offset
-            if i * 16 == PAGE_HEADER_SIZE {
+            if i * CHUNK == PAGE_HEADER_SIZE {
                 println!("*** end of header ***");
             }
-            print!("{:04x}: ", i * 16);
+            print!("{:04x}: ", i * CHUNK);
 
             // Print hex values
             for byte in chunk {
@@ -657,10 +657,11 @@ mod test {
 
         let mut rng = StdRng::seed_from_u64(seed);
 
-        let mut kvs: BTreeMap<[u8; 6], [u8; 6]> = BTreeMap::new();
+        let mut kvs: BTreeMap<Vec<u8>, Vec<u8>> = BTreeMap::new();
 
-        let mut key = [0u8; 6];
-        let mut val = [0u8; 6];
+        const MAX_LEN: usize = 128;
+        let mut key = Vec::with_capacity(MAX_LEN);
+        let mut val = Vec::with_capacity(MAX_LEN);
 
         for i in 0..1_000_000 {
             match rng.next_u32() % 1000 {
@@ -677,15 +678,17 @@ mod test {
                     let got_val = pg.get(k);
                     assert_some_eq!(got_val, v, "failed @ i={i} (get)");
                 }
-                400..750 => {
+                400..850 => {
                     // 25% to pick a key that already exists
                     let k = if (rng.next_u32() % 100) > 75 && pg.len() > 0 {
                         kvs.iter().choose(&mut rng).unwrap().0
                     } else {
+                        key.resize(rng.random_range(1..=MAX_LEN), 0);
                         rng.fill(&mut key);
                         &key
                     };
 
+                    val.resize(rng.random_range(1..=MAX_LEN), 0);
                     rng.fill(&mut val);
 
                     let res = pg.insert(k, &val);
@@ -693,7 +696,7 @@ mod test {
                         kvs.insert(k.clone(), val.clone());
                     }
                 }
-                750.. => {
+                850.. => {
                     if kvs.is_empty() {
                         continue;
                     }
@@ -724,6 +727,8 @@ mod test {
         }
 
         assert_eq!(pg.iter().count(), kvs.len());
+
+        hexdump(pg.raw);
     }
 
     use seq_macro::seq;
