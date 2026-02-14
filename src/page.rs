@@ -193,6 +193,7 @@ impl<'buffer> Page<'buffer> {
         self.set_upper_ptr(PAGE_HEADER_SIZE as u16);
         self.set_lower_ptr(PAGE_SIZE as u16 - 1);
         self.set_free(self.free_bytes_contig());
+        self.raw[PAGE_HEADER_SIZE..].fill(0); // TODO: remove this - it shouldnt be needed
     }
 
     pub(crate) fn compact(&mut self) {
@@ -203,7 +204,6 @@ impl<'buffer> Page<'buffer> {
         let cloned_page = Page::from_buffer(&mut cloned_raw);
 
         self.clear();
-        self.raw[PAGE_HEADER_SIZE..].fill(0); // TODO: remove this - it shouldnt be needed
 
         for (k, v) in cloned_page.iter() {
             // These are already sorted - this maintains sorted order and avoids another
@@ -663,8 +663,12 @@ mod test {
         let mut val = [0u8; 6];
 
         for i in 0..10_000_000 {
-            match rng.next_u32() % 100 {
-                0..30 => {
+            match rng.next_u32() % 1000 {
+                0..3 => {
+                    pg.clear();
+                    kvs.clear();
+                }
+                3..400 => {
                     if kvs.is_empty() {
                         continue;
                     }
@@ -673,7 +677,7 @@ mod test {
                     let got_val = pg.get(k);
                     assert_some_eq!(got_val, v, "failed @ i={i} (get)");
                 }
-                30..70 => {
+                400..750 => {
                     // 25% to pick a key that already exists
                     let k = if (rng.next_u32() % 100) > 75 && pg.len() > 0 {
                         kvs.iter().choose(&mut rng).unwrap().0
@@ -689,7 +693,7 @@ mod test {
                         kvs.insert(k.clone(), val.clone());
                     }
                 }
-                70.. => {
+                750.. => {
                     if kvs.is_empty() {
                         continue;
                     }
