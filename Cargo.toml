@@ -1,13 +1,15 @@
 [package]
-name = "mooodb"
+name = "mooo"
 version = "0.1.0"
 edition = "2024"
 
 [dependencies]
-paste = "1.0.15"
-xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
+libc = "=0.2.183"
+paste = "=1.0.15"
+tokio = { version = "=1.50.0", features = ["full"] }
+xxhash-rust = { version = "=0.8.15", features = ["xxh3"] }
 
 [dev-dependencies]
-claims = "0.8.0"
-rand = "0.10.0"
-seq-macro = "0.3.6"
+claims = "=0.8.0"
+rand = "=0.10.0"
+seq-macro = "=0.3.6"
