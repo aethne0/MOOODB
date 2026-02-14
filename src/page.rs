@@ -662,7 +662,7 @@ mod test {
         let mut key = [0u8; 6];
         let mut val = [0u8; 6];
 
-        for i in 0..10_000_000 {
+        for i in 0..1_000_000 {
             match rng.next_u32() % 1000 {
                 0..3 => {
                     pg.clear();
@@ -727,7 +727,7 @@ mod test {
     }
 
     use seq_macro::seq;
-    seq!(N in 1..=64 {
+    seq!(N in 1..=4096 {
         #[test]
         fn test_page_fuzzy_~N() {
             page_fuzzy_n(N);
