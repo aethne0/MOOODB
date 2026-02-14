@@ -1,35 +1,43 @@
-use crate::page::ByteOrder;
-
-macro_rules! impl_endian {
-    ($($t:ty),*) => {
-        $(
-            impl ByteOrder for $t {
-                #[inline(always)]
-                fn from_be(self) -> Self { <$t>::from_be(self) }
-                #[inline(always)]
-                fn to_be(self) -> Self { self.to_be() }
-            }
-        )*
-    };
-}
-
-impl_endian!(u16, u32, u64, i16, i32, i64, usize, isize);
-
 #[macro_export]
 macro_rules! define_page_fields {
     ($($field:ident, $type:ty, $offset:expr);* $(;)?) => {
-        $(
-            #[inline(always)]
-            pub(crate) fn $field(&self) -> $type {
-                self.read_value::<$type>($offset)
-            }
+        paste::paste! {
+            $(
+                #[inline(always)]
+                pub(crate) fn $field(&self) -> $type {
+                    // Assuming read_ methods follow a pattern like read_u16
+                    self.[<read_ $type>]($offset)
+                }
 
-            paste::paste! {
-            #[inline(always)]
-            pub(crate) fn [<set_ $field>](&mut self, value: $type) {
-                self.write_value::<$type>($offset, value);
-            }
-            }
-        )*
+                #[inline(always)]
+                pub(crate) fn [<set_ $field>](&mut self, value: $type) {
+                    self.[<write_$type>]($offset, value);
+                }
+            )*
+        }
+    };
+}
+
+#[macro_export]
+macro_rules! generate_primitive_accessors {
+    ($($t:ty),*) => {
+        paste::paste! {
+            $(
+                #[inline(always)]
+                pub(crate) fn [<read_ $t>](&self, offset: usize) -> $t {
+                    $t::from_be_bytes(
+                        self.raw[offset..offset + std::mem::size_of::<$t>()]
+                            .try_into()
+                            .unwrap(),
+                    )
+                }
+
+                #[inline(always)]
+                pub(crate) fn [<write_ $t>](&mut self, offset: usize, value: $t) {
+                    self.raw[offset..offset + std::mem::size_of::<$t>()]
+                        .copy_from_slice(&value.to_be_bytes());
+                }
+            )*
+        }
     };
 }

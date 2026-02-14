@@ -6,3 +6,7 @@ edition = "2024"
 [dependencies]
 paste = "1.0.15"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
+
+[dev-dependencies]
+claims = "0.8.0"
+rand = "0.10.0"
