@@ -662,18 +662,13 @@ mod test {
         let mut key = [0u8; 6];
         let mut val = [0u8; 6];
 
-        let start = 1_000_001;
-        // let start = 30;
-        for i in 0..1_000_000 {
-            if i >= start {
-                hexdump(pg.raw);
-            }
-
+        for i in 0..10_000_000 {
             match rng.next_u32() % 100 {
                 0..30 => {
                     if kvs.is_empty() {
                         continue;
                     }
+
                     let (k, v) = kvs.iter().choose(&mut rng).unwrap();
                     let got_val = pg.get(k);
                     assert_some_eq!(got_val, v, "failed @ i={i} (get)");
@@ -689,10 +684,6 @@ mod test {
 
                     rng.fill(&mut val);
 
-                    if i >= start {
-                        println!("\n{} insert: {:?} ({})", i, hexify(k), pg.len());
-                    }
-
                     let res = pg.insert(k, &val);
                     if res {
                         kvs.insert(k.clone(), val.clone());
@@ -702,10 +693,9 @@ mod test {
                     if kvs.is_empty() {
                         continue;
                     }
+
                     let k = kvs.iter().choose(&mut rng).unwrap().0.clone();
-                    if i >= start {
-                        println!("\n{} delete: {:?} ({})", i, hexify(&k), pg.len());
-                    }
+
                     pg.delete(&k);
                     let res = kvs.remove(&k);
                     assert_some!(res, "failed @ i={i} (delete)");
