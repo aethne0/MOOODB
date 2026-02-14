@@ -393,7 +393,7 @@ pub(crate) enum PageType {
 #[cfg(debug_assertions)]
 #[cfg(test)]
 mod test {
-    use std::collections::{HashMap, HashSet};
+    use std::collections::{BTreeMap, HashMap, HashSet};
 
     use claims::{assert_lt, assert_none, assert_some, assert_some_eq};
     use rand::{rngs::StdRng, seq::IteratorRandom, Rng, RngExt, SeedableRng};
@@ -657,7 +657,7 @@ mod test {
 
         let mut rng = StdRng::seed_from_u64(seed);
 
-        let mut kvs: HashMap<[u8; 6], [u8; 6]> = HashMap::new();
+        let mut kvs: BTreeMap<[u8; 6], [u8; 6]> = BTreeMap::new();
 
         let mut key = [0u8; 6];
         let mut val = [0u8; 6];
@@ -695,7 +695,7 @@ mod test {
 
                     let res = pg.insert(k, &val);
                     if res {
-                        kvs.insert(key.clone(), val.clone());
+                        kvs.insert(k.clone(), val.clone());
                     }
                 }
                 70.. => {
