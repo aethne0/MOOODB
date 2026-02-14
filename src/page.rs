@@ -193,7 +193,7 @@ impl<'buffer> Page<'buffer> {
         self.set_upper_ptr(PAGE_HEADER_SIZE as u16);
         self.set_lower_ptr(PAGE_SIZE as u16 - 1);
         self.set_free(self.free_bytes_contig());
-        self.raw[PAGE_HEADER_SIZE..].fill(0); // TODO: remove this - it shouldnt be needed
+        self.raw[PAGE_HEADER_SIZE..].fill(0); // TODO remove this - it shouldnt be needed
     }
 
     pub(crate) fn compact(&mut self) {
