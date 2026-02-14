@@ -10,3 +10,4 @@ xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 [dev-dependencies]
 claims = "0.8.0"
 rand = "0.10.0"
+seq-macro = "0.3.6"

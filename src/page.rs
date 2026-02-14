@@ -59,11 +59,6 @@ impl<'buffer> Page<'buffer> {
         self.clear()
     }
 
-    #[cfg(debug_assertions)]
-    pub(crate) fn get_raw(&self) -> &[u8; PAGE_SIZE] {
-        return self.raw;
-    }
-
     /// Computes the checksum but does not write it to page - must call set_checksum as well
     pub(crate) fn compute_checksum(&mut self) -> u64 {
         assert!(!self.is_free());
@@ -171,6 +166,8 @@ impl<'buffer> Page<'buffer> {
         }
     }
 
+    // TODO redo these or use byteorder/zerocopy - this is too error prone if we try to modify the
+    // array outside of just copying, because this will interpret the u16s as native-endian
     #[inline(always)]
     fn slot_array(&self) -> &[u16] {
         let slot_cnt = self.len() as usize;
@@ -180,6 +177,7 @@ impl<'buffer> Page<'buffer> {
         }
     }
 
+    // TODO same comment
     #[inline(always)]
     fn slot_array_mut(&mut self, reserve: usize) -> &mut [u16] {
         let slot_cnt = self.len() as usize;
@@ -205,6 +203,7 @@ impl<'buffer> Page<'buffer> {
         let cloned_page = Page::from_buffer(&mut cloned_raw);
 
         self.clear();
+        self.raw[PAGE_HEADER_SIZE..].fill(0); // TODO: remove this - it shouldnt be needed
 
         for (k, v) in cloned_page.iter() {
             // These are already sorted - this maintains sorted order and avoids another
@@ -241,6 +240,7 @@ impl<'buffer> Page<'buffer> {
 
             let slots = self.slot_array_mut(0);
             slots.copy_within(1 + slot_index as usize.., slot_index as usize);
+            // CAREFUL of the following - its endian naive! We are only ok doing this for 0!
             *slots.last_mut().unwrap() = 0; // zero the (now) trailing slot
 
             self.set_upper_ptr(self.upper_ptr() - size_of::<u16>() as u16);
@@ -259,14 +259,51 @@ impl<'buffer> Page<'buffer> {
         Ok(entry_len)
     }
 
-    fn insert_at_slot(&mut self, entry_len: u16, slot_index: u16, key: &[u8], val: &[u8]) {
+    /// Returns whether or not there was enough space.
+    /// If there was not then no changes were made.
+    fn insert_internal(&mut self, key: &[u8], val: &[u8], ordered: bool) -> bool {
+        assert!(!self.is_free());
+
+        let entry_len = match self.has_space(key, val) {
+            Err(_) => {
+                return false;
+            }
+            Ok(entry_len) => entry_len,
+        };
+
         // If we don't have enough contiguous free space, but we know we have enough free
         // space overall, then we will perform a compaction
+        // TODO: this is very slightly wrong (pessimistic), because it doesnt take into
+        // consideration an existing key that may be replaced by this operation
         if self.free_bytes_contig() < (entry_len + SLOT_SIZE)
             && self.free() >= (entry_len + SLOT_SIZE)
         {
             self.compact();
         }
+
+        // from here forward we know we have enough space in our free segment to insert
+
+        let mut should_increment_slot_ptr = true;
+        let slot_index = if ordered {
+            match self.find_key_slot(key) {
+                SearchResult::Found(slot_index) => {
+                    should_increment_slot_ptr = false;
+                    slot_index
+                }
+                SearchResult::NotFound(slot_index) => {
+                    let slots = self.slot_array_mut(1);
+                    slots.copy_within(
+                        slot_index as usize..slots.len() - 1,
+                        slot_index as usize + 1,
+                    );
+                    slot_index
+                }
+                _ => self.len(), // we are after all existing entries, so append
+            }
+        } else {
+            // TODO: if we are inserting unordered we should still check for key's existence...
+            self.len()
+        };
 
         let mut offset = (self.lower_ptr() - entry_len + 1) as usize;
         self.write_slot(slot_index, offset as u16);
@@ -280,55 +317,23 @@ impl<'buffer> Page<'buffer> {
         offset += size_of::<u16>();
         self.raw[offset..offset + val.len()].copy_from_slice(val);
 
-        self.set_upper_ptr(self.upper_ptr() + SLOT_SIZE);
+        if should_increment_slot_ptr {
+            self.set_upper_ptr(self.upper_ptr() + SLOT_SIZE);
+        }
         self.set_lower_ptr(self.lower_ptr() - entry_len);
         self.set_free(self.free() - entry_len - SLOT_SIZE);
+
+        true
     }
 
-    /// Returns whether or not there was enough space.
-    /// If there was not then no changes were made.
+    #[inline(always)]
     pub(crate) fn insert(&mut self, key: &[u8], val: &[u8]) -> bool {
-        assert!(self.is_inner() || self.is_leaf());
-
-        let entry_len = match self.has_space(key, val) {
-            Err(_) => {
-                return false;
-            }
-            Ok(entry_len) => entry_len,
-        };
-
-        // from here forward we know we have enough space in our free segment to insert
-
-        let slot_index = match self.find_key_slot(key) {
-            SearchResult::Found(slot_index) | SearchResult::NotFound(slot_index) => {
-                let slots = self.slot_array_mut(1);
-                slots.copy_within(
-                    slot_index as usize..slots.len() - 1,
-                    slot_index as usize + 1,
-                );
-                slot_index
-            }
-            _ => self.len(), // we are after all existing entries, so append
-        };
-
-        self.insert_at_slot(entry_len, slot_index, key, val);
-        true
+        self.insert_internal(key, val, true)
     }
 
-    /// Inserts by appending to end of slot list - used for heap pages.
+    #[inline(always)]
     pub(crate) fn insert_unordered(&mut self, key: &[u8], val: &[u8]) -> bool {
-        assert!(!self.is_free());
-
-        let entry_len = match self.has_space(key, val) {
-            Err(_) => {
-                return false;
-            }
-            Ok(entry_len) => entry_len,
-        };
-
-        let slot_index = self.len();
-        self.insert_at_slot(entry_len, slot_index, key, val);
-        true
+        self.insert_internal(key, val, false)
     }
 }
 
@@ -379,50 +384,73 @@ pub(crate) enum PageType {
     Heap = 0x3,
 }
 
-// ▄▄▄▄▄▄▄▄ ..▄▄ · ▄▄▄▄▄.▄▄ · 
-// •██  ▀▄.▀·▐█ ▀. •██  ▐█ ▀. 
+// ▄▄▄▄▄▄▄▄ ..▄▄ · ▄▄▄▄▄.▄▄ ·
+// •██  ▀▄.▀·▐█ ▀. •██  ▐█ ▀.
 //  ▐█.▪▐▀▀▪▄▄▀▀▀█▄ ▐█.▪▄▀▀▀█▄
 //  ▐█▌·▐█▄▄▌▐█▄▪▐█ ▐█▌·▐█▄▪▐█
 //  ▀▀▀  ▀▀▀  ▀▀▀▀  ▀▀▀  ▀▀▀▀
-
-#[cfg(debug_assertions)]
-pub fn hex(buf: &[u8; PAGE_SIZE]) {
-    // Only display the first 256 bytes for a 16x16 grid
-    println!();
-    for (i, chunk) in buf[..256].chunks(16).enumerate() {
-        // Print address/row offset
-        print!("{:04x}: ", i * 16);
-
-        // Print hex values
-        for byte in chunk {
-            print!("{:02x} ", byte);
-        }
-
-        // Print ASCII representation
-        print!(" | ");
-        for &byte in chunk {
-            if byte.is_ascii_graphic() || byte == b' ' {
-                print!("{}", byte as char);
-            } else {
-                print!(".");
-            }
-        }
-        println!();
-    }
-}
 
 #[cfg(debug_assertions)]
 #[cfg(test)]
 mod test {
     use std::collections::{HashMap, HashSet};
 
-    use claims::{assert_lt, assert_none};
-    use rand::{rngs::StdRng, RngExt, SeedableRng};
+    use claims::{assert_lt, assert_none, assert_some, assert_some_eq};
+    use rand::{rngs::StdRng, seq::IteratorRandom, Rng, RngExt, SeedableRng};
 
     use crate::{
         page::{Page, PageType, PAGE_HEADER_SIZE},
         PAGE_SIZE,
     };
+
+    pub fn hexdump(buf: &[u8; PAGE_SIZE]) {
+        // Only display the first 256 bytes for a 16x16 grid
+        println!();
+        for (i, chunk) in buf[..256].chunks(16).enumerate() {
+            // Print address/row offset
+            if i * 16 == PAGE_HEADER_SIZE {
+                println!("*** end of header ***");
+            }
+            print!("{:04x}: ", i * 16);
+
+            // Print hex values
+            for byte in chunk {
+                print!("{:02x} ", byte);
+            }
+
+            // Print ASCII representation
+            print!(" | ");
+            for &byte in chunk {
+                if byte.is_ascii_graphic() || byte == b' ' {
+                    print!("{}", byte as char);
+                } else {
+                    print!(".");
+                }
+            }
+            println!();
+        }
+    }
+
+    pub fn hexify(bytes: &[u8]) -> String {
+        if bytes.is_empty() {
+            return String::new();
+        }
+
+        // Pre-allocate exactly the space needed:
+        // 2 chars per byte + 1 space between each (total bytes * 3 - 1)
+        let mut s = String::with_capacity(bytes.len() * 3);
+
+        for (i, byte) in bytes.iter().enumerate() {
+            if i > 0 {
+                s.push(' ');
+            }
+            // {:02x} = hex, 2 digits, zero-padded
+            use std::fmt::Write;
+            write!(s, "{:02x}", byte).unwrap();
+        }
+
+        s
+    }
 
     #[test]
     fn test_page_insert_get() {
@@ -459,7 +487,7 @@ mod test {
         }
 
         let mut buffer2 = [0u8; PAGE_SIZE];
-        buffer2.copy_from_slice(the_page.get_raw());
+        buffer2.copy_from_slice(the_page.raw);
         let mut the_other_page = Page::from_buffer(&mut buffer2);
         the_other_page.compact();
 
@@ -487,7 +515,7 @@ mod test {
             }
         }
 
-        let mut buffer2 = the_page.get_raw().clone();
+        let mut buffer2 = the_page.raw.clone();
         let the_other_page = Page::from_buffer(&mut buffer2);
 
         for (k, _) in the_other_page.iter() {
@@ -615,7 +643,6 @@ mod test {
             kvs.push((key.clone(), val.clone()));
         }
 
-        // make sure theyre sorted
         for ((k1, v1), (k2, v2)) in the_page.iter().zip(&kvs) {
             assert_eq!(k1, k2);
             assert_eq!(v1, v2);
@@ -623,4 +650,93 @@ mod test {
 
         assert_eq!(the_page.iter().count(), kvs.len());
     }
+
+    fn page_fuzzy_n(seed: u64) {
+        let mut buffer = [0u8; PAGE_SIZE];
+        let mut pg = Page::new_with_buffer(&mut buffer, 2, PageType::Leaf, 1, 3);
+
+        let mut rng = StdRng::seed_from_u64(seed);
+
+        let mut kvs: HashMap<[u8; 6], [u8; 6]> = HashMap::new();
+
+        let mut key = [0u8; 6];
+        let mut val = [0u8; 6];
+
+        let start = 1_000_001;
+        // let start = 30;
+        for i in 0..1_000_000 {
+            if i >= start {
+                hexdump(pg.raw);
+            }
+
+            match rng.next_u32() % 100 {
+                0..30 => {
+                    if kvs.is_empty() {
+                        continue;
+                    }
+                    let (k, v) = kvs.iter().choose(&mut rng).unwrap();
+                    let got_val = pg.get(k);
+                    assert_some_eq!(got_val, v, "failed @ i={i} (get)");
+                }
+                30..70 => {
+                    // 25% to pick a key that already exists
+                    let k = if (rng.next_u32() % 100) > 75 && pg.len() > 0 {
+                        kvs.iter().choose(&mut rng).unwrap().0
+                    } else {
+                        rng.fill(&mut key);
+                        &key
+                    };
+
+                    rng.fill(&mut val);
+
+                    if i >= start {
+                        println!("\n{} insert: {:?} ({})", i, hexify(k), pg.len());
+                    }
+
+                    let res = pg.insert(k, &val);
+                    if res {
+                        kvs.insert(key.clone(), val.clone());
+                    }
+                }
+                70.. => {
+                    if kvs.is_empty() {
+                        continue;
+                    }
+                    let k = kvs.iter().choose(&mut rng).unwrap().0.clone();
+                    if i >= start {
+                        println!("\n{} delete: {:?} ({})", i, hexify(&k), pg.len());
+                    }
+                    pg.delete(&k);
+                    let res = kvs.remove(&k);
+                    assert_some!(res, "failed @ i={i} (delete)");
+                }
+            }
+        }
+
+        // make sure theyre sorted
+        let mut prev = None;
+        for (k, v) in pg.iter() {
+            assert_eq!(v, kvs.get(k).unwrap());
+            if let Some(prev) = prev {
+                assert_lt!(prev, k);
+            }
+            prev = Some(k);
+        }
+
+        // check contents
+        for ((k1, v1), (k2, v2)) in pg.iter().zip(&kvs) {
+            assert_eq!(k1, k2);
+            assert_eq!(v1, v2);
+        }
+
+        assert_eq!(pg.iter().count(), kvs.len());
+    }
+
+    use seq_macro::seq;
+    seq!(N in 1..=64 {
+        #[test]
+        fn test_page_fuzzy_~N() {
+            page_fuzzy_n(N);
+        }
+    });
 }
