@@ -727,8 +727,6 @@ mod test {
         }
 
         assert_eq!(pg.iter().count(), kvs.len());
-
-        hexdump(pg.raw);
     }
 
     use seq_macro::seq;
