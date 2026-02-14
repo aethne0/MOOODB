@@ -1,5 +1,5 @@
 #[macro_export]
-macro_rules! define_page_fields {
+macro_rules! page_fields {
     ($($field:ident, $type:ty, $offset:expr);* $(;)?) => {
         paste::paste! {
             $(
@@ -19,7 +19,7 @@ macro_rules! define_page_fields {
 }
 
 #[macro_export]
-macro_rules! generate_primitive_accessors {
+macro_rules! accessors {
     ($($t:ty),*) => {
         paste::paste! {
             $(

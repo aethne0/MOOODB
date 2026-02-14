@@ -1,10 +1,9 @@
-use std::mem::MaybeUninit;
-
 use xxhash_rust::xxh3;
 
 use crate::{
-    define_page_fields, generate_primitive_accessors,
+    accessors,
     page::{PAGE_HEADER_SIZE, PAGE_SIZE},
+    page_fields,
 };
 
 // NOTE: terminology used
@@ -26,13 +25,31 @@ use crate::{
 // Entries are of the format:
 // [key_len_u16]:[key_bytes]:[val_len_u16]:[val_bytes]
 
+const SLOT_SIZE: u16 = 2;
+
 pub(crate) struct Page<'buffer> {
     raw: &'buffer mut [u8; PAGE_SIZE],
 }
 
 impl<'buffer> Page<'buffer> {
-    generate_primitive_accessors!(u8, u16, u64);
+    accessors!(u8, u16, u64);
 
+    #[rustfmt::skip]
+    page_fields! {
+        checksum,   u64,        0x00;  // This should be first so we can checksum the rest easily
+        page_id,    u64,        0x08;
+        page_type,  u8,         0x10;
+
+        parent,     u64,        0x20;
+        right,      u64,        0x28;
+
+        upper_ptr,  u16,        0x30;  // pointer to end of slots
+        lower_ptr,  u16,        0x32;  // pointer to top of values
+        free,       u16,        0x34;  // total (non-contiguous) free bytes
+    } // None should be over 0x40 - header is 64 bytes large
+
+    /// This creates a page out of an existing buffer, which only involves setting the raw
+    /// fat-pointer to the buffer.
     pub(crate) fn from_buffer(buffer: &'buffer mut [u8; PAGE_SIZE]) -> Self {
         Self { raw: buffer }
     }
@@ -44,9 +61,9 @@ impl<'buffer> Page<'buffer> {
         parent: u64,
         right: u64,
     ) -> Self {
-        let mut p = Self { raw: buffer };
-        p.initialize(page_id, page_type, parent, right);
-        p
+        let mut page = Self { raw: buffer };
+        page.initialize(page_id, page_type, parent, right);
+        page
     }
 
     pub(crate) fn initialize(
@@ -64,20 +81,6 @@ impl<'buffer> Page<'buffer> {
         self.clear()
     }
 
-    #[rustfmt::skip]
-    define_page_fields! {
-        checksum,   u64,        0x00;  // This should be first so we can checksum the rest easily
-        page_id,    u64,        0x08;
-        page_type,  u8,         0x10;
-
-        parent,     u64,        0x20;
-        right,      u64,        0x28;
-
-        upper_ptr,  u16,        0x30;  // pointer to end of slots
-        lower_ptr,  u16,        0x32;  // pointer to top of values
-        free,       u16,        0x34;  // total (non-contiguous) free bytes
-    } // None should be over 0x40 - header is 64 bytes large
-
     #[cfg(debug_assertions)]
     pub(crate) fn get_raw(&self) -> &[u8; PAGE_SIZE] {
         return self.raw;
@@ -85,6 +88,7 @@ impl<'buffer> Page<'buffer> {
 
     /// Computes the checksum but does not write it to page - must call set_checksum as well
     pub(crate) fn compute_checksum(&mut self) -> u64 {
+        assert!(!self.is_free());
         xxh3::xxh3_64(&self.raw[8..]) // 8.. because we dont want to checksum the checksum
     }
 
@@ -114,10 +118,6 @@ impl<'buffer> Page<'buffer> {
         self.page_type() == PageType::Heap as u8
     }
 
-    pub(crate) fn is_root(&self) -> bool {
-        self.page_type() == PageType::Root as u8
-    }
-
     #[inline(always)]
     fn write_slot(&mut self, slot_index: u16, value: u16) {
         let offset = PAGE_HEADER_SIZE + slot_index as usize * size_of::<u16>();
@@ -130,6 +130,7 @@ impl<'buffer> Page<'buffer> {
     }
 
     fn key_at_slot(&self, slot_index: u16) -> &[u8] {
+        assert!(!self.is_free());
         assert!(slot_index < self.len());
 
         let offset = self.offset_from_slot(slot_index);
@@ -140,6 +141,7 @@ impl<'buffer> Page<'buffer> {
     }
 
     fn key_val_at_slot(&self, slot_index: u16) -> (&[u8], &[u8]) {
+        assert!(!self.is_free());
         assert!(slot_index < self.len());
 
         let offset = self.offset_from_slot(slot_index);
@@ -157,6 +159,7 @@ impl<'buffer> Page<'buffer> {
 
     /// Returns slot-index of first element not-less-than the search key (left-most that is GE)
     fn find_key_slot(&self, key: &[u8]) -> SearchResult {
+        assert!(self.is_inner() || self.is_leaf());
         assert!(key.len() < u16::MAX as usize, "passed search key too large");
 
         if self.len() == 0 {
@@ -210,32 +213,30 @@ impl<'buffer> Page<'buffer> {
     }
 
     fn clear(&mut self) {
+        assert!(!self.is_free());
         self.set_upper_ptr(PAGE_HEADER_SIZE as u16);
         self.set_lower_ptr(PAGE_SIZE as u16 - 1);
         self.set_free(self.free_bytes_contig());
     }
 
-    fn compact(&mut self) {
-        let cloned_page = {
-            let mut scratch: [MaybeUninit<u8>; PAGE_SIZE] =
-                unsafe { MaybeUninit::uninit().assume_init() };
-            let scratch_slice: &mut [u8; PAGE_SIZE] = unsafe {
-                std::slice::from_raw_parts_mut(scratch.as_mut_ptr() as *mut u8, PAGE_SIZE)
-                    .try_into()
-                    .unwrap()
-            };
-            scratch_slice.copy_from_slice(self.raw);
-            Page::from_buffer(scratch_slice)
-        };
+    pub(crate) fn compact(&mut self) {
+        assert!(!self.is_free());
+
+        // clone page to stack-allocated scratch space
+        let mut cloned_raw = self.raw.clone();
+        let cloned_page = Page::from_buffer(&mut cloned_raw);
 
         self.clear();
-        // self.raw[PAGE_HEADER_SIZE..PAGE_SIZE].fill(0);
+
         for (k, v) in cloned_page.iter() {
-            self.insert(k, v);
+            // These are already sorted - this maintains sorted order and avoids another
+            // binary search per insertion.
+            self.insert_unordered(k, v);
         }
     }
 
     pub(crate) fn iter<'a>(&'a self) -> PageIterator<'a> {
+        assert!(!self.is_free());
         PageIterator {
             page: self,
             slot_index: 0,
@@ -243,6 +244,8 @@ impl<'buffer> Page<'buffer> {
     }
 
     pub(crate) fn get(&self, key: &[u8]) -> Option<&[u8]> {
+        assert!(!self.is_free());
+
         match self.find_key_slot(key) {
             SearchResult::Found(slot_index) => Some(self.key_val_at_slot(slot_index).1),
             _ => None,
@@ -250,6 +253,8 @@ impl<'buffer> Page<'buffer> {
     }
 
     pub(crate) fn delete(&mut self, key: &[u8]) {
+        assert!(!self.is_free());
+
         if let SearchResult::Found(slot_index) = self.find_key_slot(key) {
             // delete slot index, recompact slot array, adjust upper pointer, adjust free counter
 
@@ -266,26 +271,53 @@ impl<'buffer> Page<'buffer> {
         }
     }
 
-    /// Returns whether or not there was enough space.
-    /// If there was not then no changes were made.
-    pub(crate) fn insert(&mut self, key: &[u8], val: &[u8]) -> bool {
-        let slot_size = size_of::<u16>() as u16;
-
-        let entry_len = 2 * size_of::<u16>() + key.len() + val.len();
-        assert!(entry_len < (u16::MAX - slot_size) as usize);
+    fn has_space(&self, key: &[u8], val: &[u8]) -> Result<u16, ()> {
+        let entry_len = size_of::<u16>() * 2 + val.len() + key.len();
+        assert!((entry_len + SLOT_SIZE as usize) < (u16::MAX as usize));
         let entry_len = entry_len as u16;
-
-        if entry_len + slot_size > self.free() {
-            return false;
+        if entry_len + SLOT_SIZE > self.free() {
+            return Err(());
         }
+        Ok(entry_len)
+    }
 
+    fn insert_at_slot(&mut self, entry_len: u16, slot_index: u16, key: &[u8], val: &[u8]) {
         // If we don't have enough contiguous free space, but we know we have enough free
         // space overall, then we will perform a compaction
-        if self.free_bytes_contig() < (entry_len + slot_size)
-            && self.free() >= (entry_len + slot_size)
+        if self.free_bytes_contig() < (entry_len + SLOT_SIZE)
+            && self.free() >= (entry_len + SLOT_SIZE)
         {
             self.compact();
         }
+
+        let mut offset = (self.lower_ptr() - entry_len + 1) as usize;
+        self.write_slot(slot_index, offset as u16);
+
+        // write actual entry
+        self.write_u16(offset as usize, key.len() as u16);
+        offset += size_of::<u16>();
+        self.raw[offset..offset + key.len()].copy_from_slice(key);
+        offset += key.len();
+        self.write_u16(offset as usize, val.len() as u16);
+        offset += size_of::<u16>();
+        self.raw[offset..offset + val.len()].copy_from_slice(val);
+
+        self.set_upper_ptr(self.upper_ptr() + SLOT_SIZE);
+        self.set_lower_ptr(self.lower_ptr() - entry_len);
+        self.set_free(self.free() - entry_len - SLOT_SIZE);
+    }
+
+    /// Returns whether or not there was enough space.
+    /// If there was not then no changes were made.
+    pub(crate) fn insert(&mut self, key: &[u8], val: &[u8]) -> bool {
+        assert!(self.is_inner() || self.is_leaf());
+
+        let entry_len = match self.has_space(key, val) {
+            Err(_) => {
+                return false;
+            }
+            Ok(entry_len) => entry_len,
+        };
 
         // from here forward we know we have enough space in our free segment to insert
 
@@ -301,22 +333,23 @@ impl<'buffer> Page<'buffer> {
             _ => self.len(), // we are after all existing entries, so append
         };
 
-        let mut offset = (self.lower_ptr() - entry_len + 1) as usize;
-        self.write_slot(slot_index, offset as u16);
+        self.insert_at_slot(entry_len, slot_index, key, val);
+        true
+    }
 
-        // write actual entry
-        self.write_u16(offset as usize, key.len() as u16);
-        offset += size_of::<u16>();
-        self.raw[offset..offset + key.len()].copy_from_slice(key);
-        offset += key.len();
-        self.write_u16(offset as usize, val.len() as u16);
-        offset += size_of::<u16>();
-        self.raw[offset..offset + val.len()].copy_from_slice(val);
+    /// Inserts by appending to end of slot list - used for heap pages.
+    pub(crate) fn insert_unordered(&mut self, key: &[u8], val: &[u8]) -> bool {
+        assert!(!self.is_free());
 
-        self.set_upper_ptr(self.upper_ptr() + slot_size);
-        self.set_lower_ptr(self.lower_ptr() - entry_len);
-        self.set_free(self.free() - entry_len - slot_size);
+        let entry_len = match self.has_space(key, val) {
+            Err(_) => {
+                return false;
+            }
+            Ok(entry_len) => entry_len,
+        };
 
+        let slot_index = self.len();
+        self.insert_at_slot(entry_len, slot_index, key, val);
         true
     }
 }
@@ -345,10 +378,7 @@ impl<'a> IntoIterator for &'a Page<'a> {
     type IntoIter = PageIterator<'a>;
 
     fn into_iter(self) -> Self::IntoIter {
-        PageIterator {
-            page: self,
-            slot_index: 0,
-        }
+        self.iter()
     }
 }
 
@@ -368,6 +398,5 @@ pub(crate) enum PageType {
     Free = 0x0,
     Leaf = 0x1,
     Inner = 0x2,
-    Root = 0x3,
-    Heap = 0x4,
+    Heap = 0x3,
 }

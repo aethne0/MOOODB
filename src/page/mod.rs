@@ -34,6 +34,7 @@ pub fn hex(buf: &[u8; PAGE_SIZE]) {
     }
 }
 
+#[cfg(debug_assertions)]
 #[cfg(test)]
 mod test {
     use std::collections::{HashMap, HashSet};
@@ -41,7 +42,7 @@ mod test {
     use claims::{assert_lt, assert_none};
     use rand::{rngs::StdRng, RngExt, SeedableRng};
 
-    use crate::page::{page::PageType, Page, PAGE_SIZE};
+    use crate::page::{page::PageType, Page, PAGE_HEADER_SIZE, PAGE_SIZE};
 
     #[test]
     fn test_page_insert_get() {
@@ -57,6 +58,68 @@ mod test {
         let got = p.get(&key);
 
         assert_eq!(got, Some(&val[..]));
+    }
+
+    #[test]
+    fn test_page_compaction_stable() {
+        let mut buffer = [0u8; PAGE_SIZE];
+        let mut the_page = Page::new_with_buffer(&mut buffer, 2, PageType::Leaf, 1, 3);
+
+        let mut rng = StdRng::seed_from_u64(0);
+
+        let mut key = [0u8; 6];
+        let mut val = [0u8; 6];
+
+        for _ in 0..16 {
+            rng.fill(&mut key);
+            rng.fill(&mut val);
+            if !the_page.insert(&key, &val) {
+                break;
+            }
+        }
+
+        let mut buffer2 = [0u8; PAGE_SIZE];
+        buffer2.copy_from_slice(the_page.get_raw());
+        let mut the_other_page = Page::from_buffer(&mut buffer2);
+        the_other_page.compact();
+
+        for ((k1, v1), (k2, v2)) in the_page.iter().zip(the_other_page.iter()) {
+            assert_eq!(k1, k2);
+            assert_eq!(v1, v2);
+        }
+    }
+
+    #[test]
+    fn test_page_compaction_frees() {
+        let mut buffer = [0u8; PAGE_SIZE];
+        let mut the_page = Page::new_with_buffer(&mut buffer, 2, PageType::Leaf, 1, 3);
+
+        let mut rng = StdRng::seed_from_u64(0);
+
+        let mut key = [0u8; 6];
+        let mut val = [0u8; 6];
+
+        for _ in 0..16 {
+            rng.fill(&mut key);
+            rng.fill(&mut val);
+            if !the_page.insert(&key, &val) {
+                break;
+            }
+        }
+
+        let mut buffer2 = the_page.get_raw().clone();
+        let the_other_page = Page::from_buffer(&mut buffer2);
+
+        for (k, _) in the_other_page.iter() {
+            the_page.delete(k);
+        }
+
+        the_page.compact();
+
+        assert_eq!(
+            the_page.free_bytes_contig(),
+            (PAGE_SIZE - PAGE_HEADER_SIZE) as u16
+        );
     }
 
     #[test]
@@ -143,6 +206,39 @@ mod test {
                 assert_lt!(prev, k);
             }
             prev = Some(k);
+        }
+
+        assert_eq!(the_page.iter().count(), kvs.len());
+    }
+
+    #[test]
+    fn test_page_insert_many_unordered() {
+        let mut buffer = [0u8; PAGE_SIZE];
+        let mut the_page = Page::new_with_buffer(&mut buffer, 2, PageType::Heap, 1, 3);
+
+        let mut rng = StdRng::seed_from_u64(0);
+
+        let mut kvs = vec![];
+
+        let mut key = [0u8; 6];
+        let mut val = [0u8; 6];
+
+        loop {
+            rng.fill(&mut key);
+            rng.fill(&mut val);
+
+            let res = the_page.insert_unordered(&key, &val);
+            if !res {
+                break;
+            }
+
+            kvs.push((key.clone(), val.clone()));
+        }
+
+        // make sure theyre sorted
+        for ((k1, v1), (k2, v2)) in the_page.iter().zip(&kvs) {
+            assert_eq!(k1, k2);
+            assert_eq!(v1, v2);
         }
 
         assert_eq!(the_page.iter().count(), kvs.len());
