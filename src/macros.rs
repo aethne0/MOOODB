@@ -23,8 +23,10 @@ macro_rules! accessors {
     ($($t:ty),*) => {
         paste::paste! {
             $(
+                /// Handles endianness
                 #[inline(always)]
-                pub(crate) fn [<read_ $t>](&self, offset: usize) -> $t {
+                pub(crate) fn [<read_ $t>](&self, offset: u16) -> $t {
+                    let offset = offset as usize;
                     $t::from_be_bytes(
                         self.raw[offset..offset + std::mem::size_of::<$t>()]
                             .try_into()
@@ -32,8 +34,10 @@ macro_rules! accessors {
                     )
                 }
 
+                /// Handles endianness
                 #[inline(always)]
-                pub(crate) fn [<write_ $t>](&mut self, offset: usize, value: $t) {
+                pub(crate) fn [<write_ $t>](&mut self, offset: u16, value: $t) {
+                    let offset = offset as usize;
                     self.raw[offset..offset + std::mem::size_of::<$t>()]
                         .copy_from_slice(&value.to_be_bytes());
                 }
