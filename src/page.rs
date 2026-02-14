@@ -390,7 +390,6 @@ pub(crate) enum PageType {
 //  ▐█▌·▐█▄▄▌▐█▄▪▐█ ▐█▌·▐█▄▪▐█
 //  ▀▀▀  ▀▀▀  ▀▀▀▀  ▀▀▀  ▀▀▀▀
 
-#[cfg(debug_assertions)]
 #[cfg(test)]
 mod test {
     use std::collections::{BTreeMap, HashMap, HashSet};
