@@ -662,7 +662,7 @@ mod test {
         let mut key = Vec::with_capacity(MAX_LEN);
         let mut val = Vec::with_capacity(MAX_LEN);
 
-        for i in 0..1_000_000 {
+        for i in 0..20_000_000 {
             match rng.next_u32() % 1000 {
                 0..3 => {
                     pg.clear();
