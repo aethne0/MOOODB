@@ -11,3 +11,4 @@ mod page;
 mod pager;
 
 pub(crate) const PAGE_SIZE: usize = 0x1000;
+
