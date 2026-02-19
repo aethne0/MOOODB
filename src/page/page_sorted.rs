@@ -32,13 +32,16 @@ impl<'buffer> PageSorted<'buffer> {
         self.clear_entries();
     }
 
+    #[inline(always)]
+    pub(crate) fn is_inner(&self) -> bool {
+        self.page_type() == PageType::Inner as u8
+    }
+
+    #[inline(always)]
     pub(crate) fn is_leaf(&self) -> bool {
         self.page_type() == PageType::Leaf as u8
     }
 
-    pub(crate) fn is_inner(&self) -> bool {
-        self.page_type() == PageType::Inner as u8
-    }
 
     fn key_at_slot(&self, slot_index: u16) -> &[u8] {
         assert!(!self.is_free());

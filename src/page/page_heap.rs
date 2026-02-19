@@ -24,6 +24,11 @@ impl<'buffer> PageHeap<'buffer> {
         page
     }
 
+    #[inline(always)]
+    pub(crate) fn is_heap(&self) -> bool {
+        self.page_type() == PageType::Heap as u8
+    }
+
     pub(crate) fn clear(&mut self) {
         assert!(self.is_heap());
         self.clear_entries();

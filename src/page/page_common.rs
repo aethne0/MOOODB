@@ -45,6 +45,11 @@ impl<'buffer> PageCommon<'buffer> {
     }
 
     #[inline(always)]
+    pub(crate) fn is_free(&self) -> bool {
+        self.page_type() == PageType::Free as u8
+    }
+
+    #[inline(always)]
     fn slots_range(&self) -> (Bound<usize>, Bound<usize>) {
         let start = PAGE_HEADER_SIZE;
         let end = PAGE_HEADER_SIZE + self.len() * SLOT_SIZE;
@@ -91,16 +96,6 @@ impl<'buffer> PageCommon<'buffer> {
     pub(crate) fn len(&self) -> u16 {
         assert!(self.upper_ptr() >= PAGE_HEADER_SIZE as u16);
         (self.upper_ptr() - PAGE_HEADER_SIZE) / SLOT_SIZE
-    }
-
-    #[inline(always)]
-    pub(crate) fn is_free(&self) -> bool {
-        self.page_type() == PageType::Free as u8
-    }
-
-    #[inline(always)]
-    pub(crate) fn is_heap(&self) -> bool {
-        self.page_type() == PageType::Heap as u8
     }
 
     #[inline(always)]
@@ -183,13 +178,11 @@ mod tests {
 
         assert_eq!(page.page_id(), 42);
         assert_eq!(page.page_type(), PageType::Heap as u8);
-        assert!(page.is_heap());
         assert_eq!(page.parent(), 1);
         assert_eq!(page.right(), 2);
         assert_eq!(page.upper_ptr(), PAGE_HEADER_SIZE as u16);
         assert_eq!(page.lower_ptr(), END_OF_PAGE);
         assert_eq!(page.len(), 0);
-        assert!(page.is_heap());
         assert!(!page.is_free());
     }
 
