@@ -1,20 +1,28 @@
 use std::ops::{Bound, RangeBounds};
 
 pub(crate) const PAGE_SIZE: usize = 0x1000;
+
+pub(crate) const PAGE_SIZE_MIN: usize = 0x100;
 const _: () = assert!(PAGE_SIZE <= u16::MAX as usize);
+const _: () = assert!(PAGE_SIZE >= PAGE_SIZE_MIN);
 
 pub(crate) const SLOT_SIZE: u16 = size_of::<u16>() as u16;
 const END_OF_PAGE: u16 = (PAGE_SIZE - 1) as u16;
 const PAGE_HEADER_SIZE: u16 = 0x40;
 
-mod page_common;
-mod page_heap;
-mod page_sorted;
+mod common;
+mod heap;
+mod sorted;
+mod superblock;
 
-pub(crate) use page_common::PageCommon;
-pub(crate) use page_heap::PageHeap;
-pub(crate) use page_sorted::PageSorted;
+pub(crate) use common::{PageCommon, PageCommonRef};
+pub(crate) use heap::PageHeap;
+pub(crate) use sorted::PageSorted;
+pub(crate) use superblock::PageSuperblock;
+pub(crate) use superblock::SUPERBLOCK_PAGE_ID;
 
+/// Converts a range whose bounds implement `Into<usize>` into a plain `(Bound<usize>, Bound<usize>)`,
+/// making it usable as a slice index on `[u8]` buffers.
 pub trait RangeExt<T> {
     fn as_usizes(self) -> (Bound<usize>, Bound<usize>);
 }
@@ -41,6 +49,10 @@ where
     }
 }
 
+/// Discriminant stored in the `page_type` header field.
+///
+/// `Free` pages are unallocated. `Leaf` and `Inner` are B-tree nodes used by
+/// [`PageSorted`]. `Heap` pages hold unordered variable-length records via [`PageHeap`].
 #[repr(u8)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum PageType {

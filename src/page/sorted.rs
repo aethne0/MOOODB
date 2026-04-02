@@ -1,45 +1,59 @@
 use std::mem::size_of;
 use std::ops::{Deref, DerefMut};
 
-use crate::page::page_common::PageCommon;
-use crate::page::{PageType, RangeExt, PAGE_SIZE, SLOT_SIZE};
+use crate::page::common::PageCommon;
+use crate::page::{PAGE_SIZE, PageType, RangeExt, SLOT_SIZE};
 
-pub(crate) struct PageSorted<'buffer> {
-    core: PageCommon<'buffer>,
+/// A sorted B-tree page storing key-value pairs in ascending key order.
+///
+/// Generic over its buffer `B`:
+/// - `PageSorted<&'b mut [u8; PAGE_SIZE]>` — full read/write access
+/// - `PageSorted<&'b [u8; PAGE_SIZE]>` — read-only (aliased as [`PageSortedRef`])
+pub(crate) struct PageSorted<B> {
+    core: PageCommon<B>,
 }
 
-impl<'buffer> PageSorted<'buffer> {
-    pub(crate) fn from_buffer(buffer: &'buffer mut [u8; PAGE_SIZE]) -> Self {
-        Self {
-            core: PageCommon::from_buffer(buffer),
-        }
+/// Read-only view of a sorted page buffer.
+pub(crate) type PageSortedRef<'b> = PageSorted<&'b [u8; PAGE_SIZE]>;
+
+// constructors
+
+impl<'b> PageSorted<&'b mut [u8; PAGE_SIZE]> {
+    /// Wraps `buffer` as a `PageSorted`. Does not initialize or validate any fields.
+    pub(crate) fn from_buffer(buffer: &'b mut [u8; PAGE_SIZE]) -> Self {
+        Self { core: PageCommon::from_buffer(buffer) }
     }
 
+    /// Wraps `buffer` as a `PageSorted` and initializes the page header.
     pub(crate) fn new_with_buffer(
-        buffer: &'buffer mut [u8; PAGE_SIZE],
-        page_id: u64,
-        page_type: PageType, // TODO
-        parent: u64,
-        right: u64,
+        buffer: &'b mut [u8; PAGE_SIZE], page_id: u64, page_type: PageType, parent: u64, right: u64,
     ) -> Self {
         let mut page = Self::from_buffer(buffer);
         page.initialize_header(page_id, page_type, parent, right);
         page
     }
+}
 
-    pub(crate) fn clear(&mut self) {
-        assert!(!self.is_free());
-        self.clear_entries();
+impl<'b> PageSorted<&'b [u8; PAGE_SIZE]> {
+    pub(crate) fn from_buffer_ref(buffer: &'b [u8; PAGE_SIZE]) -> Self {
+        Self { core: PageCommon::from_buffer_ref(buffer) }
     }
+}
 
+// read impl
+
+impl<B: AsRef<[u8]>> PageSorted<B> {
+    /// Returns `true` if this page's type field is [`PageType::Inner`].
     pub(crate) fn is_inner(&self) -> bool {
         self.page_type() == PageType::Inner as u8
     }
 
+    /// Returns `true` if this page's type field is [`PageType::Leaf`].
     pub(crate) fn is_leaf(&self) -> bool {
         self.page_type() == PageType::Leaf as u8
     }
 
+    /// Returns the key bytes stored at `slot_index`.
     fn key_at_slot(&self, slot_index: u16) -> &[u8] {
         assert!(!self.is_free());
         assert!(slot_index < self.len());
@@ -51,6 +65,7 @@ impl<'buffer> PageSorted<'buffer> {
         &self.raw()[(start..start + length).as_usizes()]
     }
 
+    /// Returns the `(key, value)` pair stored at `slot_index`.
     fn key_val_at_slot(&self, slot_index: u16) -> (&[u8], &[u8]) {
         assert!(!self.is_free());
         assert!(slot_index < self.len());
@@ -62,13 +77,11 @@ impl<'buffer> PageSorted<'buffer> {
         let val_start = key_start + key_len + SLOT_SIZE;
 
         let raw = self.raw();
-        (
-            &raw[(key_start..key_start + key_len).as_usizes()],
-            &raw[(val_start..val_start + val_len).as_usizes()],
-        )
+        (&raw[(key_start..key_start + key_len).as_usizes()], &raw[(val_start..val_start + val_len).as_usizes()])
     }
 
-    /// Returns slot-index of first element not-less-than the search key (left-most that is GE)
+    /// Binary searches for `key` and returns a [`SearchResult`] indicating whether it was
+    /// found and at which slot, or where it would be inserted to maintain order.
     fn find_key_slot(&self, key: &[u8]) -> SearchResult {
         assert!(self.is_inner() || self.is_leaf());
         let _ = u16::try_from(key.len()).expect("passed key too large");
@@ -98,28 +111,13 @@ impl<'buffer> PageSorted<'buffer> {
         }
     }
 
-    pub(crate) fn compact(&mut self) {
+    /// Returns an iterator over `(key, value)` pairs in ascending key order.
+    pub(crate) fn iter(&self) -> PageSortedIterator<'_, B> {
         assert!(!self.is_free());
-
-        let mut cloned_raw = [0u8; PAGE_SIZE];
-        cloned_raw.copy_from_slice(self.raw());
-        let cloned_page = PageSorted::from_buffer(&mut cloned_raw);
-
-        self.clear_entries();
-
-        for (k, v) in cloned_page.iter() {
-            self.insert_unordered(k, v);
-        }
+        PageSortedIterator { page: self, slot_index: 0 }
     }
 
-    pub(crate) fn iter<'a>(&'a self) -> PageSortedIterator<'a> {
-        assert!(!self.is_free());
-        PageSortedIterator {
-            page: self,
-            slot_index: 0,
-        }
-    }
-
+    /// Returns the value associated with `key`, or `None` if not present.
     pub(crate) fn get(&self, key: &[u8]) -> Option<&[u8]> {
         assert!(!self.is_free());
         match self.find_key_slot(key) {
@@ -128,6 +126,25 @@ impl<'buffer> PageSorted<'buffer> {
         }
     }
 
+    fn has_space(&self, key: &[u8], val: &[u8]) -> Result<u16, ()> {
+        let entry_len = u16::try_from(size_of::<u16>() * 2 + val.len() + key.len()).expect("entry too big for u16");
+        if !self.has_space_entry(entry_len) {
+            return Err(());
+        }
+        Ok(entry_len)
+    }
+}
+
+// write impl
+
+impl<B: AsRef<[u8]> + AsMut<[u8]>> PageSorted<B> {
+    /// Removes all entries, reclaiming all entry space.
+    pub(crate) fn clear(&mut self) {
+        assert!(!self.is_free());
+        self.clear_entries();
+    }
+
+    /// Removes the entry with `key`. Does nothing if the key is not present.
     pub(crate) fn delete(&mut self, key: &[u8]) {
         assert!(!self.is_free());
 
@@ -138,16 +155,9 @@ impl<'buffer> PageSorted<'buffer> {
         }
     }
 
-    fn has_space(&self, key: &[u8], val: &[u8]) -> Result<u16, ()> {
-        let entry_len = u16::try_from(size_of::<u16>() * 2 + val.len() + key.len())
-            .expect("entry too big for u16");
-
-        if !self.has_space_entry(entry_len) {
-            return Err(());
-        }
-        Ok(entry_len)
-    }
-
+    /// Core insert path. When `ordered` is `true`, uses binary search to find the correct
+    /// position and handles in-place update if the key already exists. When `false`,
+    /// appends to the end of the slot array without a search (caller must ensure order).
     fn insert_internal(&mut self, key: &[u8], val: &[u8], ordered: bool) -> bool {
         assert!(!self.is_free());
         let key_len = u16::try_from(key.len()).expect("key too large for u16");
@@ -158,14 +168,11 @@ impl<'buffer> PageSorted<'buffer> {
             Ok(entry_len) => entry_len,
         };
 
-        if self.free_bytes_contig() < (entry_len + SLOT_SIZE)
-            && self.free() >= (entry_len + SLOT_SIZE)
-        {
+        if self.free_bytes_contig() < (entry_len + SLOT_SIZE) && self.free() >= (entry_len + SLOT_SIZE) {
             self.compact();
         }
 
-        let mut should_increment_slot_ptr = true; // will be set to false if we find the key
-                                                  // already existing in the page
+        let mut should_increment_slot_ptr = true;
         let slot_index = if ordered {
             match self.find_key_slot(key) {
                 SearchResult::Found(slot_index) => {
@@ -197,8 +204,7 @@ impl<'buffer> PageSorted<'buffer> {
             off
         };
 
-        self.raw_mut()[(offset..offset + SLOT_SIZE).as_usizes()]
-            .copy_from_slice(&(key.len() as u16).to_be_bytes());
+        self.raw_mut()[(offset..offset + SLOT_SIZE).as_usizes()].copy_from_slice(&(key.len() as u16).to_be_bytes());
 
         let mut off = offset + SLOT_SIZE;
         self.raw_mut()[(off..off + key_len).as_usizes()].copy_from_slice(key);
@@ -210,40 +216,57 @@ impl<'buffer> PageSorted<'buffer> {
         true
     }
 
+    /// Inserts or updates `(key, val)` maintaining sorted order. Returns `false` if the page is full.
     pub(crate) fn insert(&mut self, key: &[u8], val: &[u8]) -> bool {
         self.insert_internal(key, val, true)
     }
 
-    /// Inserts entry to the end of the slot array. This WILL break ordering invarients.
-    /// Sorted page has this method because when we recompact we just reinsert all the entries from
-    /// the original version of the page into the new copy of the page, and they are already
-    /// sorted because we are iterating over them in order. We don't need the overhead of the
-    /// binary search for each insert in this case.
-    fn insert_unordered(&mut self, key: &[u8], val: &[u8]) -> bool {
+    /// Appends `(key, val)` to the end of the slot array without a binary search.
+    /// **Breaks the sort invariant** unless the caller guarantees the entry belongs at the end.
+    pub(crate) fn insert_unordered(&mut self, key: &[u8], val: &[u8]) -> bool {
         self.insert_internal(key, val, false)
+    }
+
+    /// Defragments the page by rewriting all live entries into a contiguous block. Sort order is preserved.
+    pub(crate) fn compact(&mut self) {
+        assert!(!self.is_free());
+
+        let mut cloned_raw = [0u8; PAGE_SIZE];
+        cloned_raw.copy_from_slice(self.raw());
+        let cloned_page = PageSorted::from_buffer(&mut cloned_raw);
+
+        self.clear_entries();
+
+        for (k, v) in cloned_page.iter() {
+            self.insert_unordered(k, v);
+        }
     }
 }
 
-impl<'buffer> Deref for PageSorted<'buffer> {
-    type Target = PageCommon<'buffer>;
+// deref
+
+impl<B: AsRef<[u8]>> Deref for PageSorted<B> {
+    type Target = PageCommon<B>;
 
     fn deref(&self) -> &Self::Target {
         &self.core
     }
 }
 
-impl<'buffer> DerefMut for PageSorted<'buffer> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
+impl<B: AsRef<[u8]> + AsMut<[u8]>> DerefMut for PageSorted<B> {
+    fn deref_mut(&mut self) -> &mut PageCommon<B> {
         &mut self.core
     }
 }
 
-pub(crate) struct PageSortedIterator<'a> {
-    page: &'a PageSorted<'a>,
+// iterator
+
+pub(crate) struct PageSortedIterator<'a, B: AsRef<[u8]>> {
+    page: &'a PageSorted<B>,
     slot_index: u16,
 }
 
-impl<'a> Iterator for PageSortedIterator<'a> {
+impl<'a, B: AsRef<[u8]>> Iterator for PageSortedIterator<'a, B> {
     type Item = (&'a [u8], &'a [u8]);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -256,18 +279,22 @@ impl<'a> Iterator for PageSortedIterator<'a> {
     }
 }
 
-impl<'a> IntoIterator for &'a PageSorted<'a> {
+impl<'a, B: AsRef<[u8]>> IntoIterator for &'a PageSorted<B> {
     type Item = (&'a [u8], &'a [u8]);
-    type IntoIter = PageSortedIterator<'a>;
+    type IntoIter = PageSortedIterator<'a, B>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
     }
 }
 
+/// Outcome of a binary search over the slot array.
 pub(crate) enum SearchResult {
+    /// The key was found at this slot index.
     Found(u16),
+    /// The key was not found; this slot index is where it would be inserted.
     NotFound(u16),
+    /// The key is greater than all entries; it belongs past the last slot.
     Right,
 }
 
@@ -281,11 +308,14 @@ mod test {
     use std::collections::{BTreeMap, HashMap, HashSet};
 
     use claims::{assert_lt, assert_none, assert_some, assert_some_eq};
-    use rand::{rngs::StdRng, seq::IteratorRandom, Rng, RngExt, SeedableRng};
+    use rand::{Rng, RngExt, SeedableRng, rngs::StdRng, seq::IteratorRandom};
 
-    use crate::page::{page_sorted::PageSorted, PageType, PAGE_HEADER_SIZE, PAGE_SIZE};
+    use crate::page::{
+        PAGE_HEADER_SIZE, PAGE_SIZE, PageType,
+        sorted::{PageSorted, PageSortedRef},
+    };
 
-    fn make_leaf_page(buffer: &mut [u8; PAGE_SIZE]) -> PageSorted<'_> {
+    fn make_leaf_page(buffer: &mut [u8; PAGE_SIZE]) -> PageSorted<&mut [u8; PAGE_SIZE]> {
         PageSorted::new_with_buffer(buffer, 2, PageType::Leaf, 1, 3)
     }
 
@@ -362,14 +392,9 @@ mod test {
 
         the_page.compact();
 
-        assert_eq!(
-            the_page.free_bytes_contig(),
-            (PAGE_SIZE - PAGE_HEADER_SIZE as usize) as u16
-        );
+        assert_eq!(the_page.free_bytes_contig(), (PAGE_SIZE - PAGE_HEADER_SIZE as usize) as u16);
     }
 
-    /// Fragment the page (insert many, delete some), then compact. Contiguous free should
-    /// increase and equal total free (all free space is one block after compact).
     #[test]
     fn test_compact_fragmented_increases_contiguous_free() {
         let mut buffer = [0u8; PAGE_SIZE];
@@ -388,7 +413,6 @@ mod test {
         let n = keys.len();
         assert!(n >= 4, "page should hold several entries");
 
-        // Delete every other entry to fragment the page
         for k in keys.iter().skip(1).step_by(2) {
             page.delete(k);
         }
@@ -398,19 +422,11 @@ mod test {
 
         let contig_after = page.free_bytes_contig();
         let total_free_after = page.free();
-        assert!(
-            contig_after >= contig_before,
-            "compact should not reduce contiguous free"
-        );
-        assert_eq!(
-            contig_after, total_free_after,
-            "after compact all free space should be contiguous"
-        );
+        assert!(contig_after >= contig_before, "compact should not reduce contiguous free");
+        assert_eq!(contig_after, total_free_after, "after compact all free space should be contiguous");
         assert_eq!(page.len() as usize, (n + 1) / 2);
     }
 
-    /// When the page is fragmented (enough total free but not enough contiguous), insert
-    /// should trigger compact and then succeed.
     #[test]
     fn test_insert_triggers_compact_when_fragmented() {
         let mut buffer = [0u8; PAGE_SIZE];
@@ -429,22 +445,17 @@ mod test {
         let n = keys.len();
         assert!(n >= 4);
 
-        // Delete a bunch of entries to fragment (holes in body)
         for k in keys.iter().take(n / 2) {
             page.delete(k);
         }
         let new_key = [0xffu8; 6];
         let new_val = [0xeeu8; 6];
         let inserted = page.insert(&new_key, &new_val);
-        assert!(
-            inserted,
-            "insert should compact and succeed when fragmented"
-        );
+        assert!(inserted, "insert should compact and succeed when fragmented");
         assert_some_eq!(page.get(&new_key), &new_val[..]);
         assert_eq!(page.len() as usize, n - n / 2 + 1);
     }
 
-    /// After compacting a fragmented page, we can insert until full again.
     #[test]
     fn test_compact_then_insert_until_full() {
         let mut buffer = [0u8; PAGE_SIZE];
@@ -570,8 +581,6 @@ mod test {
         assert_eq!(the_page.iter().count(), kvs.len());
     }
 
-    /// Tests insert_unordered (append-only, no binary search) on a PageSorted.
-    /// Uses Leaf type; we only care that insertion order is preserved in iter().
     #[test]
     fn test_page_insert_many_unordered() {
         let mut buffer = [0u8; PAGE_SIZE];
@@ -697,7 +706,6 @@ mod test {
         assert!(page.insert(key, val2));
         let free_after_update = page.free();
 
-        // updating an existing key reuses the slot, so only entry_len body bytes are consumed
         let entry_len = (2 * size_of::<u16>() + key.len() + val2.len()) as u16;
         assert_eq!(
             free_after_insert - free_after_update,
@@ -707,5 +715,17 @@ mod test {
 
         assert_eq!(page.get(key), Some(&val2[..]));
         assert_eq!(page.len(), 1);
+    }
+
+    #[test]
+    fn test_readonly_view() {
+        let mut buffer = [0u8; PAGE_SIZE];
+        {
+            let mut page = make_leaf_page(&mut buffer);
+            page.insert(b"key", b"val");
+        }
+        let view = PageSortedRef::from_buffer_ref(&buffer);
+        assert_eq!(view.get(b"key"), Some(&b"val"[..]));
+        assert_eq!(view.len(), 1);
     }
 }

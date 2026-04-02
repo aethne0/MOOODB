@@ -1,38 +1,50 @@
 use std::ops::{Deref, DerefMut};
 
-use crate::page::{page_common::PageCommon, PageType, RangeExt, PAGE_SIZE, SLOT_SIZE};
+use crate::page::{PAGE_SIZE, PageType, RangeExt, SLOT_SIZE, common::PageCommon};
 
-pub(crate) struct PageHeap<'buffer> {
-    core: PageCommon<'buffer>,
+/// An unordered heap page that stores variable-length byte records.
+///
+/// Generic over its buffer `B`:
+/// - `PageHeap<&'b mut [u8; PAGE_SIZE]>` — full read/write access
+/// - `PageHeap<&'b [u8; PAGE_SIZE]>` — read-only (aliased as [`PageHeapRef`])
+pub(crate) struct PageHeap<B> {
+    core: PageCommon<B>,
 }
 
-impl<'buffer> PageHeap<'buffer> {
-    pub(crate) fn from_buffer(buffer: &'buffer mut [u8; PAGE_SIZE]) -> Self {
-        Self {
-            core: PageCommon::from_buffer(buffer),
-        }
+/// Read-only view of a heap page buffer.
+pub(crate) type PageHeapRef<'b> = PageHeap<&'b [u8; PAGE_SIZE]>;
+
+// constructors
+
+impl<'b> PageHeap<&'b mut [u8; PAGE_SIZE]> {
+    /// Wraps `buffer` as a `PageHeap`. Does not initialize or validate any fields.
+    pub(crate) fn from_buffer(buffer: &'b mut [u8; PAGE_SIZE]) -> Self {
+        Self { core: PageCommon::from_buffer(buffer) }
     }
 
-    pub(crate) fn new_with_buffer(
-        buffer: &'buffer mut [u8; PAGE_SIZE],
-        page_id: u64,
-        parent: u64,
-        right: u64,
-    ) -> Self {
+    /// Wraps `buffer` as a `PageHeap` and initializes the page header.
+    pub(crate) fn new_with_buffer(buffer: &'b mut [u8; PAGE_SIZE], page_id: u64, parent: u64, right: u64) -> Self {
         let mut page = Self::from_buffer(buffer);
         page.initialize_header(page_id, PageType::Heap, parent, right);
         page
     }
+}
 
+impl<'b> PageHeap<&'b [u8; PAGE_SIZE]> {
+    pub(crate) fn from_buffer_ref(buffer: &'b [u8; PAGE_SIZE]) -> Self {
+        Self { core: PageCommon::from_buffer_ref(buffer) }
+    }
+}
+
+// read impl
+
+impl<B: AsRef<[u8]>> PageHeap<B> {
+    /// Returns `true` if this page's type field is [`PageType::Heap`].
     pub(crate) fn is_heap(&self) -> bool {
         self.page_type() == PageType::Heap as u8
     }
 
-    pub(crate) fn clear(&mut self) {
-        assert!(self.is_heap());
-        self.clear_entries();
-    }
-
+    /// Returns the value bytes stored at `slot_index`.
     fn val_at_slot(&self, slot_index: u16) -> &[u8] {
         assert!(self.is_heap());
         assert!(slot_index < self.len());
@@ -44,37 +56,33 @@ impl<'buffer> PageHeap<'buffer> {
         &self.raw()[(start..end).as_usizes()]
     }
 
-    pub(crate) fn compact(&mut self) {
+    /// Returns an iterator over `(slot_index, value)` pairs in slot order.
+    pub(crate) fn iter(&self) -> PageHeapIterator<'_, B> {
         assert!(self.is_heap());
-
-        let mut cloned_raw = [0u8; PAGE_SIZE];
-        cloned_raw.copy_from_slice(self.raw());
-        let cloned_page = PageHeap::from_buffer(&mut cloned_raw);
-
-        self.clear_entries();
-
-        for (_, v) in cloned_page.iter() {
-            self.append(v);
-        }
+        PageHeapIterator { page: self, slot_index: 0 }
     }
 
-    pub(crate) fn iter<'a>(&'a self) -> PageHeapIterator<'a> {
-        assert!(self.is_heap());
-        PageHeapIterator {
-            page: self,
-            slot_index: 0,
-        }
-    }
-
+    /// Returns the value at `slot_index`, or `None` if the index is out of bounds.
     pub(crate) fn get_at_slot(&self, slot_index: u16) -> Option<&[u8]> {
         assert!(self.is_heap());
-
         if slot_index >= self.len() {
             return None;
         }
         Some(self.val_at_slot(slot_index))
     }
+}
 
+// write impl
+
+impl<B: AsRef<[u8]> + AsMut<[u8]>> PageHeap<B> {
+    /// Removes all entries, reclaiming all entry space.
+    pub(crate) fn clear(&mut self) {
+        assert!(self.is_heap());
+        self.clear_entries();
+    }
+
+    /// Removes the entry at `slot_index`, shifting subsequent slots left.
+    /// Does nothing if `slot_index` is out of bounds.
     pub(crate) fn delete_at_slot(&mut self, slot_index: u16) {
         assert!(self.is_heap());
 
@@ -88,6 +96,10 @@ impl<'buffer> PageHeap<'buffer> {
         self.delete_slot_at(slot_index, entry_len);
     }
 
+    /// Appends `val` to the page and returns its slot index.
+    ///
+    /// Triggers compaction automatically if there is enough total free space but
+    /// not enough contiguous space. Returns `None` if the page is full.
     pub(crate) fn append(&mut self, val: &[u8]) -> Option<u16> {
         assert!(self.is_heap());
         let entry_len = u16::try_from(usize::from(SLOT_SIZE) + val.len()).unwrap();
@@ -96,45 +108,60 @@ impl<'buffer> PageHeap<'buffer> {
             return None;
         }
 
-        if self.free_bytes_contig() < (entry_len + SLOT_SIZE)
-            && self.free() >= (entry_len + SLOT_SIZE)
-        {
+        if self.free_bytes_contig() < (entry_len + SLOT_SIZE) && self.free() >= (entry_len + SLOT_SIZE) {
             self.compact();
         }
 
         let slot_index = self.len();
-        let offset = match self.prepare_insert(slot_index, entry_len) {
-            Some(off) => off,
-            None => return None,
-        };
+        let offset = self.prepare_insert(slot_index, entry_len)?;
 
         self.write_u16(offset, val.len() as u16);
         self.raw_mut()[(offset + SLOT_SIZE..offset + entry_len).as_usizes()].copy_from_slice(val);
 
         Some(slot_index)
     }
+
+    /// Defragments the page by rewriting all live entries into a contiguous block,
+    /// making all free space available as a single region.
+    pub(crate) fn compact(&mut self) {
+        assert!(self.is_heap());
+
+        let mut cloned_raw = [0u8; PAGE_SIZE];
+        cloned_raw.copy_from_slice(self.raw());
+        let cloned_page = PageHeap::from_buffer(&mut cloned_raw);
+
+        self.clear_entries();
+
+        for (_, v) in cloned_page.iter() {
+            self.append(v);
+        }
+    }
 }
 
-impl<'buffer> Deref for PageHeap<'buffer> {
-    type Target = PageCommon<'buffer>;
+// deref
+
+impl<B: AsRef<[u8]>> Deref for PageHeap<B> {
+    type Target = PageCommon<B>;
 
     fn deref(&self) -> &Self::Target {
         &self.core
     }
 }
 
-impl<'buffer> DerefMut for PageHeap<'buffer> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
+impl<B: AsRef<[u8]> + AsMut<[u8]>> DerefMut for PageHeap<B> {
+    fn deref_mut(&mut self) -> &mut PageCommon<B> {
         &mut self.core
     }
 }
 
-pub(crate) struct PageHeapIterator<'a> {
-    page: &'a PageHeap<'a>,
+// iterator
+
+pub(crate) struct PageHeapIterator<'a, B: AsRef<[u8]>> {
+    page: &'a PageHeap<B>,
     slot_index: u16,
 }
 
-impl<'a> Iterator for PageHeapIterator<'a> {
+impl<'a, B: AsRef<[u8]>> Iterator for PageHeapIterator<'a, B> {
     type Item = (u16, &'a [u8]);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -149,9 +176,9 @@ impl<'a> Iterator for PageHeapIterator<'a> {
     }
 }
 
-impl<'a> IntoIterator for &'a PageHeap<'a> {
+impl<'a, B: AsRef<[u8]>> IntoIterator for &'a PageHeap<B> {
     type Item = (u16, &'a [u8]);
-    type IntoIter = PageHeapIterator<'a>;
+    type IntoIter = PageHeapIterator<'a, B>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
@@ -256,5 +283,17 @@ mod tests {
         page.clear();
         assert_eq!(page.len(), 0);
         assert_eq!(page.free(), PAGE_SIZE as u16 - PAGE_HEADER_SIZE);
+    }
+
+    #[test]
+    fn test_readonly_view() {
+        let mut buffer = [0u8; PAGE_SIZE];
+        {
+            let mut page = PageHeap::new_with_buffer(&mut buffer, 1, 0, 0);
+            page.append(b"hello").unwrap();
+        }
+        let view = PageHeapRef::from_buffer_ref(&buffer);
+        assert_eq!(view.get_at_slot(0), Some(&b"hello"[..]));
+        assert_eq!(view.len(), 1);
     }
 }
