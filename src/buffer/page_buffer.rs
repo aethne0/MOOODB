@@ -1,3 +1,5 @@
+use std::sync::atomic::{AtomicUsize, Ordering};
+
 use parking_lot::{Mutex, RwLock};
 use rustc_hash::FxHashMap;
 
@@ -15,7 +17,10 @@ type PageId = u64;
 pub(crate) struct PageBuffer {
     pub(crate) io: Box<dyn crate::io::IODoer>,
     frames: MmapBox<[Frame]>,
-    free: Mutex<Queue<usize>>,
+
+    free_frames: Mutex<Queue<usize>>,
+    eviction_hand: AtomicUsize,
+
     /// directory: page_id -> frame_index map, inflight map
     shard_dirs: FxHashMap<usize, RwLock<PageBufferShard>>,
 }
@@ -33,6 +38,8 @@ pub(crate) struct PageBufferShard {
 
 impl PageBuffer {
     pub(crate) fn new(io: Box<dyn io::IODoer>, frame_count: usize) -> Self {
+        assert_ne!(frame_count, 0);
+
         let mut free = Queue::new(frame_count);
         for i in 0..frame_count {
             free.push_back(i);
@@ -53,7 +60,7 @@ impl PageBuffer {
             (shard_index, RwLock::new(PageBufferShard { page_frame_map: map, inflight }))
         }));
 
-        Self { io, frames, free: Mutex::new(free), shard_dirs }
+        Self { io, frames, free_frames: Mutex::new(free), shard_dirs, eviction_hand: AtomicUsize::new(0) }
     }
 
     #[must_use = "RAII FrameRef unpins when dropped"]
@@ -61,17 +68,71 @@ impl PageBuffer {
         self.frames[frame_index].pin(&self)
     }
 
-    fn evict_frame(&self, frame_index: usize) -> Result<(), io::IOError> {
-        todo!()
-    }
-
     fn get_free_frame(&self) -> Option<FrameRef<'_>> {
-        let frame_index_opt = self.free.lock().pop_front();
+        let frame_index_opt = self.free_frames.lock().pop_front();
         match frame_index_opt {
             None => {
                 todo!()
             }
             Some(index) => Some(self.pin_frame(index)),
+        }
+    }
+
+    // ▄▄▄ . ▌ ▐·▪   ▄▄· ▄▄▄▄▄▪         ▐ ▄
+    // ▀▄.▀·▪█·█▌██ ▐█ ▌▪•██  ██ ▪     •█▌▐█
+    // ▐▀▀▪▄▐█▐█•▐█·██ ▄▄ ▐█.▪▐█· ▄█▀▄ ▐█▐▐▌
+    // ▐█▄▄▌ ███ ▐█▌▐███▌ ▐█▌·▐█▌▐█▌.▐▌██▐█▌
+    //  ▀▀▀ . ▀  ▀▀▀·▀▀▀  ▀▀▀ ▀▀▀ ▀█▄▀▪▀▀ █▪
+    // Second-chance clock eviction
+
+    fn evict_frame(&self, frame_index: usize) -> Result<(), io::IOError> {
+        todo!()
+    }
+
+    fn clock_evict(&self) {
+        let to_evict = self.scan_for_eviction_candidate();
+        todo!()
+    }
+
+    /// Scans for an eviction candidate (frame with 0 pins and 0 usage). This will spin until
+    /// one is found. It is imperative that the caller re-check these conditions once a lock on the
+    /// shard directory has been acquired, so we dont TOCTOU.
+    fn scan_for_eviction_candidate(&self) -> usize {
+
+        loop {
+            let frame_index = self.eviction_hand.fetch_add(1, Ordering::Relaxed) % self.frames.len();
+            let frame = &self.frames[frame_index];
+
+            if frame.pins.load(Ordering::Acquire) == 0 {
+                // This could be Relaxed but it might result in more aborts once we take the lock
+                // later? Would need testing really. Either is "correct" because we recheck later.
+
+                let usage = loop {
+                    // theres no atomic saturating sub so we have to do a little dance, otherwise we
+                    // can have a TOCTOU where two threads decrement this usage and it wraps
+                    let fetched_usage = frame.usage.load(Ordering::Relaxed);
+                    if fetched_usage == 0 {
+                        break 0;
+                    } else {
+                        let res = frame.usage.compare_exchange(
+                            fetched_usage,
+                            fetched_usage - 1,
+                            Ordering::Relaxed,
+                            Ordering::Relaxed,
+                        );
+
+                        if res.is_ok() {
+                            break fetched_usage;
+                        }
+                    }
+                };
+
+                if usage == 0 {
+                    return frame_index;
+                }
+            }
+
+            std::hint::spin_loop();
         }
     }
 }
