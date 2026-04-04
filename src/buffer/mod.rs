@@ -1,4 +1,3 @@
 mod queue;
-
 pub(crate) mod frame;
-pub(crate) mod pager;
+pub(crate) mod page_buffer;

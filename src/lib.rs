@@ -13,7 +13,6 @@ mod macros;
 mod buffer;
 mod io;
 mod page;
-mod storage;
 mod system;
 
 mod mem_io;
@@ -23,12 +22,13 @@ mod test_util;
 
 // rkyv for network
 
+/*
 #[cfg(test)]
 mod test {
     use tracing::level_filters::LevelFilter;
     use tracing_subscriber::{Layer, layer::SubscriberExt, util::SubscriberInitExt};
 
-    use crate::{mem_io::MemIO, storage::Storage};
+    use crate::{buffer::storage::Storage, mem_io::MemIO};
 
     #[test]
     fn asd() {
@@ -49,11 +49,10 @@ mod test {
             storage.free_page(4).await;
             storage.free_page(7).await;
 
-
             for _ in 0..12 {
                 tracing::debug!("got page {}", storage.get_free_page().await.0);
             }
         });
     }
 }
-
+*/

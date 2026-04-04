@@ -2,3 +2,5 @@
 .session.vim
 .vscode/
 .notes.md
+
+src/buffer_old
