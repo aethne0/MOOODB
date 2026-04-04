@@ -3,7 +3,6 @@
 
 use std::{
     collections::HashMap,
-    pin::Pin,
     sync::{Arc, Mutex},
 };
 
@@ -12,48 +11,76 @@ use crate::{
     page::PAGE_SIZE,
 };
 
+enum PendingOp {
+    Read  { token: u64, page_id: u64, buf: *mut   [u8; PAGE_SIZE] },
+    Write { token: u64, page_id: u64, buf: *const [u8; PAGE_SIZE] },
+}
+
+// SAFETY: the buffer pointers are valid for the duration of the pending queue
+// because callers uphold the submit_read/submit_write safety contracts.
+unsafe impl Send for PendingOp {}
+unsafe impl Sync for PendingOp {}
+
 #[derive(Clone)]
 pub(crate) struct MemIO {
-    pages: Arc<Mutex<HashMap<u64, Box<[u8; PAGE_SIZE]>>>>,
+    pages:   Arc<Mutex<HashMap<u64, Box<[u8; PAGE_SIZE]>>>>,
+    pending: Arc<Mutex<Vec<PendingOp>>>,
+    done:    Arc<Mutex<Vec<(u64, Result<(), IOError>)>>>,
 }
 
 impl MemIO {
     pub(crate) fn new() -> Self {
-        Self { pages: Arc::new(Mutex::new(HashMap::new())) }
+        Self {
+            pages:   Arc::new(Mutex::new(HashMap::new())),
+            pending: Arc::new(Mutex::new(Vec::new())),
+            done:    Arc::new(Mutex::new(Vec::new())),
+        }
     }
 }
 
 impl IODoer for MemIO {
-    fn read<'a>(
-        &'a self, page_id: u64, data: &'a mut [u8; PAGE_SIZE],
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), IOError>> + Send + 'a>> {
-        Box::pin(async move {
-            let pages = self.pages.lock().unwrap();
-            match pages.get(&page_id) {
-                Some(buf) => {
-                    data.copy_from_slice(buf.as_ref());
-                    tracing::trace!("[MemIO] read  page_id={page_id} -> {} bytes (hit)", PAGE_SIZE);
-                    Ok(())
-                }
-                None => {
-                    data.fill(0);
-                    tracing::trace!("[MemIO] read  page_id={page_id} -> zeroed (miss)");
-                    Ok(())
-                }
-            }
-        })
+    unsafe fn submit_read(&self, token: u64, page_id: u64, buf: &mut [u8; PAGE_SIZE]) {
+        self.pending.lock().unwrap().push(PendingOp::Read { token, page_id, buf });
     }
 
-    fn write<'a>(
-        &'a self, page_id: u64, data: &'a [u8; PAGE_SIZE],
-    ) -> Pin<Box<dyn std::future::Future<Output = Result<(), IOError>> + Send + 'a>> {
-        Box::pin(async move {
-            let mut pages = self.pages.lock().unwrap();
-            let buf = pages.entry(page_id).or_insert_with(|| Box::new([0u8; PAGE_SIZE]));
-            buf.copy_from_slice(data);
+    unsafe fn submit_write(&self, token: u64, page_id: u64, buf: &[u8; PAGE_SIZE]) {
+        self.pending.lock().unwrap().push(PendingOp::Write { token, page_id, buf });
+    }
 
-            tracing::trace!("[MemIO] write page_id={page_id} -> {} bytes", PAGE_SIZE);
-            Ok(())
-        })
+    fn flush(&self) {
+        let ops: Vec<PendingOp> = self.pending.lock().unwrap().drain(..).collect();
+        let mut pages = self.pages.lock().unwrap();
+        let mut done  = self.done.lock().unwrap();
+
+        for op in ops {
+            match op {
+                PendingOp::Read { token, page_id, buf } => {
+                    // SAFETY: caller holds a write lock on the frame until this
+                    // token is returned by reap; the pointer is valid.
+                    let buf = unsafe { &mut *buf };
+                    match pages.get(&page_id) {
+                        Some(src) => buf.copy_from_slice(src.as_ref()),
+                        None      => buf.fill(0),
+                    }
+                    tracing::trace!("[MemIO] read  page_id={page_id}");
+                    done.push((token, Ok(())));
+                }
+                PendingOp::Write { token, page_id, buf } => {
+                    // SAFETY: caller holds a read lock on the frame until this
+                    // token is returned by reap; the pointer is valid.
+                    let buf = unsafe { &*buf };
+                    pages
+                        .entry(page_id)
+                        .or_insert_with(|| Box::new([0u8; PAGE_SIZE]))
+                        .copy_from_slice(buf);
+                    tracing::trace!("[MemIO] write page_id={page_id}");
+                    done.push((token, Ok(())));
+                }
+            }
+        }
+    }
+
+    fn reap(&self, _min: usize, out: &mut Vec<(u64, Result<(), IOError>)>) {
+        out.extend(self.done.lock().unwrap().drain(..));
     }
 }
