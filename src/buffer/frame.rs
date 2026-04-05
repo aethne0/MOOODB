@@ -15,13 +15,21 @@ pub(crate) struct Frame {
     pub(crate) inner: RwLock<FrameInner>,
 }
 
+const PAGE_ID_UNINIT: u64 = u64::MAX;
+
 impl Frame {
     pub(crate) fn new(frame_id: usize) -> Self {
         Self {
             frame_id,
             usage: AtomicU8::new(0),
             pins: AtomicI16::new(0),
-            inner: RwLock::new(FrameInner { page_id: 0, dirty: false, buffer: [0; PAGE_SIZE], io_err: None }),
+            inner: RwLock::new(FrameInner {
+                buffer: [0; PAGE_SIZE],
+
+                page_id: PAGE_ID_UNINIT,
+                dirty: false,
+                io_err: None,
+            }),
         }
     }
 
@@ -49,6 +57,19 @@ pub(crate) struct FrameInner {
     pub(crate) io_err: Option<io::IOError>,
 }
 
+impl FrameInner {
+    pub(crate) fn never_used(&self) -> bool {
+        self.page_id == PAGE_ID_UNINIT
+    }
+
+    /// sets new page_id and cleans up dirty and io_err (false, none)
+    pub(crate) fn reinit(&mut self, page_id: u64) {
+        self.page_id = page_id;
+        self.dirty = false;
+        self.io_err = None;
+    }
+}
+
 static THREAD_TOKEN_PREFIX_NEXT: AtomicU64 = AtomicU64::new(0);
 
 thread_local! {
@@ -73,14 +94,52 @@ pub(crate) struct FrameRef<'a> {
     pager: &'a PageBuffer,
 }
 
+impl<'a> FrameRef<'a> {
+    #[must_use = "RAII FrameReadGuard unpins when dropped"]
+    pub(crate) fn read_lock(&self) -> FrameReadGuard<'a> {
+        FrameReadGuard { frame: self.frame.inner.read(), pager: self.pager }
+    }
+
+    #[must_use = "RAII FrameReadGuard unpins when dropped"]
+    pub(crate) fn try_read_lock(&self) -> Option<FrameReadGuard<'a>> {
+        let guard_opt = self.frame.inner.try_read();
+        match guard_opt {
+            Some(guard) => Some(FrameReadGuard { frame: guard, pager: self.pager }),
+            None => None,
+        }
+    }
+
+    #[must_use = "RAII FrameWriteGuard unpins when dropped"]
+    pub(crate) fn write_lock(&self) -> FrameWriteGuard<'a> {
+        FrameWriteGuard { frame: self.frame.inner.write(), pager: self.pager }
+    }
+
+    #[must_use = "RAII FrameReadGuard unpins when dropped"]
+    pub(crate) fn try_write_lock(&self) -> Option<FrameWriteGuard<'a>> {
+        let guard_opt = self.frame.inner.try_write();
+        match guard_opt {
+            Some(guard) => Some(FrameWriteGuard { frame: guard, pager: self.pager }),
+            None => None,
+        }
+    }
+}
+
+impl<'a> std::ops::Deref for FrameRef<'a> {
+    type Target = Frame;
+
+    fn deref(&self) -> &Self::Target {
+        &self.frame
+    }
+}
+
 impl<'a> Drop for FrameRef<'a> {
     fn drop(&mut self) {
         self.frame.pins.fetch_sub(1, Ordering::Release);
     }
 }
 
-struct FrameReadGuard<'a> {
-    frame: &'a RwLockReadGuard<'a, FrameInner>,
+pub(crate) struct FrameReadGuard<'a> {
+    frame: RwLockReadGuard<'a, FrameInner>,
     pager: &'a PageBuffer,
 }
 
@@ -88,7 +147,7 @@ impl<'a> std::ops::Deref for FrameReadGuard<'a> {
     type Target = RwLockReadGuard<'a, FrameInner>;
 
     fn deref(&self) -> &Self::Target {
-        self.frame
+        &self.frame
     }
 }
 
@@ -103,8 +162,8 @@ impl<'a> FrameReadGuard<'a> {
     }
 }
 
-struct FrameWriteGuard<'a> {
-    frame: &'a mut RwLockWriteGuard<'a, FrameInner>,
+pub(crate) struct FrameWriteGuard<'a> {
+    frame: RwLockWriteGuard<'a, FrameInner>,
     pager: &'a PageBuffer,
 }
 
@@ -112,7 +171,13 @@ impl<'a> std::ops::Deref for FrameWriteGuard<'a> {
     type Target = RwLockWriteGuard<'a, FrameInner>;
 
     fn deref(&self) -> &Self::Target {
-        self.frame
+        &self.frame
+    }
+}
+
+impl<'a> std::ops::DerefMut for FrameWriteGuard<'a> {
+    fn deref_mut(&mut self) -> &mut Self::Target {
+        &mut self.frame
     }
 }
 
