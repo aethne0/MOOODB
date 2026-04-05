@@ -10,7 +10,7 @@ use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
 
 use crate::{
-    buffer::frame::{Frame, FrameReadGuard, FrameRef, FrameWriteGuard},
+    buffer::frame::{Frame, FrameRef, FrameWriteGuard},
     io,
     system::MmapBox,
 };
@@ -36,22 +36,6 @@ fn next_thread_token() -> u64 {
         })
     })
 }
-
-type PageId = u64;
-
-pub(crate) struct PageBuffer {
-    pub(crate) io: Arc<dyn crate::io::IOFactory>,
-    frames: MmapBox<[Frame]>,
-    /// directory: page_id -> frame_index map, inflight map
-    shard_dirs: Box<[RwLock<PageBufferShard>]>,
-    eviction_hand: AtomicUsize,
-}
-
-pub(crate) struct PageBufferShard {
-    // making this a struct incase we add more later - might flatten
-    page_frame_map: FxHashMap<PageId, usize>,
-}
-
 const SHARD_CNT: usize = 64;
 fn hash(mut page_id: u64) -> usize {
     page_id ^= page_id >> 33;
@@ -60,9 +44,28 @@ fn hash(mut page_id: u64) -> usize {
     (page_id as usize) & (SHARD_CNT - 1)
 }
 
-//   todo:
-//   3. flush_page(page_id) -> Result<()> — write one dirty frame back
-//   4. flush_all() -> Result<()> — checkpoint, flush every dirty frame
+//  ▄▄▄· ▄▄▄·  ▄▄ • ▄▄▄ .    ▄▄▄▄· ▄• ▄▌·▄▄▄·▄▄▄▄▄▄ .▄▄▄
+// ▐█ ▄█▐█ ▀█ ▐█ ▀ ▪▀▄.▀·    ▐█ ▀█▪█▪██▌▐▄▄·▐▄▄·▀▄.▀·▀▄ █·
+//  ██▀·▄█▀▀█ ▄█ ▀█▄▐▀▀▪▄    ▐█▀▀█▄█▌▐█▌██▪ ██▪ ▐▀▀▪▄▐▀▀▄
+// ▐█▪·•▐█ ▪▐▌▐█▄▪▐█▐█▄▄▌    ██▄▪▐█▐█▄█▌██▌.██▌.▐█▄▄▌▐█•█▌
+// .▀    ▀  ▀ ·▀▀▀▀  ▀▀▀     ·▀▀▀▀  ▀▀▀ ▀▀▀ ▀▀▀  ▀▀▀ .▀  ▀
+// Page Buffer
+
+type PageId = u64;
+
+pub(crate) struct PageBuffer {
+    pub(crate) io: Arc<dyn crate::io::IOFactory>,
+    frames: MmapBox<[Frame]>,
+    /// All shards' maps of `page_id` -> `frame_index`
+    shard_dirs: Box<[RwLock<PageBufferShard>]>,
+    eviction_hand: AtomicUsize,
+}
+
+pub(crate) struct PageBufferShard {
+    // making this a struct incase we add more later - might flatten
+    /// Shard's map of `page_id` -> `frame_index`
+    dir: FxHashMap<PageId, usize>,
+}
 
 impl PageBuffer {
     pub(crate) fn new(io: Arc<dyn io::IOFactory>, frame_count: usize) -> Self {
@@ -78,70 +81,11 @@ impl PageBuffer {
         let shard_dirs = Vec::from_iter((0..SHARD_CNT).into_iter().map(|_| {
             let mut map = FxHashMap::default();
             map.reserve(frame_count / SHARD_CNT);
-            RwLock::new(PageBufferShard { page_frame_map: map })
+            RwLock::new(PageBufferShard { dir: map })
         }))
         .into_boxed_slice();
 
         Self { io, frames, shard_dirs, eviction_hand: AtomicUsize::new(0) }
-    }
-
-    // ▪
-    // ██ ▪
-    // ▐█· ▄█▀▄
-    // ▐█▌▐█▌.▐▌
-    // ▀▀▀ ▀█▄▀▪
-
-    /// Must be called once by each worker thread before using the buffer.
-    pub(crate) fn init_thread(&self) {
-        THREAD_IO.with(|cell| {
-            assert!(cell.borrow().is_none(), "Tried to init thread-io twice!");
-            *cell.borrow_mut() = Some(self.io.make_io_doer())
-        });
-    }
-
-    pub(crate) fn thread_io<F, R>(&self, f: F) -> R
-    where
-        F: FnOnce(&dyn io::IODoer) -> R,
-    {
-        THREAD_IO.with(|cell| f(cell.borrow().as_deref().expect("init_thread not called")))
-    }
-
-    fn io_read_one(&self, frame_guard: &mut FrameWriteGuard<'_>) -> Result<(), std::io::ErrorKind> {
-        self.thread_io(|io| {
-            debug_assert_eq!(io.peek(), 0);
-            let token = next_thread_token();
-            unsafe { io.submit_read(token, frame_guard.page_id, &mut frame_guard.buffer) };
-            io.flush();
-            let (recv_token, res) = io.reap_one();
-            debug_assert_eq!(recv_token, token);
-            res
-        })
-    }
-
-    // todo merge these
-    fn io_write_one(&self, frame_guard: &FrameReadGuard<'_>) -> Result<(), std::io::ErrorKind> {
-        self.thread_io(|io| {
-            debug_assert_eq!(io.peek(), 0);
-            let token = next_thread_token();
-            unsafe { io.submit_write(token, frame_guard.page_id, &frame_guard.buffer) };
-            io.flush();
-            let (recv_token, res) = io.reap_one();
-            debug_assert_eq!(recv_token, token);
-            res
-        })
-    }
-
-    // todo merge these
-    fn io_write_one_w(&self, frame_guard: &FrameWriteGuard<'_>) -> Result<(), std::io::ErrorKind> {
-        self.thread_io(|io| {
-            debug_assert_eq!(io.peek(), 0);
-            let token = next_thread_token();
-            unsafe { io.submit_write(token, frame_guard.page_id, &frame_guard.buffer) };
-            io.flush();
-            let (recv_token, res) = io.reap_one();
-            debug_assert_eq!(recv_token, token);
-            res
-        })
     }
 
     //  ▄▄▄· ▄▄▄·  ▄▄ • ▪   ▐ ▄  ▄▄ •
@@ -149,16 +93,28 @@ impl PageBuffer {
     //  ██▀·▄█▀▀█ ▄█ ▀█▄▐█·▐█▐▐▌▄█ ▀█▄
     // ▐█▪·•▐█ ▪▐▌▐█▄▪▐█▐█▌██▐█▌▐█▄▪▐█
     // .▀    ▀  ▀ ·▀▀▀▀ ▀▀▀▀▀ █▪·▀▀▀▀
+    //  Paging & Eviction
 
-    /// Gives an empty frame with a new page
-    /// Does not mark the frame as dirty!
-    /// Frames should only be marked dirty once you actually want them to be written out.
+    /// Gives an empty frame with a new page. Its `page_id`, `dirty` flag and `io_err` will be reset,
+    /// however its `buffer` can contain old garbage.
     ///
-    /// **Note**: The writeguard that this returns will have been held since BEFORE the frame was
-    /// inserted into the page directory
-    pub(crate) fn get_page_new(&self, new_page_id: u64) -> (FrameRef<'_>, FrameWriteGuard<'_>) {
-        let (a, b) = self.get_free_frame().unwrap();
-        todo!()
+    /// **NOTE**: It is assumed that, for a given `page_id`, `get_page_new` will only ever be called
+    /// once. Multiple threads calling this with the same `page_id` will result in a race.
+    pub(crate) fn get_page_new(
+        &self, new_page_id: u64,
+    ) -> Result<(FrameRef<'_>, FrameWriteGuard<'_>), std::io::ErrorKind> {
+        let (frame_ref, mut frame_guard) = match self.get_free_frame() {
+            Err(err) => return Err(err),
+            Ok(ret) => ret,
+        };
+
+        frame_guard.reinit(new_page_id);
+
+        let mut dir_guard = self.shard_dirs[hash(frame_guard.page_id)].write();
+        debug_assert!(dir_guard.dir.get(&frame_guard.page_id).is_none(), "page was already in directory");
+        dir_guard.dir.insert(frame_guard.page_id, frame_ref.index());
+
+        Ok((frame_ref, frame_guard))
     }
 
     /// Fetches existing page
@@ -167,12 +123,13 @@ impl PageBuffer {
 
         // if its already paged in
         let shard_guard = self.shard_dirs[shard].read();
-        if let Some(&frame_index) = shard_guard.page_frame_map.get(&page_id) {
+        if let Some(&frame_index) = shard_guard.dir.get(&page_id) {
             return Ok(self.frames[frame_index].pin());
         }
         drop(shard_guard);
 
         // we need to page it in and load it
+
         // this puts it in the dir right away, which is useful because other threads can see we
         // already have inflight io
         let (frame_ref, mut frame_guard) = {
@@ -182,11 +139,38 @@ impl PageBuffer {
             }
         };
 
+        frame_guard.reinit(page_id);
+
+        // we now need to make entry for this page in directory
+        let mut dir_guard = self.shard_dirs[shard].write();
+
+        // check if another thread beat us to populating this page_id in the dir
+        // well abandon our frame and use theres instead
+        if let Some(&found_frame_index) = dir_guard.dir.get(&frame_guard.page_id) {
+            // we need to set our frame to uninit, to make sure another frame doesnt later choose
+            // it for eviction, see its page_id, then remove that page_id from the dir
+            // (the page_id is the same as the actual frame that were going to take!)
+            frame_guard.uninit();
+            drop(frame_guard);
+
+            let frame_ref = self.frames[found_frame_index].pin();
+            // if the frame we adopt has an error we just return that error - no retry
+            if let Some(err) = frame_ref.read_lock().io_err.clone() {
+                return Err(err);
+            }
+
+            return Ok(frame_ref);
+        }
+        dir_guard.dir.insert(frame_guard.page_id, frame_ref.index());
+        drop(dir_guard);
+
+        // fetch data
         let res = self.io_read_one(&mut frame_guard);
         match res {
             Ok(()) => Ok(frame_ref),
             Err(err) => {
-                self.shard_dirs[shard].write().page_frame_map.remove(&page_id);
+                // if err well remove and set err on frame
+                self.shard_dirs[shard].write().dir.remove(&page_id);
                 frame_guard.io_err = Some(err.clone());
                 Err(err)
             }
@@ -194,6 +178,7 @@ impl PageBuffer {
     }
 
     /// Gets, pins, and writelocks and unused frame
+    /// Maybe evicts a frame
     /// **NOTE: it may contain dirty data, and its fields will not be initialized correctly
     /// (page_id, dirty, is_err)**
     fn get_free_frame(&self) -> Result<(FrameRef<'_>, FrameWriteGuard<'_>), std::io::ErrorKind> {
@@ -204,7 +189,7 @@ impl PageBuffer {
             // we'll optimistically try to get a lock on this frame - if we dont, then someone else
             // evicted this frame before we got a chance, so well try again and find another one
             if let Some(mut frame_guard) = frame_ref.try_write_lock() {
-                if !frame_guard.never_used() {
+                if frame_guard.has_non_init_page() {
                     let mut dir_guard = self.shard_dirs[hash(frame_guard.page_id)].write();
 
                     if frame_ref.pins.load(Ordering::Acquire) != 1 {
@@ -214,11 +199,11 @@ impl PageBuffer {
                         continue;
                     }
 
-                    dir_guard.page_frame_map.remove(&frame_guard.page_id);
+                    dir_guard.dir.remove(&frame_guard.page_id);
                     drop(dir_guard);
 
                     if frame_guard.dirty {
-                        if let Err(err) = self.io_write_one_w(&frame_guard) {
+                        if let Err(err) = self.io_write_one(&frame_guard) {
                             return Err(err);
                         }
                         frame_guard.dirty = false;
@@ -226,95 +211,6 @@ impl PageBuffer {
                 }
 
                 return Ok((frame_ref, frame_guard));
-            }
-        }
-    }
-
-    /// Will get a free frame, evicting if neccessary
-    /// This function handles all eviction logic (outside the initial scan)
-    ///
-    /// **Note**: The writeguard that this returns will have been held since BEFORE the frame was
-    /// inserted into the page directory
-    fn get_free_frame_2(&self, req_page_id: u64) -> (FrameRef<'_>, FrameWriteGuard<'_>) {
-        loop {
-            let frame_index = self.scan_for_eviction_candidate();
-            let frame_ref = self.frames[frame_index].pin();
-
-            // we'll optimistically try to get a lock on this frame - if we dont, then someone else
-            // evicted this frame before we got a chance, so well try again and find another one
-            if let Some(mut frame_guard) = frame_ref.try_write_lock() {
-                if frame_guard.never_used() {
-                    // if this is a unused frame (like on db startup) we can just take it
-                    frame_guard.reinit(req_page_id);
-                    let mut dir_guard = self.shard_dirs[hash(req_page_id)].write();
-                    match dir_guard.page_frame_map.get(&req_page_id) {
-                        Some(&frame_index) => {
-                            drop(frame_guard);
-                            let frame_ref = self.frames[frame_index].pin();
-                            let frame_guard = frame_ref.write_lock();
-                            return (frame_ref, frame_guard);
-                        }
-                        None => {
-                            dir_guard.page_frame_map.insert(req_page_id, frame_index);
-                            return (frame_ref, frame_guard);
-                        }
-                    }
-                } else {
-                    // otherwise we need to do cleanup
-
-                    if frame_guard.dirty {
-                        let res = self.io_write_one_w(&frame_guard); // TODO
-                        frame_guard.dirty = false;
-                    }
-
-                    // get old and new shard locks - or just old if theyre the same
-                    let (mut dir_guard_old, dir_guard_new_opt) = {
-                        // we need to do this funny thing to ensure we take the locks in ascending
-                        // order, because otherwise we could DEADLOCK in a scenario like:
-                        // thread-A evicts frame from shard-3 to put in shard-1
-                        // thread-B evicts frame from shard-1 to put in shard-3
-                        // thread-A has lock on shard-3, thread-B has lock on shard-1
-                        let old_shard = hash(frame_guard.page_id);
-                        let new_shard = hash(req_page_id);
-
-                        if old_shard < new_shard {
-                            let old_guard = self.shard_dirs[old_shard].write();
-                            let new_guard = self.shard_dirs[new_shard].write();
-                            (old_guard, Some(new_guard))
-                        } else if old_shard > new_shard {
-                            // if theyre == this is fine too ofc
-                            let new_guard = self.shard_dirs[new_shard].write();
-                            let old_guard = self.shard_dirs[old_shard].write();
-                            (old_guard, Some(new_guard))
-                        } else {
-                            let old_guard = self.shard_dirs[old_shard].write();
-                            (old_guard, None)
-                        }
-                    };
-
-                    if frame_ref.pins.load(Ordering::Acquire) != 1 {
-                        // we need to recheck pins again after we take the old directory lock, to make
-                        // sure nobody found this and pinned it in the meantime
-                        // If someone did we drop all our locks and start over
-                        continue;
-                    }
-
-                    if let Some(mut dir_guard_new) = dir_guard_new_opt {
-                        // remove old, insert new
-                        dir_guard_old.page_frame_map.remove(&frame_guard.page_id);
-                        drop(dir_guard_old);
-                        dir_guard_new.page_frame_map.insert(req_page_id, frame_index);
-                        drop(dir_guard_new);
-                    } else {
-                        // remove old, insert new - but for same shard
-                        dir_guard_old.page_frame_map.remove(&frame_guard.page_id);
-                        dir_guard_old.page_frame_map.insert(req_page_id, frame_index);
-                        drop(dir_guard_old);
-                    }
-
-                    frame_guard.reinit(req_page_id);
-                    return (frame_ref, frame_guard);
-                }
             }
         }
     }
@@ -366,4 +262,52 @@ impl PageBuffer {
             }
         }
     }
+
+    // ▪
+    // ██ ▪
+    // ▐█· ▄█▀▄
+    // ▐█▌▐█▌.▐▌
+    // ▀▀▀ ▀█▄▀▪
+    // IO
+
+    /// Must be called once by each worker thread before using the buffer.
+    pub(crate) fn init_thread(&self) {
+        THREAD_IO.with(|cell| {
+            assert!(cell.borrow().is_none(), "Tried to init thread-io twice!");
+            *cell.borrow_mut() = Some(self.io.make_io_doer())
+        });
+    }
+
+    pub(crate) fn thread_io<F, R>(&self, f: F) -> R
+    where
+        F: FnOnce(&dyn io::IODoer) -> R,
+    {
+        THREAD_IO.with(|cell| f(cell.borrow().as_deref().expect("init_thread not called")))
+    }
+
+    fn io_read_one(&self, frame_guard: &mut FrameWriteGuard<'_>) -> Result<(), std::io::ErrorKind> {
+        self.thread_io(|io| {
+            debug_assert_eq!(io.peek(), 0, "queue was dirty before we submitted anything?");
+            let token = next_thread_token();
+            unsafe { io.submit_read(token, frame_guard.page_id, &mut frame_guard.buffer) };
+            io.flush();
+            let (recv_token, res) = io.reap_one();
+            debug_assert_eq!(recv_token, token, "received a token other than the one we submitted - queue was dirty?");
+            res
+        })
+    }
+
+    fn io_write_one(&self, frame_guard: &FrameWriteGuard<'_>) -> Result<(), std::io::ErrorKind> {
+        self.thread_io(|io| {
+            debug_assert_eq!(io.peek(), 0, "queue was dirty before we submitted anything?");
+            let token = next_thread_token();
+            unsafe { io.submit_write(token, frame_guard.page_id, &frame_guard.buffer) };
+            io.flush();
+            let (recv_token, res) = io.reap_one();
+            debug_assert_eq!(recv_token, token, "received a token other than the one we submitted - queue was dirty?");
+            res
+        })
+    }
+
+    // TODO flush all
 }

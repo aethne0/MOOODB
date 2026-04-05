@@ -30,7 +30,7 @@ impl Frame {
         }
     }
 
-    pub(crate) fn frame_id(&self) -> usize {
+    pub(crate) fn index(&self) -> usize {
         self.frame_id
     }
 }
@@ -56,15 +56,26 @@ pub(crate) struct FrameInner {
 }
 
 impl FrameInner {
-    pub(crate) fn never_used(&self) -> bool {
-        self.page_id == PAGE_ID_UNINIT
+    /// When frames are created at DB creation, page_ids are set to a sentinel "None" value
+    /// ([`PAGE_ID_UNINIT`]), this checks if they are still that value. Pages can be reset back to this
+    /// state as well if needed, using [`uninit`], namely during [`PageBuffer::get_new_frame`] if we
+    /// have decide to abandon our frame - we need to clear its page_id so we don't erroneously see
+    /// it later and remove its old `page_id` from the dir
+    pub(crate) fn has_non_init_page(&self) -> bool {
+        self.page_id != PAGE_ID_UNINIT
     }
 
-    /// sets new page_id and cleans up dirty and io_err (false, none)
+    /// sets new `page_id` and cleans up `dirty` and `io_err` (`false`, `none`)
     pub(crate) fn reinit(&mut self, page_id: u64) {
         self.page_id = page_id;
         self.dirty = false;
         self.io_err = None;
+    }
+
+    /// Reinitializes the page using the "never initialized" sentinel `page_id` value
+    /// ([`PAGE_ID_UNINIT`]). See [`FrameInner::has_non_init_page`] for more info.
+    pub(crate) fn uninit(&mut self) {
+        self.reinit(PAGE_ID_UNINIT);
     }
 }
 
