@@ -10,13 +10,15 @@ use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
 
 use crate::{
-    buffer::frame::{Frame, FrameRef, FrameWriteGuard},
     io,
-    system::MmapBox,
+    storage::{
+        frame::{Frame, FrameRef, FrameWriteGuard},
+        memory_alloc::MmapBox,
+    },
 };
 
 thread_local! {
-    static THREAD_IO: RefCell<Option<Box<dyn io::IODoer>>> = RefCell::new(None);
+    static THREAD_IO: RefCell<Option<Box<dyn crate::io::IODoer>>> = RefCell::new(None);
 }
 
 static THREAD_TOKEN_PREFIX_NEXT: AtomicU64 = AtomicU64::new(0);
@@ -53,30 +55,32 @@ fn hash(mut page_id: u64) -> usize {
 
 type PageId = u64;
 
-pub(crate) struct PageBuffer {
-    pub(crate) io: Arc<dyn crate::io::IOFactory>,
+pub(super) struct PageBuffer {
+    pub(super) io: Arc<dyn crate::io::IOFactory>,
     frames: MmapBox<[Frame]>,
     /// All shards' maps of `page_id` -> `frame_index`
     shard_dirs: Box<[RwLock<PageBufferShard>]>,
     eviction_hand: AtomicUsize,
 }
 
-pub(crate) struct PageBufferShard {
+pub(super) struct PageBufferShard {
     // making this a struct incase we add more later - might flatten
     /// Shard's map of `page_id` -> `frame_index`
     dir: FxHashMap<PageId, usize>,
 }
 
 impl PageBuffer {
-    pub(crate) fn new(io: Arc<dyn io::IOFactory>, frame_count: usize) -> Self {
+    pub(super) fn new(io: Arc<dyn crate::io::IOFactory>, frame_count: usize) -> Self {
         assert_ne!(frame_count, 0);
 
         let mut i = 0;
-        let frames = MmapBox::<[Frame]>::new_slice_with(frame_count, || {
+        let (frames, allocated_bytes) = MmapBox::<[Frame]>::new_slice_with(frame_count, || {
             let frame = Frame::new(i);
             i += 1;
             frame
         });
+
+        tracing::info!("PageBuffer reserved {}", monke::fmt_size(allocated_bytes));
 
         let shard_dirs = Vec::from_iter((0..SHARD_CNT).into_iter().map(|_| {
             let mut map = FxHashMap::default();
@@ -100,7 +104,7 @@ impl PageBuffer {
     ///
     /// **NOTE**: It is assumed that, for a given `page_id`, `get_page_new` will only ever be called
     /// once. Multiple threads calling this with the same `page_id` will result in a race.
-    pub(crate) fn get_page_new(
+    pub(super) fn get_page_new(
         &self, new_page_id: u64,
     ) -> Result<(FrameRef<'_>, FrameWriteGuard<'_>), std::io::ErrorKind> {
         let (frame_ref, mut frame_guard) = match self.get_free_frame() {
@@ -118,7 +122,7 @@ impl PageBuffer {
     }
 
     /// Fetches existing page
-    pub(crate) fn get_page_existing(&self, page_id: u64) -> Result<FrameRef<'_>, std::io::ErrorKind> {
+    pub(super) fn get_page_existing(&self, page_id: u64) -> Result<FrameRef<'_>, std::io::ErrorKind> {
         let shard = hash(page_id);
 
         // if its already paged in
@@ -271,14 +275,14 @@ impl PageBuffer {
     // IO
 
     /// Must be called once by each worker thread before using the buffer.
-    pub(crate) fn init_thread(&self) {
+    pub(super) fn init_thread(&self) {
         THREAD_IO.with(|cell| {
             assert!(cell.borrow().is_none(), "Tried to init thread-io twice!");
             *cell.borrow_mut() = Some(self.io.make_io_doer())
         });
     }
 
-    pub(crate) fn thread_io<F, R>(&self, f: F) -> R
+    pub(super) fn thread_io<F, R>(&self, f: F) -> R
     where
         F: FnOnce(&dyn io::IODoer) -> R,
     {
@@ -310,4 +314,244 @@ impl PageBuffer {
     }
 
     // TODO flush all
+}
+
+/// ▄▄▄▄▄▄▄▄ ..▄▄ · ▄▄▄▄▄.▄▄ ·
+/// •██  ▀▄.▀·▐█ ▀. •██  ▐█ ▀.
+///  ▐█.▪▐▀▀▪▄▄▀▀▀█▄ ▐█.▪▄▀▀▀█▄
+///  ▐█▌·▐█▄▄▌▐█▄▪▐█ ▐█▌·▐█▄▪▐█
+///  ▀▀▀  ▀▀▀  ▀▀▀▀  ▀▀▀  ▀▀▀▀
+#[cfg(test)]
+mod tests {
+    use std::sync::Arc;
+
+    use super::*;
+    use crate::{io::mem_io::MemIO, page::PAGE_SIZE};
+
+    fn make_buf(frame_count: usize) -> PageBuffer {
+        let buf = PageBuffer::new(Arc::new(MemIO::new()), frame_count);
+        buf.init_thread();
+        buf
+    }
+
+    // ─── get_page_new ───────────────────────────────────────────────────────────
+
+    #[test]
+    fn get_page_new_sets_page_id() {
+        let buf = make_buf(4);
+
+        let (_r, g) = buf.get_page_new(42).expect("should allocate frame");
+
+        assert_eq!(g.page_id, 42);
+    }
+
+    #[test]
+    fn get_page_new_clears_dirty_and_io_err() {
+        let buf = make_buf(4);
+
+        let (_r, g) = buf.get_page_new(1).expect("should allocate frame");
+
+        assert!(!g.dirty, "dirty must be false after get_page_new");
+        assert!(g.io_err.is_none(), "io_err must be None after get_page_new");
+    }
+
+    #[test]
+    fn get_page_new_different_ids_get_different_frames() {
+        let buf = make_buf(4);
+
+        let (r1, _g1) = buf.get_page_new(1).expect("page 1");
+        let (r2, _g2) = buf.get_page_new(2).expect("page 2");
+        let (r3, _g3) = buf.get_page_new(3).expect("page 3");
+
+        assert_ne!(r1.index(), r2.index());
+        assert_ne!(r2.index(), r3.index());
+        assert_ne!(r1.index(), r3.index());
+    }
+
+    // ─── get_page_existing ──────────────────────────────────────────────────────
+
+    #[test]
+    fn get_page_existing_finds_cached_page_in_same_frame() {
+        let buf = make_buf(4);
+
+        let (orig_ref, g) = buf.get_page_new(7).expect("allocate page 7");
+        let orig_index = orig_ref.index();
+        drop(g);
+        // keep orig_ref alive so the frame stays pinned and cannot be evicted
+
+        let found = buf.get_page_existing(7).expect("should find page 7 in buffer");
+
+        assert_eq!(found.index(), orig_index, "get_page_existing must return the same frame as get_page_new");
+    }
+
+    // ─── eviction & dirty flush ─────────────────────────────────────────────────
+
+    /// Fill all 3 frames, mark one dirty, force it out by requesting a 4th page,
+    /// then reload that page from IO and verify the data survived the eviction cycle.
+    #[test]
+    fn dirty_page_data_survives_eviction_and_reload() {
+        let buf = make_buf(3);
+        let pattern = [0xABu8; PAGE_SIZE];
+
+        // Allocate all 3 frames.
+        let (r1, mut g1) = buf.get_page_new(1).expect("page 1");
+        let (r2, g2) = buf.get_page_new(2).expect("page 2");
+        let (r3, g3) = buf.get_page_new(3).expect("page 3");
+
+        // Write a recognizable pattern to page 1 and mark it dirty.
+        g1.buffer.copy_from_slice(&pattern);
+        g1.dirty = true;
+        drop(g1);
+        drop(r1); // unpin; frame for page 1 is the only eviction candidate
+
+        // Request page 4: forces eviction of the only unpinned frame (page 1).
+        // Because it was dirty, the eviction path must flush it to IO.
+        let (r4, g4) = buf.get_page_new(4).expect("should evict dirty page 1");
+        drop(g4);
+        drop(r4);
+
+        // Unpin pages 2 and 3 so their frames are free for the reload.
+        drop(g2);
+        drop(r2);
+        drop(g3);
+        drop(r3);
+
+        // Re-fetch page 1; it must now be loaded back from IO with the original data.
+        let reloaded = buf.get_page_existing(1).expect("should reload page 1 from IO");
+        let guard = reloaded.read_lock();
+
+        assert_eq!(guard.buffer, pattern, "reloaded buffer must match data written before eviction");
+    }
+
+    /// Same setup but the frame is NOT marked dirty; the buffer content must
+    /// not be persisted, and a subsequent reload should return zeroes.
+    #[test]
+    fn clean_page_not_flushed_to_io_on_eviction() {
+        let buf = make_buf(3);
+        let garbage = [0xFFu8; PAGE_SIZE];
+
+        let (r1, mut g1) = buf.get_page_new(1).expect("page 1");
+        let (r2, g2) = buf.get_page_new(2).expect("page 2");
+        let (r3, g3) = buf.get_page_new(3).expect("page 3");
+
+        // Write to the frame buffer but do NOT set dirty.
+        g1.buffer.copy_from_slice(&garbage);
+        // g1.dirty remains false
+        drop(g1);
+        drop(r1);
+
+        // Evict page 1 cleanly (no IO write should occur).
+        let (r4, g4) = buf.get_page_new(4).expect("should evict clean page 1");
+        drop(g4);
+        drop(r4);
+        drop(g2);
+        drop(r2);
+        drop(g3);
+        drop(r3);
+
+        // Reload page 1; MemIO returns zeroes for pages it has never written.
+        let reloaded = buf.get_page_existing(1).expect("reload page 1");
+        let guard = reloaded.read_lock();
+
+        assert_eq!(guard.buffer, [0u8; PAGE_SIZE], "non-dirty eviction must not persist the frame contents");
+    }
+
+    // ─── pin protection ─────────────────────────────────────────────────────────
+
+    /// A pinned frame must never be chosen as an eviction candidate.
+    /// Allocate 2 frames, keep one pinned, request a third — the buffer must
+    /// evict the unpinned frame and leave the pinned page intact.
+    #[test]
+    fn pinned_frame_is_not_evicted() {
+        let buf = make_buf(2);
+
+        let (r1, g1) = buf.get_page_new(1).expect("page 1");
+        let (r2, g2) = buf.get_page_new(2).expect("page 2");
+
+        // Unpin page 2 but keep page 1 fully pinned.
+        drop(g2);
+        drop(r2);
+
+        // Requesting page 3 must evict page 2 (the only unpinned frame).
+        let (_r3, g3) = buf.get_page_new(3).expect("should evict page 2 not page 1");
+        assert_eq!(g3.page_id, 3);
+        drop(g3);
+
+        // Page 1 must still be resident in its original frame.
+        let found = buf.get_page_existing(1).expect("page 1 must still be in buffer");
+        assert_eq!(found.index(), r1.index(), "page 1 must still occupy its original frame");
+
+        drop(g1);
+        drop(r1);
+    }
+
+    // ─── concurrency ────────────────────────────────────────────────────────────
+
+    /// Two threads calling get_page_existing for the same already-cached page
+    /// must both succeed and see the correct page_id — no race, no deadlock.
+    #[test]
+    fn concurrent_get_page_existing_cached_page_both_succeed() {
+        let buf = PageBuffer::new(Arc::new(MemIO::new()), 16);
+        buf.init_thread();
+
+        // Seed page 42 so it is in the directory.
+        let (r, g) = buf.get_page_new(42).expect("seed page 42");
+        drop(g);
+        drop(r);
+
+        std::thread::scope(|s| {
+            let h1 = s.spawn(|| {
+                buf.init_thread();
+                let frame = buf.get_page_existing(42).expect("t1: page 42");
+                frame.read_lock().page_id
+            });
+            let h2 = s.spawn(|| {
+                buf.init_thread();
+                let frame = buf.get_page_existing(42).expect("t2: page 42");
+                frame.read_lock().page_id
+            });
+
+            assert_eq!(h1.join().expect("thread 1 panicked"), 42);
+            assert_eq!(h2.join().expect("thread 2 panicked"), 42);
+        });
+    }
+
+    /// Many threads race to load the same uncached page simultaneously.
+    /// Every thread must get back the correct page_id and the directory must
+    /// not be left in an inconsistent state.
+    #[test]
+    fn concurrent_load_of_uncached_page_all_threads_see_correct_page_id() {
+        // Large buffer: enough frames so no eviction pressure during the race,
+        // but page 99 starts uncached so all threads hit the slow path.
+        let buf = PageBuffer::new(Arc::new(MemIO::new()), 64);
+        buf.init_thread();
+
+        // Seed page 99 in IO by allocating it dirty, then evicting it via fill.
+        let (r, mut g) = buf.get_page_new(99).expect("seed page 99");
+        g.dirty = true;
+        drop(g);
+        drop(r);
+        {
+            // 63 additional pages fill the remaining frames, forcing page 99 out.
+            let mut refs = Vec::new();
+            for id in 100..163u64 {
+                refs.push(buf.get_page_new(id).expect("fill frame"));
+            }
+        } // all unpinned here; page 99 was evicted and flushed
+
+        let results: std::sync::Mutex<Vec<u64>> = std::sync::Mutex::new(Vec::new());
+        std::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    buf.init_thread();
+                    let frame = buf.get_page_existing(99).expect("should load page 99");
+                    results.lock().unwrap().push(frame.read_lock().page_id);
+                });
+            }
+        });
+
+        let ids = results.into_inner().unwrap();
+        assert_eq!(ids.len(), 8, "all threads must complete");
+        assert!(ids.iter().all(|&id| id == 99), "every thread must see page_id 99, got: {ids:?}");
+    }
 }

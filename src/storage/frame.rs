@@ -7,15 +7,15 @@ use crate::page::PAGE_SIZE;
 #[repr(align(64))]
 pub(crate) struct Frame {
     frame_id: usize,
-    pub(crate) usage: AtomicU8,
-    pub(crate) pins: AtomicI16,
-    pub(crate) inner: RwLock<FrameInner>,
+    pub(super) usage: AtomicU8,
+    pub(super) pins: AtomicI16,
+    pub(super) inner: RwLock<FrameInner>,
 }
 
 const PAGE_ID_UNINIT: u64 = u64::MAX;
 
 impl Frame {
-    pub(crate) fn new(frame_id: usize) -> Self {
+    pub(super) fn new(frame_id: usize) -> Self {
         Self {
             frame_id,
             usage: AtomicU8::new(0),
@@ -30,29 +30,33 @@ impl Frame {
         }
     }
 
-    pub(crate) fn index(&self) -> usize {
+    pub(super) fn index(&self) -> usize {
         self.frame_id
     }
 }
 
 impl<'a> Frame {
     #[must_use = "RAII FrameRef unpins when dropped"]
-    pub(crate) fn pin(&'a self) -> FrameRef<'a> {
+    pub(super) fn pin(&'a self) -> FrameRef<'a> {
         self.pins.fetch_add(1, Ordering::Release);
         self.usage.fetch_add(1, Ordering::Relaxed);
         FrameRef { frame: self }
+    }
+
+    pub(super) fn leak(&'a self) {
+        self.pins.fetch_add(1, Ordering::Release);
     }
 }
 
 #[repr(align(64))]
 pub(crate) struct FrameInner {
-    pub(crate) buffer: [u8; PAGE_SIZE],
+    pub(super) buffer: [u8; PAGE_SIZE],
 
-    pub(crate) page_id: u64,
-    pub(crate) dirty: bool,
+    pub(super) page_id: u64,
+    pub(super) dirty: bool,
     /// This is for the loading-in task to flag waiting tasks that there was an
     /// IO error - abandon ship!
-    pub(crate) io_err: Option<std::io::ErrorKind>,
+    pub(super) io_err: Option<std::io::ErrorKind>,
 }
 
 impl FrameInner {
@@ -61,12 +65,12 @@ impl FrameInner {
     /// state as well if needed, using [`uninit`], namely during [`PageBuffer::get_new_frame`] if we
     /// have decide to abandon our frame - we need to clear its page_id so we don't erroneously see
     /// it later and remove its old `page_id` from the dir
-    pub(crate) fn has_non_init_page(&self) -> bool {
+    pub(super) fn has_non_init_page(&self) -> bool {
         self.page_id != PAGE_ID_UNINIT
     }
 
     /// sets new `page_id` and cleans up `dirty` and `io_err` (`false`, `none`)
-    pub(crate) fn reinit(&mut self, page_id: u64) {
+    pub(super) fn reinit(&mut self, page_id: u64) {
         self.page_id = page_id;
         self.dirty = false;
         self.io_err = None;
@@ -74,7 +78,7 @@ impl FrameInner {
 
     /// Reinitializes the page using the "never initialized" sentinel `page_id` value
     /// ([`PAGE_ID_UNINIT`]). See [`FrameInner::has_non_init_page`] for more info.
-    pub(crate) fn uninit(&mut self) {
+    pub(super) fn uninit(&mut self) {
         self.reinit(PAGE_ID_UNINIT);
     }
 }
@@ -86,12 +90,12 @@ pub(crate) struct FrameRef<'a> {
 
 impl<'a> FrameRef<'a> {
     #[must_use = "RAII FrameReadGuard unpins when dropped"]
-    pub(crate) fn read_lock(&self) -> FrameReadGuard<'a> {
+    pub(super) fn read_lock(&self) -> FrameReadGuard<'a> {
         FrameReadGuard { frame: self.frame.inner.read() }
     }
 
     #[must_use = "RAII FrameReadGuard unpins when dropped"]
-    pub(crate) fn try_read_lock(&self) -> Option<FrameReadGuard<'a>> {
+    pub(super) fn try_read_lock(&self) -> Option<FrameReadGuard<'a>> {
         let guard_opt = self.frame.inner.try_read();
         match guard_opt {
             Some(guard) => Some(FrameReadGuard { frame: guard }),
@@ -100,12 +104,12 @@ impl<'a> FrameRef<'a> {
     }
 
     #[must_use = "RAII FrameWriteGuard unpins when dropped"]
-    pub(crate) fn write_lock(&self) -> FrameWriteGuard<'a> {
+    pub(super) fn write_lock(&self) -> FrameWriteGuard<'a> {
         FrameWriteGuard { frame: self.frame.inner.write() }
     }
 
     #[must_use = "RAII FrameReadGuard unpins when dropped"]
-    pub(crate) fn try_write_lock(&self) -> Option<FrameWriteGuard<'a>> {
+    pub(super) fn try_write_lock(&self) -> Option<FrameWriteGuard<'a>> {
         let guard_opt = self.frame.inner.try_write();
         match guard_opt {
             Some(guard) => Some(FrameWriteGuard { frame: guard }),

@@ -1,3 +1,4 @@
+//! Platform specific memory allocation for the page-buffer
 pub(crate) struct MmapBox<T: ?Sized> {
     ptr: *mut T,
     raw: *mut libc::c_void, // thin base pointer for munmap
@@ -24,14 +25,14 @@ pub(crate) struct MmapBox<T: ?Sized> {
 // }
 
 impl<T> MmapBox<[T]> {
-    pub(crate) fn new_slice_with(count: usize, mut f: impl FnMut() -> T) -> Self {
+    pub(crate) fn new_slice_with(count: usize, mut f: impl FnMut() -> T) -> (Self, usize) {
         let size = size_of::<T>() * count;
         let raw = alloc_huge(size) as *mut libc::c_void;
         let thin = raw as *mut T;
         for i in 0..count {
             unsafe { std::ptr::write(thin.add(i), f()) };
         }
-        Self { ptr: std::ptr::slice_from_raw_parts_mut(thin, count), raw, size }
+        (Self { ptr: std::ptr::slice_from_raw_parts_mut(thin, count), raw, size }, size)
     }
 }
 

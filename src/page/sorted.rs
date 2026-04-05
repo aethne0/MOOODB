@@ -1,7 +1,7 @@
 use std::mem::size_of;
 use std::ops::{Deref, DerefMut};
 
-use crate::page::common::PageCommon;
+use crate::page::common::Common;
 use crate::page::{PAGE_SIZE, PageType, RangeExt, SLOT_SIZE};
 
 /// A sorted B-tree page storing key-value pairs in ascending key order.
@@ -9,19 +9,19 @@ use crate::page::{PAGE_SIZE, PageType, RangeExt, SLOT_SIZE};
 /// Generic over its buffer `B`:
 /// - `PageSorted<&'b mut [u8; PAGE_SIZE]>` — full read/write access
 /// - `PageSorted<&'b [u8; PAGE_SIZE]>` — read-only (aliased as [`PageSortedRef`])
-pub(crate) struct PageSorted<B> {
-    core: PageCommon<B>,
+pub(crate) struct Sorted<B> {
+    core: Common<B>,
 }
 
 /// Read-only view of a sorted page buffer.
-pub(crate) type PageSortedRef<'b> = PageSorted<&'b [u8; PAGE_SIZE]>;
+pub(crate) type SortedRef<'b> = Sorted<&'b [u8; PAGE_SIZE]>;
 
 // constructors
 
-impl<'b> PageSorted<&'b mut [u8; PAGE_SIZE]> {
+impl<'b> Sorted<&'b mut [u8; PAGE_SIZE]> {
     /// Wraps `buffer` as a `PageSorted`. Does not initialize or validate any fields.
     pub(crate) fn from_buffer(buffer: &'b mut [u8; PAGE_SIZE]) -> Self {
-        Self { core: PageCommon::from_buffer(buffer) }
+        Self { core: Common::from_buffer(buffer) }
     }
 
     /// Wraps `buffer` as a `PageSorted` and initializes the page header.
@@ -34,15 +34,15 @@ impl<'b> PageSorted<&'b mut [u8; PAGE_SIZE]> {
     }
 }
 
-impl<'b> PageSorted<&'b [u8; PAGE_SIZE]> {
+impl<'b> Sorted<&'b [u8; PAGE_SIZE]> {
     pub(crate) fn from_buffer_ref(buffer: &'b [u8; PAGE_SIZE]) -> Self {
-        Self { core: PageCommon::from_buffer_ref(buffer) }
+        Self { core: Common::from_buffer_ref(buffer) }
     }
 }
 
 // read impl
 
-impl<B: AsRef<[u8]>> PageSorted<B> {
+impl<B: AsRef<[u8]>> Sorted<B> {
     /// Returns `true` if this page's type field is [`PageType::Inner`].
     pub(crate) fn is_inner(&self) -> bool {
         self.page_type() == PageType::Inner as u8
@@ -112,9 +112,9 @@ impl<B: AsRef<[u8]>> PageSorted<B> {
     }
 
     /// Returns an iterator over `(key, value)` pairs in ascending key order.
-    pub(crate) fn iter(&self) -> PageSortedIterator<'_, B> {
+    pub(crate) fn iter(&self) -> SortedIterator<'_, B> {
         assert!(!self.is_free());
-        PageSortedIterator { page: self, slot_index: 0 }
+        SortedIterator { page: self, slot_index: 0 }
     }
 
     /// Returns the value associated with `key`, or `None` if not present.
@@ -137,7 +137,7 @@ impl<B: AsRef<[u8]>> PageSorted<B> {
 
 // write impl
 
-impl<B: AsRef<[u8]> + AsMut<[u8]>> PageSorted<B> {
+impl<B: AsRef<[u8]> + AsMut<[u8]>> Sorted<B> {
     /// Removes all entries, reclaiming all entry space.
     pub(crate) fn clear(&mut self) {
         assert!(!self.is_free());
@@ -233,7 +233,7 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> PageSorted<B> {
 
         let mut cloned_raw = [0u8; PAGE_SIZE];
         cloned_raw.copy_from_slice(self.raw());
-        let cloned_page = PageSorted::from_buffer(&mut cloned_raw);
+        let cloned_page = Sorted::from_buffer(&mut cloned_raw);
 
         self.clear_entries();
 
@@ -245,28 +245,28 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> PageSorted<B> {
 
 // deref
 
-impl<B: AsRef<[u8]>> Deref for PageSorted<B> {
-    type Target = PageCommon<B>;
+impl<B: AsRef<[u8]>> Deref for Sorted<B> {
+    type Target = Common<B>;
 
     fn deref(&self) -> &Self::Target {
         &self.core
     }
 }
 
-impl<B: AsRef<[u8]> + AsMut<[u8]>> DerefMut for PageSorted<B> {
-    fn deref_mut(&mut self) -> &mut PageCommon<B> {
+impl<B: AsRef<[u8]> + AsMut<[u8]>> DerefMut for Sorted<B> {
+    fn deref_mut(&mut self) -> &mut Common<B> {
         &mut self.core
     }
 }
 
 // iterator
 
-pub(crate) struct PageSortedIterator<'a, B: AsRef<[u8]>> {
-    page: &'a PageSorted<B>,
+pub(crate) struct SortedIterator<'a, B: AsRef<[u8]>> {
+    page: &'a Sorted<B>,
     slot_index: u16,
 }
 
-impl<'a, B: AsRef<[u8]>> Iterator for PageSortedIterator<'a, B> {
+impl<'a, B: AsRef<[u8]>> Iterator for SortedIterator<'a, B> {
     type Item = (&'a [u8], &'a [u8]);
 
     fn next(&mut self) -> Option<Self::Item> {
@@ -279,9 +279,9 @@ impl<'a, B: AsRef<[u8]>> Iterator for PageSortedIterator<'a, B> {
     }
 }
 
-impl<'a, B: AsRef<[u8]>> IntoIterator for &'a PageSorted<B> {
+impl<'a, B: AsRef<[u8]>> IntoIterator for &'a Sorted<B> {
     type Item = (&'a [u8], &'a [u8]);
-    type IntoIter = PageSortedIterator<'a, B>;
+    type IntoIter = SortedIterator<'a, B>;
 
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
@@ -312,11 +312,11 @@ mod test {
 
     use crate::page::{
         PAGE_HEADER_SIZE, PAGE_SIZE, PageType,
-        sorted::{PageSorted, PageSortedRef},
+        sorted::{Sorted, SortedRef},
     };
 
-    fn make_leaf_page(buffer: &mut [u8; PAGE_SIZE]) -> PageSorted<&mut [u8; PAGE_SIZE]> {
-        PageSorted::new_with_buffer(buffer, 2, PageType::Leaf, 1, 3)
+    fn make_leaf_page(buffer: &mut [u8; PAGE_SIZE]) -> Sorted<&mut [u8; PAGE_SIZE]> {
+        Sorted::new_with_buffer(buffer, 2, PageType::Leaf, 1, 3)
     }
 
     #[test]
@@ -355,7 +355,7 @@ mod test {
 
         let mut buffer2 = [0u8; PAGE_SIZE];
         buffer2.copy_from_slice(the_page.raw());
-        let mut the_other_page = PageSorted::from_buffer(&mut buffer2);
+        let mut the_other_page = Sorted::from_buffer(&mut buffer2);
         the_other_page.compact();
 
         for ((k1, v1), (k2, v2)) in the_page.iter().zip(the_other_page.iter()) {
@@ -384,7 +384,7 @@ mod test {
 
         let mut buffer2 = [0u8; PAGE_SIZE];
         buffer2.copy_from_slice(the_page.raw());
-        let the_other_page = PageSorted::from_buffer(&mut buffer2);
+        let the_other_page = Sorted::from_buffer(&mut buffer2);
 
         for (k, _) in the_other_page.iter() {
             the_page.delete(k);
@@ -724,7 +724,7 @@ mod test {
             let mut page = make_leaf_page(&mut buffer);
             page.insert(b"key", b"val");
         }
-        let view = PageSortedRef::from_buffer_ref(&buffer);
+        let view = SortedRef::from_buffer_ref(&buffer);
         assert_eq!(view.get(b"key"), Some(&b"val"[..]));
         assert_eq!(view.len(), 1);
     }

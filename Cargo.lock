@@ -252,12 +252,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "68354c5c6bd36d73ff3feceb05efa59b6acb7626617f4962be322a825e61f79a"
 
 [[package]]
+name = "monke"
+version = "0.1.0"
+source = "git+https://github.com/aethne0/monke-util#4327b8c0532187b0c38e0eeb06d67fb0b4968f9c"
+
+[[package]]
 name = "mooo"
 version = "0.1.0"
 dependencies = [
  "axboe-liburing",
  "claims",
  "libc",
+ "monke",
  "parking_lot",
  "paste",
  "rand",

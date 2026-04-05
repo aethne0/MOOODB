@@ -100,38 +100,3 @@ macro_rules! accessors {
         }
     };
 }
-
-#[macro_export]
-macro_rules! Bytes {
-    ($x:expr) => {
-        $x
-    };
-}
-
-#[macro_export]
-macro_rules! KiB {
-    ($x:expr) => {
-        $x * 1024
-    };
-}
-
-#[macro_export]
-macro_rules! MiB {
-    ($x:expr) => {
-        $x * 1024 * 1024
-    };
-}
-
-#[macro_export]
-macro_rules! GiB {
-    ($x:expr) => {
-        $x * 1024 * 1024 * 1024
-    };
-}
-
-#[macro_export]
-macro_rules! TiB {
-    ($x:expr) => {
-        $x * 1024 * 1024 * 1024 * 1024
-    };
-}

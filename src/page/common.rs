@@ -17,22 +17,19 @@ use crate::{
 ///
 /// Read methods are available whenever `B: AsRef<[u8]>`.
 /// Write methods are available whenever `B: AsRef<[u8]> + AsMut<[u8]>`.
-pub(crate) struct PageCommon<B> {
+pub(crate) struct Common<B> {
     pub(crate) raw: B,
 }
 
-/// Read-only view of a page buffer.
-pub(crate) type PageCommonRef<'b> = PageCommon<&'b [u8; PAGE_SIZE]>;
-
 // constructors
 
-impl<'b> PageCommon<&'b mut [u8; PAGE_SIZE]> {
+impl<'b> Common<&'b mut [u8; PAGE_SIZE]> {
     pub(crate) fn from_buffer(buffer: &'b mut [u8; PAGE_SIZE]) -> Self {
         Self { raw: buffer }
     }
 }
 
-impl<'b> PageCommon<&'b [u8; PAGE_SIZE]> {
+impl<'b> Common<&'b [u8; PAGE_SIZE]> {
     pub(crate) fn from_buffer_ref(buffer: &'b [u8; PAGE_SIZE]) -> Self {
         Self { raw: buffer }
     }
@@ -40,7 +37,7 @@ impl<'b> PageCommon<&'b [u8; PAGE_SIZE]> {
 
 // read impl
 
-impl<B: AsRef<[u8]>> PageCommon<B> {
+impl<B: AsRef<[u8]>> Common<B> {
     accessors_read!(u8, u16, u64);
 
     #[rustfmt::skip]
@@ -96,7 +93,7 @@ impl<B: AsRef<[u8]>> PageCommon<B> {
 
 // write impl
 
-impl<B: AsRef<[u8]> + AsMut<[u8]>> PageCommon<B> {
+impl<B: AsRef<[u8]> + AsMut<[u8]>> Common<B> {
     accessors_write!(u8, u16, u64);
 
     #[rustfmt::skip]
@@ -182,7 +179,7 @@ mod tests {
     #[test]
     fn test_initialize_header() {
         let mut buffer = [0u8; PAGE_SIZE];
-        let mut page = PageCommon::from_buffer(&mut buffer);
+        let mut page = Common::from_buffer(&mut buffer);
         page.initialize_header(42, PageType::Heap, 1, 2);
 
         assert_eq!(page.page_id(), 42);
@@ -198,7 +195,7 @@ mod tests {
     #[test]
     fn test_checksum() {
         let mut buffer = [0u8; PAGE_SIZE];
-        let mut page = PageCommon::from_buffer(&mut buffer);
+        let mut page = Common::from_buffer(&mut buffer);
         page.initialize_header(42, PageType::Heap, 1, 2);
 
         let checksum = page.compute_checksum();
@@ -213,7 +210,7 @@ mod tests {
     #[test]
     fn test_space_and_pointers() {
         let mut buffer = [0u8; PAGE_SIZE];
-        let mut page = PageCommon::from_buffer(&mut buffer);
+        let mut page = Common::from_buffer(&mut buffer);
         page.initialize_header(1, PageType::Heap, 0, 0);
 
         let initial_free = page.free();
@@ -234,10 +231,10 @@ mod tests {
     fn test_readonly_view() {
         let mut buffer = [0u8; PAGE_SIZE];
         {
-            let mut page = PageCommon::from_buffer(&mut buffer);
+            let mut page = Common::from_buffer(&mut buffer);
             page.initialize_header(7, PageType::Leaf, 0, 0);
         }
-        let view = PageCommonRef::from_buffer_ref(&buffer);
+        let view = Common::from_buffer_ref(&buffer);
         assert_eq!(view.page_id(), 7);
         assert_eq!(view.page_type(), PageType::Leaf as u8);
         assert!(!view.is_free());

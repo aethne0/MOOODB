@@ -10,16 +10,18 @@ pub(crate) const SLOT_SIZE: u16 = size_of::<u16>() as u16;
 const END_OF_PAGE: u16 = (PAGE_SIZE - 1) as u16;
 const PAGE_HEADER_SIZE: u16 = 0x40;
 
+mod macros;
+
 mod common;
 mod heap;
 mod sorted;
 mod superblock;
 
-pub(crate) use common::{PageCommon, PageCommonRef};
-pub(crate) use heap::PageHeap;
-pub(crate) use sorted::PageSorted;
-pub(crate) use superblock::PageSuperblock;
+pub(crate) use common::Common;
+pub(crate) use heap::Heap;
+pub(crate) use sorted::Sorted;
 pub(crate) use superblock::SUPERBLOCK_PAGE_ID;
+pub(crate) use superblock::Superblock;
 
 /// Converts a range whose bounds implement `Into<usize>` into a plain `(Bound<usize>, Bound<usize>)`,
 /// making it usable as a slice index on `[u8]` buffers.
