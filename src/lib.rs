@@ -11,11 +11,9 @@
 mod macros;
 
 mod buffer;
-mod io;
 mod page;
 mod system;
-
-mod mem_io;
+mod io;
 
 #[cfg(test)]
 mod test_util;

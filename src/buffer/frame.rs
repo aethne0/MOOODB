@@ -1,11 +1,8 @@
-use std::{
-    cell::Cell,
-    sync::atomic::{AtomicI16, AtomicU8, AtomicU64, Ordering},
-};
+use std::sync::atomic::{AtomicI16, AtomicU8, Ordering};
 
 use parking_lot::{RwLock, RwLockReadGuard, RwLockWriteGuard};
 
-use crate::{buffer::page_buffer::PageBuffer, io, page::PAGE_SIZE};
+use crate::page::PAGE_SIZE;
 
 #[repr(align(64))]
 pub(crate) struct Frame {
@@ -40,9 +37,10 @@ impl Frame {
 
 impl<'a> Frame {
     #[must_use = "RAII FrameRef unpins when dropped"]
-    pub(crate) fn pin(&'a self, pager: &'a PageBuffer) -> FrameRef<'a> {
+    pub(crate) fn pin(&'a self) -> FrameRef<'a> {
         self.pins.fetch_add(1, Ordering::Release);
-        FrameRef { frame: self, pager }
+        self.usage.fetch_add(1, Ordering::Relaxed);
+        FrameRef { frame: self }
     }
 }
 
@@ -54,7 +52,7 @@ pub(crate) struct FrameInner {
     pub(crate) dirty: bool,
     /// This is for the loading-in task to flag waiting tasks that there was an
     /// IO error - abandon ship!
-    pub(crate) io_err: Option<io::IOError>,
+    pub(crate) io_err: Option<std::io::ErrorKind>,
 }
 
 impl FrameInner {
@@ -70,55 +68,36 @@ impl FrameInner {
     }
 }
 
-static THREAD_TOKEN_PREFIX_NEXT: AtomicU64 = AtomicU64::new(0);
-
-thread_local! {
-    static THREAD_TOKEN_PREFIX: u64 = THREAD_TOKEN_PREFIX_NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    static THREAD_TOKEN_NEXT: Cell<u64> = Cell::new(0);
-}
-
-fn next_token() -> u64 {
-    THREAD_TOKEN_PREFIX.with(|&token_prefix| {
-        debug_assert!(token_prefix < 0x100, "Only 8 bits allocated for thread token prefix id (max 256 threads)");
-        THREAD_TOKEN_NEXT.with(|token_next_cell| {
-            let token_next = token_next_cell.get();
-            token_next_cell.set(token_next + 1);
-            (token_prefix << 56) | (token_next & 0x00ff_ffff_ffff_ffff)
-        })
-    })
-}
-
 /// RAII Ref to a frame - decrements frame pin counter on [`Drop`]
 pub(crate) struct FrameRef<'a> {
     frame: &'a Frame,
-    pager: &'a PageBuffer,
 }
 
 impl<'a> FrameRef<'a> {
     #[must_use = "RAII FrameReadGuard unpins when dropped"]
     pub(crate) fn read_lock(&self) -> FrameReadGuard<'a> {
-        FrameReadGuard { frame: self.frame.inner.read(), pager: self.pager }
+        FrameReadGuard { frame: self.frame.inner.read() }
     }
 
     #[must_use = "RAII FrameReadGuard unpins when dropped"]
     pub(crate) fn try_read_lock(&self) -> Option<FrameReadGuard<'a>> {
         let guard_opt = self.frame.inner.try_read();
         match guard_opt {
-            Some(guard) => Some(FrameReadGuard { frame: guard, pager: self.pager }),
+            Some(guard) => Some(FrameReadGuard { frame: guard }),
             None => None,
         }
     }
 
     #[must_use = "RAII FrameWriteGuard unpins when dropped"]
     pub(crate) fn write_lock(&self) -> FrameWriteGuard<'a> {
-        FrameWriteGuard { frame: self.frame.inner.write(), pager: self.pager }
+        FrameWriteGuard { frame: self.frame.inner.write() }
     }
 
     #[must_use = "RAII FrameReadGuard unpins when dropped"]
     pub(crate) fn try_write_lock(&self) -> Option<FrameWriteGuard<'a>> {
         let guard_opt = self.frame.inner.try_write();
         match guard_opt {
-            Some(guard) => Some(FrameWriteGuard { frame: guard, pager: self.pager }),
+            Some(guard) => Some(FrameWriteGuard { frame: guard }),
             None => None,
         }
     }
@@ -140,7 +119,6 @@ impl<'a> Drop for FrameRef<'a> {
 
 pub(crate) struct FrameReadGuard<'a> {
     frame: RwLockReadGuard<'a, FrameInner>,
-    pager: &'a PageBuffer,
 }
 
 impl<'a> std::ops::Deref for FrameReadGuard<'a> {
@@ -151,20 +129,8 @@ impl<'a> std::ops::Deref for FrameReadGuard<'a> {
     }
 }
 
-impl<'a> FrameReadGuard<'a> {
-    /// # SAFETY
-    /// Caller must hold a **read** lock on the frame containing `buf` until
-    /// the corresponding `token` is returned by [`reap`].
-    pub(crate) unsafe fn submit_write(&self, page_id: u64) -> u64 {
-        let token = next_token();
-        unsafe { self.pager.io.submit_write(token, page_id, &self.frame.buffer) };
-        token
-    }
-}
-
 pub(crate) struct FrameWriteGuard<'a> {
     frame: RwLockWriteGuard<'a, FrameInner>,
-    pager: &'a PageBuffer,
 }
 
 impl<'a> std::ops::Deref for FrameWriteGuard<'a> {
@@ -178,16 +144,5 @@ impl<'a> std::ops::Deref for FrameWriteGuard<'a> {
 impl<'a> std::ops::DerefMut for FrameWriteGuard<'a> {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.frame
-    }
-}
-
-impl<'a> FrameWriteGuard<'a> {
-    /// # SAFETY
-    /// Caller must hold a **write** lock on the frame containing `buf` until
-    /// the corresponding `token` is returned by [`reap`].
-    pub(crate) unsafe fn submit_read(&mut self, page_id: u64) -> u64 {
-        let token = next_token();
-        unsafe { self.pager.io.submit_read(token, page_id, &mut self.frame.buffer) };
-        token
     }
 }

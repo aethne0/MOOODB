@@ -1,6 +1,11 @@
+pub mod mem_io;
+
 use crate::page::PAGE_SIZE;
 
-pub type IOError = Box<dyn std::error::Error + Send + Sync>;
+pub trait IOFactory: Send + Sync {
+    /// Called once per worker thread to create that thread's dedicated ring.
+    fn make_io_doer(&self) -> Box<dyn IODoer>;
+}
 
 pub trait IODoer: Send + Sync {
     /// Enqueue a read of `page_id` into `buf`. Returns immediately.
@@ -19,11 +24,20 @@ pub trait IODoer: Send + Sync {
 
     /// Flush pending submissions to the kernel.
     /// No-op for sync backends and io_uring SQPOLL mode.
-    fn flush(&self) {}
+    fn flush(&self);
 
     /// Collect completions into `out`. Blocks until at least `min` are ready.
-    /// Pass `min = 0` for a non-blocking peek.
+    /// [`min`] must be > 0
     ///
     /// The frame lock must be held until the corresponding token appears here.
-    fn reap(&self, min: usize, out: &mut Vec<(u64, Result<(), IOError>)>);
+    fn reap(&self, min: usize, out: &mut Vec<(u64, Result<(), std::io::ErrorKind>)>);
+
+    /// Collect completions into `out`. Blocks until at least `min` are ready.
+    /// [`min`] must be > 0
+    ///
+    /// The frame lock must be held until the corresponding token appears here.
+    fn reap_one(&self) -> (u64, Result<(), std::io::ErrorKind>);
+
+    /// Peek completions - non-blocking
+    fn peek(&self) -> usize;
 }

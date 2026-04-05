@@ -1,5 +1,6 @@
-//! Throwaway in-memory IODoer implementation for manual testing.
+//! llm throwaway in-memory IODoer implementation for manual testing.
 //! Delete this file when no longer needed.
+//! ill write a less shit version eventually cause this is an atrocity
 
 use std::{
     collections::HashMap,
@@ -7,12 +8,12 @@ use std::{
 };
 
 use crate::{
-    io::{IODoer, IOError},
+    io::{IODoer, IOFactory},
     page::PAGE_SIZE,
 };
 
 enum PendingOp {
-    Read  { token: u64, page_id: u64, buf: *mut   [u8; PAGE_SIZE] },
+    Read { token: u64, page_id: u64, buf: *mut [u8; PAGE_SIZE] },
     Write { token: u64, page_id: u64, buf: *const [u8; PAGE_SIZE] },
 }
 
@@ -23,34 +24,52 @@ unsafe impl Sync for PendingOp {}
 
 #[derive(Clone)]
 pub(crate) struct MemIO {
-    pages:   Arc<Mutex<HashMap<u64, Box<[u8; PAGE_SIZE]>>>>,
+    pages: Arc<Mutex<HashMap<u64, Box<[u8; PAGE_SIZE]>>>>,
     pending: Arc<Mutex<Vec<PendingOp>>>,
-    done:    Arc<Mutex<Vec<(u64, Result<(), IOError>)>>>,
+    done: Arc<Mutex<Vec<(u64, Result<(), std::io::ErrorKind>)>>>,
 }
 
 impl MemIO {
     pub(crate) fn new() -> Self {
         Self {
-            pages:   Arc::new(Mutex::new(HashMap::new())),
+            pages: Arc::new(Mutex::new(HashMap::new())),
             pending: Arc::new(Mutex::new(Vec::new())),
-            done:    Arc::new(Mutex::new(Vec::new())),
+            done: Arc::new(Mutex::new(Vec::new())),
         }
+    }
+}
+
+impl IOFactory for MemIO {
+    fn make_io_doer(&self) -> Box<dyn IODoer> {
+        // Share the backing page store, but each doer gets its own queues
+        // (mirroring per-thread io_uring rings that don't share a CQ/SQ)
+        Box::new(MemIO {
+            pages: Arc::clone(&self.pages),
+            pending: Arc::new(Mutex::new(Vec::new())),
+            done: Arc::new(Mutex::new(Vec::new())),
+        })
     }
 }
 
 impl IODoer for MemIO {
     unsafe fn submit_read(&self, token: u64, page_id: u64, buf: &mut [u8; PAGE_SIZE]) {
-        self.pending.lock().unwrap().push(PendingOp::Read { token, page_id, buf });
+        self.pending
+            .lock()
+            .unwrap()
+            .push(PendingOp::Read { token, page_id, buf });
     }
 
     unsafe fn submit_write(&self, token: u64, page_id: u64, buf: &[u8; PAGE_SIZE]) {
-        self.pending.lock().unwrap().push(PendingOp::Write { token, page_id, buf });
+        self.pending
+            .lock()
+            .unwrap()
+            .push(PendingOp::Write { token, page_id, buf });
     }
 
     fn flush(&self) {
         let ops: Vec<PendingOp> = self.pending.lock().unwrap().drain(..).collect();
         let mut pages = self.pages.lock().unwrap();
-        let mut done  = self.done.lock().unwrap();
+        let mut done = self.done.lock().unwrap();
 
         for op in ops {
             match op {
@@ -60,7 +79,7 @@ impl IODoer for MemIO {
                     let buf = unsafe { &mut *buf };
                     match pages.get(&page_id) {
                         Some(src) => buf.copy_from_slice(src.as_ref()),
-                        None      => buf.fill(0),
+                        None => buf.fill(0),
                     }
                     tracing::trace!("[MemIO] read  page_id={page_id}");
                     done.push((token, Ok(())));
@@ -80,7 +99,23 @@ impl IODoer for MemIO {
         }
     }
 
-    fn reap(&self, _min: usize, out: &mut Vec<(u64, Result<(), IOError>)>) {
+    fn reap(&self, min: usize, out: &mut Vec<(u64, Result<(), std::io::ErrorKind>)>) {
+        assert_ne!(min, 0);
         out.extend(self.done.lock().unwrap().drain(..));
+    }
+
+    fn reap_one(&self) -> (u64, Result<(), std::io::ErrorKind>) {
+        loop {
+            let mut done = self.done.lock().unwrap();
+            if !done.is_empty() {
+                return done.remove(0);
+            }
+            drop(done);
+            std::thread::yield_now();
+        }
+    }
+
+    fn peek(&self) -> usize {
+        self.done.lock().unwrap().len()
     }
 }
