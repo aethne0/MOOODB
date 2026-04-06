@@ -63,7 +63,7 @@ impl PageManager {
 
                 // this should all be ok because were holding an excl lock on the superblock this
                 // whole time
-                let free_guard = free_ref.write_lock(); // TODO deadlocks here
+                let free_guard = free_ref.write_lock();
                 let free_page = page::Common::from_buffer_ref(&free_guard.buffer);
                 let next_next_free_page_id = free_page.next_free();
 
