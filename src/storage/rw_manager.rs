@@ -11,6 +11,15 @@ use super::page_buffer::PageBuffer;
 use super::pages::SuperblockHeader;
 use super::pages::SuperblockPage;
 
+pub(crate) trait PageReader {
+    fn get_page_read(&self, page_id: u64) -> Result<FrameReadGuard<'_>, std::io::ErrorKind>;
+}
+
+/// PageWriter is also PageAllocator so to speak
+pub(crate) trait PageAllocator {
+    fn get_page_alloc(&mut self) -> FrameWriteGuard<'_>;
+}
+
 /// Copy-on-Write storage-engine manager
 pub(crate) struct TxManager {
     page_buffer: PageBuffer,
@@ -76,14 +85,6 @@ impl TxManager {
     }
 }
 
-pub(crate) trait PageReader {
-    fn get_page_read(&self, page_id: u64) -> Result<FrameReadGuard<'_>, std::io::ErrorKind>;
-}
-
-pub(crate) trait PageWriter {
-    fn get_page_alloc(&mut self) -> FrameWriteGuard<'_>;
-}
-
 // --- Read handle ---
 
 pub(crate) struct ReadTxHandle<'tx> {
@@ -130,7 +131,7 @@ impl PageReader for WriteTxHandle<'_> {
     }
 }
 
-impl PageWriter for WriteTxHandle<'_> {
+impl PageAllocator for WriteTxHandle<'_> {
     /// Bump allocates
     fn get_page_alloc(&mut self) -> FrameWriteGuard<'_> {
         let page_id = self.superblock.alloc_bump_next_id.get();

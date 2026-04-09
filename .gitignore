@@ -3,3 +3,4 @@
 .vscode/
 .notes/
 
+Cargo.lock

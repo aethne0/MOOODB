@@ -296,10 +296,7 @@ impl FrameSlab {
     pub(super) fn pin_write(&self, index: usize) -> FrameWriteGuard<'_> {
         self.frames[index].pins.fetch_add(1, Ordering::Release);
         self.frames[index].usage.fetch_add(1, Ordering::Relaxed);
-        let guard = self.frames[index].inner.try_write().expect(
-            "Frame write lock was contented - shouldn't happen. \
-                Only a single thread should ever be even trying to write to a frame, because of CoW invarients",
-        );
+        let guard = self.frames[index].inner.write();
         // SAFETY
         // we hold an exclusive write lock on frame.inner for the duration of the returned guard,
         // ensuring no other guard can read/write the buffer simultaneously

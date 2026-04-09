@@ -23,8 +23,3 @@ pub(crate) const PAGE_SIZE: u16 = 4096;
 
 mod executor;
 mod storage;
-
-// TODO we are literally checksumming nothing
-// TODO we should have a checksum trait that the page-buffer can call at writeout/read-in etc
-//
-// TODO im an idiot the frame buffers have to be 4k aligned

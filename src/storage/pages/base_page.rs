@@ -43,7 +43,7 @@ where
 #[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
 #[repr(C)]
 pub(crate) struct PageHeader {
-    pub(crate) checksum: big_endian::U64,
+    _checksum: big_endian::U64,
     pub(crate) page_id: big_endian::U64,
     pub(crate) tx_id: big_endian::U64,
 
@@ -139,10 +139,6 @@ impl<Buf: AsRef<[u8]>> BasePage<Buf> {
     pub(crate) fn has_space_entry(&self, entry_len: u16) -> bool {
         assert!(entry_len + SLOT_SIZE < u16::MAX);
         entry_len + SLOT_SIZE <= self.free_bytes.get()
-    }
-
-    pub(crate) fn compute_checksum(&self) -> u64 {
-        xxh3::xxh3_64(&self.raw.as_ref()[8..])
     }
 
     fn slots_range(&self) -> (Bound<usize>, Bound<usize>) {
@@ -306,21 +302,6 @@ mod tests {
         assert_eq!(page.upper_ptr.get(), PAGE_HEADER_SIZE);
         assert_eq!(page.lower_ptr.get(), 4095);
         assert_eq!(page.len(), 0);
-    }
-
-    #[test]
-    fn test_checksum() {
-        let mut buffer = [0u8; 4096];
-        let mut page = BasePage::from_buffer(&mut buffer);
-        page.initialize_header(42, 1, 2);
-
-        let checksum = page.compute_checksum();
-        page.checksum = checksum.into();
-        assert_eq!(page.checksum.get(), checksum);
-
-        page.page_id = 43u64.into();
-        let new_checksum = page.compute_checksum();
-        assert_ne!(checksum, new_checksum);
     }
 
     #[test]

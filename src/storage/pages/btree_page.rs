@@ -99,6 +99,21 @@ impl<Buf: AsRef<[u8]>> BtreePage<Buf> {
         }
     }
 
+    /// TODO rename
+    /// gets first slot that is AT LEAST key (slot_key >= arg_key)
+    /// This corresponds to which child page you should go it in a tree traversal
+    pub(crate) fn get_first_slot_ge_key(&self, key: &[u8]) -> Option<U64Entry> {
+        assert!(!self.is_leaf(), "shouldnt be called on leaf node");
+        assert!(self.len() > 0, "inner node shouldnt be empty");
+
+        match self.find_key_slot(key) {
+            SearchResult::Found(slot_index) | SearchResult::NotFound(slot_index) => {
+                Some(self.entry_at_slot(slot_index).1)
+            }
+            _ => None,
+        }
+    }
+
     fn has_space(&self, key: &[u8]) -> Result<u16, ()> {
         let entry_len = u16::try_from(key.len() + size_of::<U64Entry>()).expect("entry too big for u16");
         if !self.has_space_entry(entry_len) {
@@ -275,7 +290,7 @@ mod test {
     use claims::{assert_lt, assert_none, assert_some, assert_some_eq};
     use rand::{rngs::StdRng, seq::IteratorRandom, Rng, RngExt, SeedableRng};
 
-    use crate::storage::pages::{BtreePage, U64Entry, base_page::PAGE_HEADER_SIZE};
+    use crate::storage::pages::{base_page::PAGE_HEADER_SIZE, BtreePage, U64Entry};
 
     fn make_leaf_page(buffer: &mut [u8; 4096]) -> BtreePage<&mut [u8]> {
         BtreePage::new_with_buffer(buffer, 2, 1, 3)

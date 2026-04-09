@@ -12,14 +12,15 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 use rustc_hash::FxHashMap;
+use zerocopy::FromZeros;
 
+use super::pages::checksum;
 use crate::storage::pages::PAGE_ID_NULL;
 use frame::FrameReadGuard;
 use frame::FrameSlab;
 use frame::FrameWriteGuard;
 use io::IODoer;
 use io::IOFactory;
-use zerocopy::FromZeros;
 
 thread_local! {
     static THREAD_IO: RefCell<Option<Box<dyn IODoer>>> = RefCell::new(None);
@@ -129,6 +130,7 @@ impl PageBuffer {
 
             return Ok(frame_guard);
         }
+
         dir_guard.dir.insert(page_id, frame_guard.index());
         self.framer[frame_guard.index()]
             .page_id_hint
@@ -187,10 +189,9 @@ impl PageBuffer {
             // Read the hint to find which shard to lock. We must lock the shard BEFORE the frame
             // to match the ordering in get_page_existing (shard → frame), avoiding deadlock.
             let hint = self.framer[frame_index].page_id_hint.load(Ordering::Acquire);
-            let mut opt_dir_guard = if hint != PAGE_ID_NULL {
-                Some(self.shard_dirs[hash(hint)].write())
-            } else {
-                None
+            let mut opt_dir_guard = match hint {
+                PAGE_ID_NULL => None,
+                _ => Some(self.shard_dirs[hash(hint)].write()),
             };
 
             let mut frame_guard = self.framer.pin_write(frame_index);
@@ -312,11 +313,18 @@ impl PageBuffer {
             res
         });
 
+        // check checksum
+        if !checksum::check(frame_guard.buffer) {
+            return Err(std::io::ErrorKind::UnexpectedEof); // TODO error type
+        }
+
         frame_guard.state_uninit_to_read(page_id, res);
         res
     }
 
     fn io_write_one(&self, frame_guard: &mut FrameWriteGuard<'_>) {
+        checksum::set(frame_guard.buffer);
+
         Self::thread_io(|io| {
             debug_assert_eq!(io.peek(), 0, "queue was dirty before we submitted anything?");
             let token = next_thread_token();

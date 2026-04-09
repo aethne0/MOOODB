@@ -1,6 +1,5 @@
 use std::mem::size_of;
 
-use xxhash_rust::xxh3;
 use zerocopy::{big_endian, IntoBytes};
 
 use super::PAGE_ID_NULL;
@@ -8,7 +7,7 @@ use super::PAGE_ID_NULL;
 #[derive(Clone, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
 #[repr(C)]
 pub(crate) struct SuperblockHeader {
-    pub(crate) checksum: big_endian::U64,
+    _checksum: big_endian::U64,
     pub(crate) page_id: big_endian::U64,
     pub(crate) version: big_endian::U64,
 
@@ -88,8 +87,4 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> std::ops::DerefMut for SuperblockPage<Buf> 
 
 // other methods
 
-impl<Buf: AsRef<[u8]>> SuperblockPage<Buf> {
-    pub(crate) fn compute_checksum(&self) -> u64 {
-        xxh3::xxh3_64(&self.raw.as_ref()[8..])
-    }
-}
+impl<Buf: AsRef<[u8]>> SuperblockPage<Buf> {}
