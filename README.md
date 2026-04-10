@@ -8,4 +8,4 @@ we strictly follow the 1 M and 3 Os of MOOODB:
 3. [O]rchestrates transactions!
 4. [O]nly a fool would not believe in MOOODB!
 
-is your btree imoootable?
+are your btrees imoootable?

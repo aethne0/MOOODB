@@ -1,4 +1,5 @@
 use std::fmt::Debug;
+use std::marker::PhantomData;
 
 use super::slab::SlabBox;
 use super::StorageError;
@@ -17,7 +18,6 @@ pub(crate) struct Frame {
 }
 
 impl Frame {
-    // loom's atomic and lock types are not const-initializable, so we drop `const` under loom.
     #[cfg_attr(not(loom), allow(clippy::missing_const_for_fn))]
     pub(crate) fn new(frame_index: usize) -> Self {
         Self {
@@ -30,25 +30,33 @@ impl Frame {
     }
 }
 
-/// **Possible state transitions:**
-/// TODO update
-/// - Writing:      `Uninitialized -> Writteable -> Dirty -> WrittenOut`
-/// - Read:         `Uninitialized -> ReadPending`
-/// - Read:         `ReadPending   -> ReadIn`
-/// - Read Error:   `ReadPending   -> ReadErrored`
+/// Invarients:
+/// A "frame-cycle" refers to the span of time between it having 0 pins
+/// Within a single frame-cycle:
+/// - the frame should have exactly 1 page_id
+/// - the possible state transitions are possible:
+///     - Writing:      `Uninitialized` -> `Writteable` -> `Dirty` -> `WrittenOut`
+///     - ReadGood:     `Uninitialized` -> `ReadPending` -> `Readin`
+///     - ReadError:    `Uninitialized` -> `ReadPending` -> `ReadErrored`
+///
+/// `Dirty` and `ReadPending` frames may not be transitioned to `Uninitialized`
+/// `ReadSuccessful` | `ReadErrored` -> `Uninitialized`
 ///
 /// NOTE there is not "WriteError" state - we poison our page buffer if we have a write-out error
+
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
 enum State {
     Uninitialized,
 
-    ReadPending(u64),
-    ReadSuccessful(u64),
+    LoadPending(u64),
+
+    Readable(u64),
     ReadErrored(u64, StorageError),
 
     Writeable(u64),
     Dirty(u64),
-    WrittenOut(u64),
+
+    Poisoned,
 }
 
 pub(crate) struct FrameInner {
@@ -56,74 +64,6 @@ pub(crate) struct FrameInner {
 }
 
 impl FrameInner {
-    pub(super) fn state_to_uninit(&mut self) {
-        if matches!(self.state, State::Dirty(_)) {
-            unreachable!("invalid frame state transition (frame was {:?})", self.state);
-        }
-        self.state = State::Uninitialized;
-    }
-
-    pub(super) fn state_uninit_to_readpending(&mut self, page_id: u64) {
-        if !matches!(self.state, State::Uninitialized) {
-            unreachable!("invalid frame state transition (frame was {:?})", self.state);
-        }
-        self.state = State::ReadPending(page_id);
-    }
-
-    pub(super) fn state_readpending_to_read(&mut self, err: Option<StorageError>) {
-        match self.state {
-            State::ReadPending(page_id) => {
-                self.state = match err {
-                    Some(err) => State::ReadErrored(page_id, err),
-                    None => State::ReadSuccessful(page_id),
-                }
-            }
-            _ => unreachable!("invalid frame state transition (frame was {:?})", self.state),
-        }
-    }
-
-    pub(super) fn state_uninit_to_writeable(&mut self, page_id: u64) {
-        if !matches!(self.state, State::Uninitialized) {
-            unreachable!("invalid frame state transition (frame was {:?})", self.state);
-        }
-        self.state = State::Writeable(page_id);
-    }
-
-    pub(super) fn state_writeable_to_dirty(&mut self) {
-        match self.state {
-            State::Writeable(page_id) => self.state = State::Dirty(page_id),
-            _ => unreachable!("invalid frame state transition (frame was {:?})", self.state),
-        }
-    }
-
-    pub(super) fn state_dirty_to_writtenout(&mut self) {
-        match self.state {
-            State::Dirty(page_id) => self.state = State::WrittenOut(page_id),
-            _ => unreachable!("invalid frame state transition (frame was {:?})", self.state),
-        }
-    }
-
-    pub(crate) fn has_read_error(&self) -> Option<StorageError> {
-        match self.state {
-            State::ReadSuccessful(_) => None,
-            State::ReadErrored(_, err) => Some(err),
-            _ => unreachable!("invalid frame state transition (frame was {:?})", self.state),
-        }
-    }
-
-    pub(super) fn has_page(&self) -> Option<u64> {
-        // TODO further narrow
-        match self.state {
-            State::ReadPending(page_id) => Some(page_id),
-            State::ReadSuccessful(page_id) => Some(page_id),
-            State::ReadErrored(page_id, _) => Some(page_id),
-            State::Dirty(page_id) => Some(page_id),
-            State::Writeable(page_id) => Some(page_id),
-            State::WrittenOut(page_id) => Some(page_id),
-            _ => None,
-        }
-    }
-
     pub(super) fn is_dirty(&self) -> Option<u64> {
         // TODO further narrow
         match self.state {
@@ -139,80 +79,223 @@ impl Debug for FrameInner {
     }
 }
 
-pub(crate) struct FrameReadGuard<'a> {
+struct PinDropper<'a> {
+    slab: &'a FrameSlab,
+    index: usize,
+}
+
+impl<'a> Drop for PinDropper<'a> {
+    fn drop(&mut self) {
+        self.slab.unpin(self.index);
+    }
+}
+
+// --------------------------------------------------------------------------------
+// *            Guards                                                            *
+// --------------------------------------------------------------------------------
+
+pub(super) struct ReadGuardStateReadable;
+/// This is a Readable frame (has had data loaded in) that we've acquired a write-guard on
+/// Corresponds to `ReadGuardStateReadable` / `State::Readable`
+pub(super) struct WriteGuardStateReadable;
+pub(super) struct WriteGuardStateLoadPending;
+pub(super) struct WriteGuardStateUninit;
+pub(super) struct WriteGuardStateWriteable;
+pub(super) struct WriteGuardStateDirty;
+
+// --------------------------------------------------------------------------------
+// *            FrameReadGuard                                                    *
+// --------------------------------------------------------------------------------
+
+pub(crate) struct FrameReadGuard<'a, GuardState> {
+    _phantom: PhantomData<GuardState>,
     pub(crate) index: usize,
+
     inner: RwLockReadGuard<'a, FrameInner>,
     slab: &'a FrameSlab,
-    pub(crate) buffer: &'a [u8; PAGE_SIZE],
+    buffer: &'a [u8; PAGE_SIZE],
+    pin_dropper: Option<PinDropper<'a>>,
 }
 
-impl std::ops::Deref for FrameReadGuard<'_> {
-    type Target = FrameInner;
+// --
 
-    fn deref(&self) -> &Self::Target {
-        &self.inner
+impl<'a> FrameReadGuard<'a, ReadGuardStateReadable> {
+    pub(crate) fn buffer(&self) -> &'a [u8; PAGE_SIZE] {
+        self.buffer
     }
 }
 
-impl Drop for FrameReadGuard<'_> {
-    fn drop(&mut self) {
-        self.slab.unpin(self.index);
-    }
-}
+// --------------------------------------------------------------------------------
+// *            FrameWriteGuard                                                   *
+// --------------------------------------------------------------------------------
 
 /// NOTE `FrameWriteGuard` must be explicitly dropped using `cancel` or `commit`
-pub(crate) struct FrameWriteGuard<'a> {
+pub(crate) struct FrameWriteGuard<'a, GuardState> {
+    _phantom: PhantomData<GuardState>,
     pub(crate) index: usize,
+
     inner: RwLockWriteGuard<'a, FrameInner>,
     slab: &'a FrameSlab,
-    pub(crate) buffer: &'a mut [u8; PAGE_SIZE],
-    committed: bool,
+    buffer: &'a mut [u8; PAGE_SIZE],
+    pin_dropper: Option<PinDropper<'a>>,
 }
 
-impl FrameWriteGuard<'_> {
-    /// Consumes guard and sets frame back to uninitialized. Must not be called on a Dirty frame.
-    pub(crate) fn cancel(mut self) {
-        debug_assert!(
-            !matches!(self.state, State::Dirty(_)),
-            "FrameWriteGuard cancelled while dirty — uncommitted data would be lost"
-        );
-        self.committed = true;
-        self.inner.state_to_uninit();
-    }
-
-    /// Releases the guard without changing frame state. For use in eviction when bailing out
-    /// after discovering the frame is contended or the shard hint was stale.
-    pub(super) fn release(mut self) {
-        self.committed = true;
-        // drop releases the write lock and unpins
-    }
-
-    /// Consumes guard and sets frame to dirty, marking it for write-out. Must be in Writeable state.
-    pub(crate) fn commit(mut self) {
-        debug_assert!(matches!(self.state, State::Writeable(_)), "FrameWriteGuard dropped in weird state");
-        self.committed = true;
-        self.inner.state_writeable_to_dirty();
+impl<'a, Old> FrameWriteGuard<'a, Old> {
+    fn transition<New>(mut self) -> FrameWriteGuard<'a, New> {
+        FrameWriteGuard {
+            _phantom: PhantomData,
+            index: self.index,
+            slab: self.slab,
+            inner: self.inner,
+            buffer: self.buffer,
+            pin_dropper: self.pin_dropper.take(),
+        }
     }
 }
 
-impl std::ops::Deref for FrameWriteGuard<'_> {
-    type Target = FrameInner;
+impl<'a> FrameWriteGuard<'a, WriteGuardStateUninit> {
+    pub(crate) fn abandon(self) {
+        // documentational
+    }
 
-    fn deref(&self) -> &Self::Target {
-        &self.inner
+    pub(crate) fn buffer<'b>(&'b mut self) -> &'b mut [u8; PAGE_SIZE] {
+        self.buffer
+    }
+
+    pub(crate) fn mark_load_pending(mut self, page_id: u64) -> FrameWriteGuard<'a, WriteGuardStateLoadPending> {
+        match self.inner.state {
+            State::Uninitialized => self.inner.state = State::LoadPending(page_id),
+            _ => unreachable!(),
+        }
+        Self::transition(self)
+    }
+
+    pub(crate) fn mark_writeable(mut self, page_id: u64) -> FrameWriteGuard<'a, WriteGuardStateWriteable> {
+        match self.inner.state {
+            State::Uninitialized => self.inner.state = State::Writeable(page_id),
+            _ => unreachable!(),
+        }
+        Self::transition(self)
     }
 }
 
-impl std::ops::DerefMut for FrameWriteGuard<'_> {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.inner
+impl<'a> FrameWriteGuard<'a, WriteGuardStateWriteable> {
+    pub(crate) fn abandon(mut self) {
+        // documentational
+        match self.inner.state {
+            State::Writeable(_) => self.inner.state = State::Uninitialized,
+            _ => unreachable!(),
+        }
+    }
+
+    pub(crate) fn buffer<'b>(&'b mut self) -> &'b mut [u8; PAGE_SIZE] {
+        self.buffer
     }
 }
 
-impl Drop for FrameWriteGuard<'_> {
-    fn drop(&mut self) {
-        debug_assert!(self.committed, "FrameWriteGuard::Drop called without it being `commit`ed or `cancelled`");
-        self.slab.unpin(self.index);
+impl<'a> FrameWriteGuard<'a, WriteGuardStateReadable> {
+    pub(crate) fn abandon(self) {
+        // documentational
+    }
+
+    pub(crate) fn page_id(&self) -> u64 {
+        match self.inner.state {
+            State::Readable(page_id) => {
+                assert!(page_id != PAGE_ID_NULL);
+                page_id
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    pub(crate) fn mark_evicted(mut self) -> FrameWriteGuard<'a, WriteGuardStateUninit> {
+        match self.inner.state {
+            State::Readable(_) => self.inner.state = State::Uninitialized,
+            _ => unreachable!(),
+        }
+        Self::transition(self)
+    }
+}
+
+impl<'a> FrameWriteGuard<'a, WriteGuardStateLoadPending> {
+    pub(crate) fn buffer<'b>(&'b mut self) -> &'b mut [u8; PAGE_SIZE] {
+        self.buffer
+    }
+
+    pub(crate) fn page_id(&self) -> u64 {
+        match self.inner.state {
+            State::LoadPending(page_id) => {
+                assert!(page_id != PAGE_ID_NULL);
+                page_id
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    pub(crate) fn mark_load_ok(mut self) -> FrameReadGuard<'a, ReadGuardStateReadable> {
+        match self.inner.state {
+            State::LoadPending(page_id) => {
+                self.inner.state = State::Readable(page_id);
+                self.slab.downgrade_guard(self)
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    pub(crate) fn mark_load_err(mut self, err: StorageError) {
+        match self.inner.state {
+            State::LoadPending(page_id) => {
+                self.inner.state = State::ReadErrored(page_id, err);
+            }
+            _ => unreachable!(),
+        }
+    }
+}
+
+impl<'a> FrameWriteGuard<'a, WriteGuardStateDirty> {
+    pub(crate) fn buffer<'b>(&'b mut self) -> &'b mut [u8; PAGE_SIZE] {
+        self.buffer
+    }
+
+    pub(crate) fn abandon(self) {
+        // documentational
+    }
+
+    pub(crate) fn page_id(&self) -> u64 {
+        match self.inner.state {
+            State::LoadPending(page_id) => {
+                assert!(page_id != PAGE_ID_NULL);
+                page_id
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    pub(crate) fn mark_poisoned(mut self) {
+        match self.inner.state {
+            State::Dirty(_) => {
+                self.slab.poison(self.index);
+                self.inner.state = State::Poisoned
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    /// for eviction
+    pub(crate) fn mark_written_out_and_reinit(mut self) -> FrameWriteGuard<'a, WriteGuardStateUninit> {
+        match self.inner.state {
+            State::Dirty(_) => self.inner.state = State::Uninitialized,
+            _ => unreachable!(),
+        }
+        Self::transition(self)
+    }
+
+    /// turns it into a readable frame - use this if you are not trying to evict
+    pub(crate) fn mark_written_out(mut self) {
+        match self.inner.state {
+            State::Dirty(page_id) => self.inner.state = State::Readable(page_id),
+            _ => unreachable!(),
+        }
     }
 }
 
@@ -231,6 +314,24 @@ pub(super) struct FrameSlab {
 unsafe impl Send for FrameSlab {}
 unsafe impl Sync for FrameSlab {}
 
+pub(crate) enum PinWrite<'a> {
+    Uninit(FrameWriteGuard<'a, WriteGuardStateUninit>),
+    Resident(FrameWriteGuard<'a, WriteGuardStateReadable>),
+    Dirty(FrameWriteGuard<'a, WriteGuardStateDirty>),
+    Beaten,
+}
+
+impl<'a> PinWrite<'a> {
+    pub(crate) fn abandon(self) {
+        match self {
+            PinWrite::Dirty(g) => g.abandon(),
+            PinWrite::Uninit(g) => g.abandon(),
+            PinWrite::Resident(g) => g.abandon(),
+            PinWrite::Beaten => {}
+        }
+    }
+}
+
 impl FrameSlab {
     pub(super) fn new(frame_count: usize) -> Self {
         let page_slab_size = frame_count * PAGE_SIZE;
@@ -248,16 +349,48 @@ impl FrameSlab {
         self.frames.len()
     }
 
-    pub(crate) fn pin_count(&self, frame_index: usize) -> u16 {
-        self.frames[frame_index].pins.load(Ordering::Acquire)
+    pub(crate) fn pin_count(&self, index: usize) -> u16 {
+        self.frames[index].pins.load(Ordering::Acquire)
     }
 
-    fn unpin(&self, frame_index: usize) {
-        self.frames[frame_index].pins.fetch_sub(1, Ordering::Release);
+    /// leaks a pin so this frame wont get evicted
+    /// Might make this do something different later - somewhat documentational
+    fn poison(&self, index: usize) {
+        self.frames[index].pins.fetch_add(1, Ordering::Release);
     }
 
+    fn unpin(&self, index: usize) {
+        let prev = self.frames[index].pins.fetch_sub(1, Ordering::Release);
+        assert!(prev > 0, "unpin underflow!");
+    }
+
+    /// NOTE this does not affect state
+    fn downgrade_guard<'a>(
+        &'a self, mut guard: FrameWriteGuard<'a, WriteGuardStateLoadPending>,
+    ) -> FrameReadGuard<'a, ReadGuardStateReadable> {
+        assert!(matches!(guard.inner.state, State::Readable(_)));
+        let index = guard.index;
+
+        // take our new pin before releasing the old one
+        let pin_dropper = guard.pin_dropper.take();
+        // TODO delete these:
+        // self.frames[index].pins.fetch_add(1, Ordering::Release);
+        // drop guard
+
+        drop(guard);
+        let guard = self.frames[index].inner.try_read().expect("lock was contested");
+
+        // SAFETY
+        // we hold a read lock on frame.inner for the duration of the returned guard
+        let buffer: &[u8; PAGE_SIZE] =
+            unsafe { &*(self.page_slab.as_ptr().add(PAGE_SIZE * index) as *const [u8; PAGE_SIZE]) };
+
+        FrameReadGuard { index, slab: self, buffer, inner: guard, _phantom: PhantomData, pin_dropper }
+    }
+
+    /// NOTE this does not affect state
     #[must_use = "RAII FrameRef unpins when dropped"]
-    pub(super) fn pin_read(&self, index: usize) -> FrameReadGuard<'_> {
+    pub(super) fn pin_read(&self, index: usize) -> Result<FrameReadGuard<'_, ReadGuardStateReadable>, StorageError> {
         self.frames[index].pins.fetch_add(1, Ordering::Release);
         self.frames[index].usage.fetch_add(1, Ordering::Relaxed);
         let guard = self.frames[index].inner.read().unwrap();
@@ -267,12 +400,35 @@ impl FrameSlab {
         let buffer: &[u8; PAGE_SIZE] =
             unsafe { &*(self.page_slab.as_ptr().add(PAGE_SIZE * index) as *const [u8; PAGE_SIZE]) };
 
-        FrameReadGuard { index, inner: guard, buffer, slab: self }
+        match guard.state {
+            State::Readable(_) => Ok(FrameReadGuard {
+                index,
+                slab: self,
+                buffer,
+                inner: guard,
+                pin_dropper: Some(PinDropper { slab: self, index }),
+                _phantom: PhantomData,
+            }),
+            State::ReadErrored(_, err) => Err(err),
+            _ => {
+                unreachable!(
+                    "tried to get read guard on frame while it was in an invalid state (frame was {:?})",
+                    guard.state
+                );
+            }
+        }
     }
 
     #[must_use = "RAII FrameRef unpins when dropped"]
-    pub(super) fn pin_write(&self, index: usize) -> FrameWriteGuard<'_> {
-        self.frames[index].pins.fetch_add(1, Ordering::Release);
+    pub(crate) fn pin_write<'a>(&'a self, index: usize) -> PinWrite<'a> {
+        if self.frames[index]
+            .pins
+            // not 100% sure about the ordering here
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Relaxed)
+            .is_err()
+        {
+            return PinWrite::Beaten;
+        }
         self.frames[index].usage.fetch_add(1, Ordering::Relaxed);
         let guard = self.frames[index].inner.write().unwrap();
         // SAFETY
@@ -282,7 +438,32 @@ impl FrameSlab {
         let buffer: &mut [u8; PAGE_SIZE] =
             unsafe { &mut *(self.page_slab.as_ptr().add(PAGE_SIZE * index) as *mut [u8; PAGE_SIZE]) };
 
-        FrameWriteGuard { index, slab: self, buffer, inner: guard, committed: false }
+        let state = guard.state;
+        let fwg = FrameWriteGuard {
+            index,
+            slab: self,
+            buffer,
+            inner: guard,
+            pin_dropper: Some(PinDropper { slab: self, index }),
+            _phantom: PhantomData,
+        };
+
+        match state {
+            State::Uninitialized => PinWrite::Uninit(fwg),
+            State::ReadErrored(_, _) => PinWrite::Uninit(fwg),
+            State::Readable(_) => PinWrite::Resident(FrameWriteGuard::transition(fwg)),
+            State::Dirty(_) => PinWrite::Dirty(FrameWriteGuard::transition(fwg)),
+
+            State::Poisoned => {
+                unreachable!("poisoned frame should be pin-leaked, it shouldnt be an eviction canadidate")
+            }
+            State::Writeable(_) => unreachable!(
+                "frames that are writeable either need to be written or abandoned before being unpinned / dropped"
+            ),
+            State::LoadPending(_) => unreachable!(
+                "frames that are load-pending either need to be written or abandoned before being unpinned / dropped"
+            ),
+        }
     }
 }
 
