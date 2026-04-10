@@ -90,7 +90,7 @@ impl IODoer for MemIO {
                     let buf = unsafe { &*buf };
                     pages
                         .entry(page_id)
-                        .or_insert_with(|| vec![0u8; PAGE_SIZE as usize].into_boxed_slice())
+                        .or_insert_with(|| vec![0u8; PAGE_SIZE].into_boxed_slice())
                         .copy_from_slice(buf);
                     tracing::trace!("[MemIO] write page_id={page_id}");
                     done.push((token, Ok(())));

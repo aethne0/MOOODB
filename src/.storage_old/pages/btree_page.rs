@@ -5,7 +5,6 @@ use super::base_page::BasePage;
 use super::base_page::RangeExt;
 use super::base_page::SLOT_SIZE;
 use super::U64Entry;
-use crate::storage::PAGE_SIZE;
 
 /// A sorted B-tree page storing key-value pairs in ascending key order.
 pub(crate) struct BtreePage<Buf> {
@@ -14,20 +13,20 @@ pub(crate) struct BtreePage<Buf> {
 
 // constructors
 
-impl<'buf> BtreePage<&'buf mut [u8; PAGE_SIZE]> {
-    pub(crate) fn new_with_buffer(buffer: &'buf mut [u8; PAGE_SIZE], page_id: u64, parent: u64, right: u64) -> Self {
+impl<'buf> BtreePage<&'buf mut [u8]> {
+    pub(crate) fn new_with_buffer(buffer: &'buf mut [u8], page_id: u64, parent: u64, right: u64) -> Self {
         let mut page = Self::from_buffer(buffer);
         page.initialize_header(page_id, parent, right);
         page
     }
 
-    pub(crate) const fn from_buffer(buffer: &'buf mut [u8; PAGE_SIZE]) -> Self {
+    pub(crate) const fn from_buffer(buffer: &'buf mut [u8]) -> Self {
         Self { core: BasePage::from_buffer(buffer) }
     }
 }
 
-impl<'b> BtreePage<&'b [u8; PAGE_SIZE]> {
-    pub(crate) const fn from_buffer_ref(buffer: &'b [u8; PAGE_SIZE]) -> Self {
+impl<'b> BtreePage<&'b [u8]> {
+    pub(crate) const fn from_buffer_ref(buffer: &'b [u8]) -> Self {
         Self { core: BasePage::from_buffer_ref(buffer) }
     }
 }
@@ -47,7 +46,7 @@ impl<Buf: AsRef<[u8]>> BtreePage<Buf> {
         assert!(slot_index < self.len());
 
         let (offset, len) = self.offset_len_from_slot(slot_index);
-        assert!(len >= U64Entry::SIZE_U16);
+        assert!(len >= size_of::<U64Entry>() as u16);
         let key_len = len - U64Entry::SIZE_U16;
 
         let raw = self.raw();
@@ -210,7 +209,8 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
 
     /// Defragments the page by rewriting all live entries into a contiguous block. Sort order is preserved.
     pub(crate) fn compact(&mut self) {
-        let mut cloned_raw = [0u8; PAGE_SIZE];
+        // TODO figure something else out for this memory eventually
+        let mut cloned_raw = vec![0u8; self.raw().len()];
 
         cloned_raw.copy_from_slice(self.raw());
         let cloned_page = BtreePage::from_buffer(&mut cloned_raw);
@@ -285,20 +285,20 @@ pub(crate) enum SearchResult {
 ///  ▀▀▀  ▀▀▀  ▀▀▀▀  ▀▀▀  ▀▀▀▀
 #[cfg(test)]
 mod test {
-    use super::PAGE_SIZE;
     use std::collections::{BTreeMap, HashMap, HashSet};
 
+    use claims::{assert_lt, assert_none, assert_some, assert_some_eq};
     use rand::{rngs::StdRng, seq::IteratorRandom, Rng, RngExt, SeedableRng};
 
     use crate::storage::pages::{base_page::PAGE_HEADER_SIZE, BtreePage, U64Entry};
 
-    fn make_leaf_page(buffer: &mut [u8; PAGE_SIZE]) -> BtreePage<&mut [u8; PAGE_SIZE]> {
+    fn make_leaf_page(buffer: &mut [u8; 4096]) -> BtreePage<&mut [u8]> {
         BtreePage::new_with_buffer(buffer, 2, 1, 3)
     }
 
     #[test]
     fn test_page_insert_get() {
-        let mut buffer = [0u8; PAGE_SIZE];
+        let mut buffer = [0u8; 4096];
         let mut p = make_leaf_page(&mut buffer);
 
         let key = [1, 2, 3, 4];
@@ -313,7 +313,7 @@ mod test {
 
     #[test]
     fn test_page_compaction_stable() {
-        let mut buffer = [0u8; PAGE_SIZE];
+        let mut buffer = [0u8; 4096];
         let mut the_page = make_leaf_page(&mut buffer);
 
         let mut rng = StdRng::seed_from_u64(0);
@@ -328,7 +328,7 @@ mod test {
             }
         }
 
-        let mut buffer2 = [0u8; PAGE_SIZE];
+        let mut buffer2 = [0u8; 4096];
         buffer2.copy_from_slice(the_page.raw());
         let mut the_other_page = BtreePage::from_buffer(&mut buffer2);
         the_other_page.compact();
@@ -341,7 +341,7 @@ mod test {
 
     #[test]
     fn test_page_compaction_frees() {
-        let mut buffer = [0u8; PAGE_SIZE];
+        let mut buffer = [0u8; 4096];
         let mut the_page = make_leaf_page(&mut buffer);
 
         let mut rng = StdRng::seed_from_u64(0);
@@ -356,7 +356,7 @@ mod test {
             }
         }
 
-        let mut buffer2 = [0u8; PAGE_SIZE];
+        let mut buffer2 = [0u8; 4096];
         buffer2.copy_from_slice(the_page.raw());
         let the_other_page = BtreePage::from_buffer(&mut buffer2);
 
@@ -366,12 +366,12 @@ mod test {
 
         the_page.compact();
 
-        assert_eq!(the_page.free_bytes_contig(), (PAGE_SIZE - PAGE_HEADER_SIZE as usize) as u16);
+        assert_eq!(the_page.free_bytes_contig(), (4096 - PAGE_HEADER_SIZE as usize) as u16);
     }
 
     #[test]
     fn test_compact_fragmented_increases_contiguous_free() {
-        let mut buffer = [0u8; PAGE_SIZE];
+        let mut buffer = [0u8; 4096];
         let mut page = make_leaf_page(&mut buffer);
 
         let mut rng = StdRng::seed_from_u64(0);
@@ -403,7 +403,7 @@ mod test {
 
     #[test]
     fn test_insert_triggers_compact_when_fragmented() {
-        let mut buffer = [0u8; PAGE_SIZE];
+        let mut buffer = [0u8; 4096];
         let mut page = make_leaf_page(&mut buffer);
 
         let mut rng = StdRng::seed_from_u64(42);
@@ -426,13 +426,13 @@ mod test {
         let new_val = U64Entry::from(0xeeeeeeeeeeeeeeee_u64);
         let inserted = page.insert(&new_key, new_val);
         assert!(inserted, "insert should compact and succeed when fragmented");
-        assert!(page.get(&new_key).is_some_and(|v| v == new_val));
+        assert_some_eq!(page.get(&new_key), new_val);
         assert_eq!(page.len() as usize, n - n / 2 + 1);
     }
 
     #[test]
     fn test_compact_then_insert_until_full() {
-        let mut buffer = [0u8; PAGE_SIZE];
+        let mut buffer = [0u8; 4096];
         let mut page = make_leaf_page(&mut buffer);
 
         let mut rng = StdRng::seed_from_u64(0);
@@ -461,7 +461,7 @@ mod test {
         for (k, v) in page.iter() {
             assert_eq!(page.get(k), Some(v));
             if let Some(p) = prev {
-                assert!(p < k);
+                assert_lt!(p, k);
             }
             prev = Some(k);
         }
@@ -469,14 +469,14 @@ mod test {
 
     #[test]
     fn test_page_churn() {
-        let mut buffer = [0u8; PAGE_SIZE];
+        let mut buffer = [0u8; 4096];
         let mut the_page = make_leaf_page(&mut buffer);
 
         let mut rng = StdRng::seed_from_u64(0);
 
         let mut key = [0u8; 6];
 
-        for _ in 0..PAGE_SIZE {
+        for _ in 0..4096 {
             rng.fill(&mut key);
             let val = U64Entry::from(rng.next_u64());
             let res = the_page.insert(&key, val);
@@ -487,7 +487,7 @@ mod test {
 
     #[test]
     fn test_page_delete() {
-        let mut buffer = [0u8; PAGE_SIZE];
+        let mut buffer = [0u8; 4096];
         let mut the_page = make_leaf_page(&mut buffer);
 
         let mut rng = StdRng::seed_from_u64(0);
@@ -511,7 +511,7 @@ mod test {
         for k in &kvs {
             the_page.delete(k);
             let res = the_page.get(k);
-            assert!(res.is_none());
+            assert_none!(res);
         }
 
         assert_eq!(the_page.len(), 0);
@@ -519,7 +519,7 @@ mod test {
 
     #[test]
     fn test_page_insert_many() {
-        let mut buffer = [0u8; PAGE_SIZE];
+        let mut buffer = [0u8; 4096];
         let mut the_page = make_leaf_page(&mut buffer);
 
         let mut rng = StdRng::seed_from_u64(0);
@@ -544,7 +544,7 @@ mod test {
         for (k, v) in the_page.iter() {
             assert_eq!(v, *kvs.get(k).unwrap());
             if let Some(prev) = prev {
-                assert!(prev < k);
+                assert_lt!(prev, k);
             }
             prev = Some(k);
         }
@@ -554,7 +554,7 @@ mod test {
 
     #[test]
     fn test_page_insert_many_unordered() {
-        let mut buffer = [0u8; PAGE_SIZE];
+        let mut buffer = [0u8; 4096];
         let mut the_page = make_leaf_page(&mut buffer);
 
         let mut rng = StdRng::seed_from_u64(0);
@@ -585,26 +585,26 @@ mod test {
 
     #[test]
     fn get_returns_none_on_empty_page() {
-        let mut buffer = [0u8; PAGE_SIZE];
+        let mut buffer = [0u8; 4096];
         let page = make_leaf_page(&mut buffer);
 
-        assert!(page.get(&[1, 2, 3]).is_none());
+        assert_none!(page.get(&[1, 2, 3]));
     }
 
     #[test]
     fn get_returns_none_for_key_not_in_nonempty_page() {
-        let mut buffer = [0u8; PAGE_SIZE];
+        let mut buffer = [0u8; 4096];
         let mut page = make_leaf_page(&mut buffer);
         page.insert(&[5], U64Entry::from(50_u64));
 
-        assert!(page.get(&[1]).is_none()); // less than only entry
-        assert!(page.get(&[9]).is_none()); // greater than only entry
-        assert!(page.get(&[5, 0]).is_none()); // different key entirely
+        assert_none!(page.get(&[1])); // less than only entry
+        assert_none!(page.get(&[9])); // greater than only entry
+        assert_none!(page.get(&[5, 0])); // different key entirely
     }
 
     #[test]
     fn delete_missing_key_does_not_change_page() {
-        let mut buffer = [0u8; PAGE_SIZE];
+        let mut buffer = [0u8; 4096];
         let mut page = make_leaf_page(&mut buffer);
         let key = [1u8, 2, 3];
         let val = U64Entry::from(42_u64);
@@ -616,12 +616,12 @@ mod test {
 
         assert_eq!(page.len(), len_before);
         assert_eq!(page.free_bytes(), free_before);
-        assert!(page.get(&key).is_some_and(|v| v == val));
+        assert_some_eq!(page.get(&key), val);
     }
 
     #[test]
     fn iter_on_empty_page_yields_nothing() {
-        let mut buffer = [0u8; PAGE_SIZE];
+        let mut buffer = [0u8; 4096];
         let page = make_leaf_page(&mut buffer);
 
         assert_eq!(page.iter().count(), 0);
@@ -629,7 +629,7 @@ mod test {
 
     #[test]
     fn clear_empties_page() {
-        let mut buffer = [0u8; PAGE_SIZE];
+        let mut buffer = [0u8; 4096];
         let mut page = make_leaf_page(&mut buffer);
         page.insert(&[1], U64Entry::from(1_u64));
         page.insert(&[2], U64Entry::from(2_u64));
@@ -638,24 +638,24 @@ mod test {
 
         assert_eq!(page.len(), 0);
         assert_eq!(page.iter().count(), 0);
-        assert!(page.get(&[1]).is_none());
-        assert!(page.get(&[2]).is_none());
+        assert_none!(page.get(&[1]));
+        assert_none!(page.get(&[2]));
     }
 
     #[test]
     fn compact_on_empty_page_is_safe() {
-        let mut buffer = [0u8; PAGE_SIZE];
+        let mut buffer = [0u8; 4096];
         let mut page = make_leaf_page(&mut buffer);
 
         page.compact();
 
         assert_eq!(page.len(), 0);
-        assert_eq!(page.free_bytes_contig(), (PAGE_SIZE - PAGE_HEADER_SIZE as usize) as u16);
+        assert_eq!(page.free_bytes_contig(), (4096 - PAGE_HEADER_SIZE as usize) as u16);
     }
 
     #[test]
     fn insert_same_key_updates_value_and_preserves_count() {
-        let mut buffer = [0u8; PAGE_SIZE];
+        let mut buffer = [0u8; 4096];
         let mut page = make_leaf_page(&mut buffer);
         let key = [1u8, 2, 3];
         let val1 = U64Entry::from(111_u64);
@@ -665,12 +665,12 @@ mod test {
         assert!(page.insert(&key, val2));
 
         assert_eq!(page.len(), 1);
-        assert!(page.get(&key).is_some_and(|v| v == val2));
+        assert_some_eq!(page.get(&key), val2);
     }
 
     #[test]
     fn descending_insertion_order_iterates_ascending() {
-        let mut buffer = [0u8; PAGE_SIZE];
+        let mut buffer = [0u8; 4096];
         let mut page = make_leaf_page(&mut buffer);
 
         for i in (0u8..8).rev() {
@@ -686,7 +686,7 @@ mod test {
 
     #[test]
     fn delete_first_and_last_elements_maintain_integrity() {
-        let mut buffer = [0u8; PAGE_SIZE];
+        let mut buffer = [0u8; 4096];
         let mut page = make_leaf_page(&mut buffer);
         let entries = [
             ([1u8], U64Entry::from(10_u64)),
@@ -701,14 +701,14 @@ mod test {
         page.delete(&[9]);
 
         assert_eq!(page.len(), 1);
-        assert!(page.get(&[1]).is_none());
-        assert!(page.get(&[9]).is_none());
-        assert!(page.get(&[5]).is_some_and(|v| v == U64Entry::from(50_u64)));
+        assert_none!(page.get(&[1]));
+        assert_none!(page.get(&[9]));
+        assert_some_eq!(page.get(&[5]), U64Entry::from(50_u64));
     }
 
     #[test]
     fn insert_returns_false_and_preserves_state_when_full() {
-        let mut buffer = [0u8; PAGE_SIZE];
+        let mut buffer = [0u8; 4096];
         let mut page = make_leaf_page(&mut buffer);
         let mut rng = StdRng::seed_from_u64(99);
         let mut key = [0u8; 6];
@@ -735,7 +735,7 @@ mod test {
     fn test_page_fuzzy() {
         let seed = 1;
 
-        let mut buffer = [0u8; PAGE_SIZE];
+        let mut buffer = [0u8; 4096];
         let mut pg = make_leaf_page(&mut buffer);
 
         let mut rng = StdRng::seed_from_u64(seed);
@@ -758,7 +758,7 @@ mod test {
 
                     let (k, v) = kvs.iter().choose(&mut rng).unwrap();
                     let got_val = pg.get(k);
-                    assert!(got_val.is_some_and(|x| x == *v), "failed @ i={i} (get)");
+                    assert_some_eq!(got_val, *v, "failed @ i={i} (get)");
                 }
                 400..850 => {
                     let k: Vec<u8> = if (rng.next_u32() % 100) > 75 && !kvs.is_empty() {
@@ -785,7 +785,7 @@ mod test {
 
                     pg.delete(&k);
                     let res = kvs.remove(&k);
-                    assert!(res.is_some(), "failed @ i={i} (delete)");
+                    assert_some!(res, "failed @ i={i} (delete)");
                 }
             }
         }
@@ -794,7 +794,7 @@ mod test {
         for (k, v) in pg.iter() {
             assert_eq!(v, *kvs.get(k).unwrap());
             if let Some(prev) = prev {
-                assert!(prev < k);
+                assert_lt!(prev, k);
             }
             prev = Some(k);
         }
@@ -809,7 +809,7 @@ mod test {
 
     #[test]
     fn test_update_free_accounting() {
-        let mut buffer = [0u8; PAGE_SIZE];
+        let mut buffer = [0u8; 4096];
         let mut page = make_leaf_page(&mut buffer);
 
         let key = b"mykey";
@@ -835,7 +835,7 @@ mod test {
 
     #[test]
     fn test_readonly_view() {
-        let mut buffer = [0u8; PAGE_SIZE];
+        let mut buffer = [0u8; 4096];
         let val = U64Entry::from(0x123_u64);
         {
             let mut page = make_leaf_page(&mut buffer);

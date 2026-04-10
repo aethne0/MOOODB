@@ -3,7 +3,6 @@ use std::ops::{Deref, DerefMut};
 use super::base_page::BasePage;
 use super::base_page::RangeExt;
 use super::base_page::SLOT_SIZE;
-use crate::storage::PAGE_SIZE;
 
 /// An unordered heap page that stores variable-length byte records.
 ///
@@ -16,22 +15,22 @@ pub(crate) struct HeapPage<Buf> {
 
 // constructors
 
-impl<'b> HeapPage<&'b mut [u8; PAGE_SIZE]> {
+impl<'b> HeapPage<&'b mut [u8]> {
     /// Wraps `buffer` as a `PageHeap`. Does not initialize or validate any fields.
-    pub(crate) const fn from_buffer(buffer: &'b mut [u8; PAGE_SIZE]) -> Self {
+    pub(crate) const fn from_buffer(buffer: &'b mut [u8]) -> Self {
         Self { core: BasePage::from_buffer(buffer) }
     }
 
     /// Wraps `buffer` as a `PageHeap` and initializes the page header.
-    pub(crate) fn new_with_buffer(buffer: &'b mut [u8; PAGE_SIZE], page_id: u64, parent: u64, right: u64) -> Self {
+    pub(crate) fn new_with_buffer(buffer: &'b mut [u8], page_id: u64, parent: u64, right: u64) -> Self {
         let mut page = Self::from_buffer(buffer);
         page.initialize_header(page_id, parent, right);
         page
     }
 }
 
-impl<'b> HeapPage<&'b [u8; PAGE_SIZE]> {
-    pub(crate) const fn from_buffer_ref(buffer: &'b [u8; PAGE_SIZE]) -> Self {
+impl<'b> HeapPage<&'b [u8]> {
+    pub(crate) const fn from_buffer_ref(buffer: &'b [u8]) -> Self {
         Self { core: BasePage::from_buffer_ref(buffer) }
     }
 }
@@ -70,7 +69,7 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> HeapPage<B> {
         // TODO figure something else out for this memory eventually
         // TODO this should just copy into the other buffer, cause were copy on write
         // infact we can make it so its never called, if we copy by iterating
-        let mut cloned_raw = [0u8; PAGE_SIZE];
+        let mut cloned_raw = vec![0u8; self.raw().len()];
 
         cloned_raw.copy_from_slice(self.raw());
         let cloned_page = HeapPage::from_buffer(&mut cloned_raw);
@@ -105,13 +104,16 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> DerefMut for HeapPage<B> {
 ///  ▐█▌·▐█▄▄▌▐█▄▪▐█ ▐█▌·▐█▄▪▐█
 ///  ▀▀▀  ▀▀▀  ▀▀▀▀  ▀▀▀  ▀▀▀▀
 #[cfg(test)]
-mod test {
+mod tests {
+
+
     use crate::storage::pages::base_page::PAGE_HEADER_SIZE;
+
     use super::*;
 
     #[test]
     fn test_heap_append_get() {
-        let mut buffer = [0u8; PAGE_SIZE];
+        let mut buffer = [0u8; 4096];
         let mut page = HeapPage::new_with_buffer(&mut buffer, 1, 0, 0);
 
         let data1 = b"hello";
@@ -127,7 +129,7 @@ mod test {
 
     #[test]
     fn test_heap_delete() {
-        let mut buffer = [0u8; PAGE_SIZE];
+        let mut buffer = [0u8; 4096];
         let mut page = HeapPage::new_with_buffer(&mut buffer, 1, 0, 0);
 
         page.append(b"item1").unwrap();
@@ -140,7 +142,7 @@ mod test {
 
     #[test]
     fn test_heap_iter() {
-        let mut buffer = [0u8; PAGE_SIZE];
+        let mut buffer = [0u8; 4096];
         let mut page = HeapPage::new_with_buffer(&mut buffer, 1, 0, 0);
 
         page.append(b"a").unwrap();
@@ -156,7 +158,7 @@ mod test {
 
     #[test]
     fn test_heap_compaction() {
-        let mut buffer = [0u8; PAGE_SIZE];
+        let mut buffer = [0u8; 4096];
         let mut page = HeapPage::new_with_buffer(&mut buffer, 1, 0, 0);
 
         for i in 0..10 {
@@ -186,7 +188,7 @@ mod test {
 
     #[test]
     fn test_heap_clear() {
-        let mut buffer = [0u8; PAGE_SIZE];
+        let mut buffer = [0u8; 4096];
         let mut page = HeapPage::new_with_buffer(&mut buffer, 1, 0, 0);
 
         page.append(b"data").unwrap();
@@ -194,12 +196,12 @@ mod test {
 
         page.clear_entries();
         assert_eq!(page.len(), 0);
-        assert_eq!(page.free_bytes(), PAGE_SIZE as u16 - PAGE_HEADER_SIZE);
+        assert_eq!(page.free_bytes(), 4096 as u16 - PAGE_HEADER_SIZE);
     }
 
     #[test]
     fn test_readonly_view() {
-        let mut buffer = [0u8; PAGE_SIZE];
+        let mut buffer = [0u8; 4096];
         {
             let mut page = HeapPage::new_with_buffer(&mut buffer, 1, 0, 0);
             page.append(b"hello").unwrap();

@@ -22,36 +22,6 @@ use frame::FrameWriteGuard;
 use io::IODoer;
 use io::IOFactory;
 
-thread_local! {
-    static THREAD_IO: RefCell<Option<Box<dyn IODoer>>> = RefCell::new(None);
-}
-
-static THREAD_TOKEN_PREFIX_NEXT: AtomicU64 = AtomicU64::new(0);
-
-thread_local! {
-    static THREAD_TOKEN_PREFIX: u64
-        = THREAD_TOKEN_PREFIX_NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-    static THREAD_TOKEN_NEXT: Cell<u64> = const { Cell::new(0) };
-}
-
-fn next_thread_token() -> u64 {
-    THREAD_TOKEN_PREFIX.with(|&token_prefix| {
-        debug_assert!(token_prefix < 0x100, "Only 8 bits allocated for thread token prefix id (max 256 threads)");
-        THREAD_TOKEN_NEXT.with(|token_next_cell| {
-            let token_next = token_next_cell.get();
-            token_next_cell.set(token_next + 1);
-            (token_prefix << 56) | (token_next & 0x00ff_ffff_ffff_ffff)
-        })
-    })
-}
-const SHARD_CNT: usize = 64;
-const fn hash(mut page_id: u64) -> usize {
-    page_id ^= page_id >> 33;
-    page_id = page_id.wrapping_mul(0xff51_afd7_ed55_8ccd);
-    page_id ^= page_id >> 33;
-    (page_id as usize) & (SHARD_CNT - 1)
-}
-
 pub(super) struct PageBuffer {
     pub(super) io: Arc<dyn IOFactory>,
     framer: FrameSlab,
@@ -210,15 +180,16 @@ impl PageBuffer {
                     continue;
                 }
 
+                // TODO we are currently holding the dir guard while writing
+                if frame_guard.is_dirty() {
+                    self.io_write_one(&mut frame_guard);
+                }
+
                 opt_dir_guard.as_mut().unwrap().dir.remove(&actual_page_id);
                 self.framer[frame_index]
                     .page_id_hint
                     .store(PAGE_ID_NULL, Ordering::Release);
                 drop(opt_dir_guard);
-
-                if frame_guard.is_dirty() {
-                    self.io_write_one(&mut frame_guard);
-                }
             }
             // If has_valid_page() is None the frame is already Uninitialized/ReadErrored with no
             // directory entry. opt_dir_guard (if any from a stale hint) just drops here.

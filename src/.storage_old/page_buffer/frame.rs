@@ -240,11 +240,11 @@ unsafe impl Sync for FrameSlab {}
 
 impl FrameSlab {
     pub(super) fn new(frame_count: usize) -> Self {
-        let page_slab_size = frame_count * PAGE_SIZE as usize;
+        let page_slab_size = frame_count * PAGE_SIZE;
         let page_slab = SlabBox::<[u8]>::new_raw(page_slab_size);
 
         let frames = (0..frame_count)
-            .map(|index| Frame::new(index, unsafe { page_slab.as_ptr().add(index * PAGE_SIZE as usize) }))
+            .map(|index| Frame::new(index, unsafe { page_slab.as_ptr().add(index * PAGE_SIZE) }))
             .collect::<Vec<_>>()
             .into_boxed_slice();
 
@@ -277,7 +277,7 @@ impl FrameSlab {
         // of `inner` here and it will be managed by the returned FrameReadGuard.
         let inner = unsafe { std::ptr::read(&guard.inner) };
         let downgraded = parking_lot::lock_api::RwLockWriteGuard::downgrade(inner);
-        let buffer = unsafe { std::slice::from_raw_parts(downgraded.buffer_ptr.cast_const(), PAGE_SIZE as usize) };
+        let buffer = unsafe { std::slice::from_raw_parts(downgraded.buffer_ptr.cast_const(), PAGE_SIZE) };
         FrameReadGuard { inner: downgraded, buffer, slab: self }
     }
 
@@ -288,7 +288,7 @@ impl FrameSlab {
         let guard = self.frames[index].inner.read();
         // SAFETY
         // we hold a read lock on frame.inner for the duration of the returned guard
-        let buffer = unsafe { std::slice::from_raw_parts(guard.buffer_ptr.cast_const(), PAGE_SIZE as usize) };
+        let buffer = unsafe { std::slice::from_raw_parts(guard.buffer_ptr.cast_const(), PAGE_SIZE) };
         FrameReadGuard { inner: guard, buffer, slab: self }
     }
 
@@ -300,7 +300,7 @@ impl FrameSlab {
         // SAFETY
         // we hold an exclusive write lock on frame.inner for the duration of the returned guard,
         // ensuring no other guard can read/write the buffer simultaneously
-        let buffer = unsafe { std::slice::from_raw_parts_mut(guard.buffer_ptr.cast(), PAGE_SIZE as usize) };
+        let buffer = unsafe { std::slice::from_raw_parts_mut(guard.buffer_ptr.cast(), PAGE_SIZE) };
         FrameWriteGuard { inner: guard, buffer, slab: self, committed: false }
     }
 }

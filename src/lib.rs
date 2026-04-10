@@ -1,4 +1,5 @@
 #![allow(dead_code)]
+
 #![warn(clippy::pedantic)]
 #![warn(clippy::perf)]
 #![warn(unreachable_pub)]
@@ -19,7 +20,5 @@
 //!
 //! **MOOODB** is a relational database management system
 
-pub(crate) const PAGE_SIZE: u16 = 4096;
-
-mod executor;
-mod storage;
+pub(crate) mod storage;
+pub(crate) mod sync;

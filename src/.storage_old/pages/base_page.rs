@@ -1,8 +1,7 @@
 use std::ops::{Bound, RangeBounds};
 
+use xxhash_rust::xxh3;
 use zerocopy::big_endian;
-
-use crate::storage::PAGE_SIZE;
 
 // we have some placeholder IDs to mean different things
 // These will start at u64::MAX and count down
@@ -12,29 +11,6 @@ use crate::storage::PAGE_SIZE;
 pub(crate) const PAGE_ID_NULL: u64 = u64::MAX;
 pub(crate) const SLOT_SIZE: u16 = 2 * size_of::<u16>() as u16;
 pub(crate) const PAGE_HEADER_SIZE: u16 = 0x40;
-
-/// The first 32 bytes of **every** page on disk, regardless of page type.
-///
-/// The pager and I/O layer can cast any raw page buffer to this type to read or
-/// write the common fields (checksum, page_id, tx_id) without knowing which
-/// concrete page type lives in the rest of the buffer.
-///
-/// Layout (all big-endian):
-/// ```text
-/// offset  0 │ checksum   u64
-/// offset  8 │ page_id    u64
-/// offset 16 │ tx_id      u64
-/// offset 24 │ <reserved> u64
-/// ```
-#[derive(Clone, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
-#[repr(C)]
-pub(crate) struct PagePrefix {
-    pub(crate) checksum: big_endian::U64,
-    pub(crate) page_id: big_endian::U64,
-    pub(crate) tx_id: big_endian::U64,
-    _reserved: big_endian::U64,
-}
-const _: () = assert!(size_of::<PagePrefix>() == 32);
 
 /// Converts a range whose bounds implement `Into<usize>` into a plain `(Bound<usize>, Bound<usize>)`,
 /// making it usable as a slice index on `[u8]` buffers.
@@ -67,7 +43,9 @@ where
 #[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
 #[repr(C)]
 pub(crate) struct PageHeader {
-    pub(crate) prefix: PagePrefix,
+    _checksum: big_endian::U64,
+    pub(crate) page_id: big_endian::U64,
+    pub(crate) tx_id: big_endian::U64,
 
     pub(crate) parent_id: big_endian::U64,
     pub(crate) next_id: big_endian::U64,
@@ -77,17 +55,9 @@ pub(crate) struct PageHeader {
     pub(crate) free_bytes: big_endian::U16,
     pub(crate) page_flags: big_endian::U16,
 
-    _pad: [u8; 8],
+    _pad: [u8; 16],
 }
 const _: () = assert!(size_of::<PageHeader>() == PAGE_HEADER_SIZE as usize);
-
-impl std::ops::Deref for PageHeader {
-    type Target = PagePrefix;
-    fn deref(&self) -> &PagePrefix { &self.prefix }
-}
-impl std::ops::DerefMut for PageHeader {
-    fn deref_mut(&mut self) -> &mut PagePrefix { &mut self.prefix }
-}
 
 /// Base slotted-page layout shared by all page types.
 pub(crate) struct BasePage<Buf> {
@@ -96,14 +66,14 @@ pub(crate) struct BasePage<Buf> {
 
 // constructors
 
-impl<'buf> BasePage<&'buf mut [u8; PAGE_SIZE]> {
-    pub(crate) const fn from_buffer(buffer: &'buf mut [u8; PAGE_SIZE]) -> Self {
+impl<'buf> BasePage<&'buf mut [u8]> {
+    pub(crate) const fn from_buffer(buffer: &'buf mut [u8]) -> Self {
         Self { raw: buffer }
     }
 }
 
-impl<'b> BasePage<&'b [u8; PAGE_SIZE]> {
-    pub(crate) const fn from_buffer_ref(buffer: &'b [u8; PAGE_SIZE]) -> Self {
+impl<'b> BasePage<&'b [u8]> {
+    pub(crate) const fn from_buffer_ref(buffer: &'b [u8]) -> Self {
         Self { raw: buffer }
     }
 }
@@ -317,7 +287,7 @@ impl<'a, B: AsRef<[u8]>> IntoIterator for &'a BasePage<B> {
 ///  ▐█▌·▐█▄▄▌▐█▄▪▐█ ▐█▌·▐█▄▪▐█
 ///  ▀▀▀  ▀▀▀  ▀▀▀▀  ▀▀▀  ▀▀▀▀
 #[cfg(test)]
-mod test {
+mod tests {
     use super::*;
 
     #[test]
