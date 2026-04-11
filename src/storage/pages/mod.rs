@@ -4,8 +4,8 @@ mod heap_page;
 mod id_entry;
 mod superblock_page;
 
-pub(super) use base_page::PagePrefix;
 pub(super) use base_page::PAGE_ID_NULL;
+pub(super) use base_page::PagePrefix;
 
 pub(super) use btree_page::BtreePage;
 pub(super) use heap_page::HeapPage;

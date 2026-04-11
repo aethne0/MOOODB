@@ -1,10 +1,10 @@
 use std::ops::Deref;
 use std::ops::DerefMut;
 
+use super::U64Entry;
 use super::base_page::BasePage;
 use super::base_page::RangeExt;
 use super::base_page::SLOT_SIZE;
-use super::U64Entry;
 use crate::storage::PAGE_SIZE;
 
 /// A sorted B-tree page storing key-value pairs in ascending key order.
@@ -15,7 +15,9 @@ pub(crate) struct BtreePage<Buf> {
 // constructors
 
 impl<'buf> BtreePage<&'buf mut [u8; PAGE_SIZE]> {
-    pub(crate) fn new_with_buffer(buffer: &'buf mut [u8; PAGE_SIZE], page_id: u64, parent: u64, right: u64) -> Self {
+    pub(crate) fn new_with_buffer(
+        buffer: &'buf mut [u8; PAGE_SIZE], page_id: u64, parent: u64, right: u64,
+    ) -> Self {
         let mut page = Self::from_buffer(buffer);
         page.initialize_header(page_id, parent, right);
         page
@@ -53,7 +55,9 @@ impl<Buf: AsRef<[u8]>> BtreePage<Buf> {
         let raw = self.raw();
         (
             &raw[(offset..offset + key_len).into_usizes()],
-            U64Entry::from(&raw[(offset + key_len..offset + key_len + U64Entry::SIZE_U16).into_usizes()]),
+            U64Entry::from(
+                &raw[(offset + key_len..offset + key_len + U64Entry::SIZE_U16).into_usizes()],
+            ),
         )
     }
 
@@ -80,11 +84,7 @@ impl<Buf: AsRef<[u8]>> BtreePage<Buf> {
             }
         }
 
-        if low == self.len() {
-            SearchResult::Right
-        } else {
-            SearchResult::NotFound(low)
-        }
+        if low == self.len() { SearchResult::Right } else { SearchResult::NotFound(low) }
     }
 
     /// Returns an iterator over `(key, value)` pairs in ascending key order.
@@ -116,7 +116,8 @@ impl<Buf: AsRef<[u8]>> BtreePage<Buf> {
     }
 
     fn has_space(&self, key: &[u8]) -> Result<u16, ()> {
-        let entry_len = u16::try_from(key.len() + size_of::<U64Entry>()).expect("entry too big for u16");
+        let entry_len =
+            u16::try_from(key.len() + size_of::<U64Entry>()).expect("entry too big for u16");
         if !self.has_space_entry(entry_len) {
             return Err(());
         }
@@ -155,7 +156,9 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
             Ok(entry_len) => entry_len,
         };
 
-        if self.free_bytes_contig() < (entry_len + SLOT_SIZE) && self.free_bytes() >= (entry_len + SLOT_SIZE) {
+        if self.free_bytes_contig() < (entry_len + SLOT_SIZE)
+            && self.free_bytes() >= (entry_len + SLOT_SIZE)
+        {
             self.compact();
         }
 
@@ -286,11 +289,19 @@ pub(crate) enum SearchResult {
 #[cfg(test)]
 mod test {
     use super::PAGE_SIZE;
-    use std::collections::{BTreeMap, HashMap, HashSet};
+    use std::collections::BTreeMap;
+    use std::collections::HashMap;
+    use std::collections::HashSet;
 
-    use rand::{rngs::StdRng, seq::IteratorRandom, Rng, RngExt, SeedableRng};
+    use rand::Rng;
+    use rand::RngExt;
+    use rand::SeedableRng;
+    use rand::rngs::StdRng;
+    use rand::seq::IteratorRandom;
 
-    use crate::storage::pages::{base_page::PAGE_HEADER_SIZE, BtreePage, U64Entry};
+    use crate::storage::pages::BtreePage;
+    use crate::storage::pages::U64Entry;
+    use crate::storage::pages::base_page::PAGE_HEADER_SIZE;
 
     fn make_leaf_page(buffer: &mut [u8; PAGE_SIZE]) -> BtreePage<&mut [u8; PAGE_SIZE]> {
         BtreePage::new_with_buffer(buffer, 2, 1, 3)
@@ -397,7 +408,10 @@ mod test {
         let contig_after = page.free_bytes_contig();
         let total_free_after = page.free_bytes();
         assert!(contig_after >= contig_before, "compact should not reduce contiguous free");
-        assert_eq!(contig_after, total_free_after, "after compact all free space should be contiguous");
+        assert_eq!(
+            contig_after, total_free_after,
+            "after compact all free space should be contiguous"
+        );
         assert_eq!(page.len() as usize, (n + 1) / 2);
     }
 

@@ -36,13 +36,16 @@ impl From<u64> for U64Entry {
 
 impl From<&[u8]> for U64Entry {
     fn from(value: &[u8]) -> Self {
-        zerocopy::FromBytes::read_from_bytes(&value[..size_of::<Self>()]).expect("couldnt deserialize U64Entry")
+        zerocopy::FromBytes::read_from_bytes(&value[..size_of::<Self>()])
+            .expect("couldnt deserialize U64Entry")
     }
 }
 
 // --- Free-page Entry ---
 
-#[derive(Clone, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
+#[derive(
+    Clone, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout,
+)]
 #[repr(C)]
 pub(crate) struct FreeEntry {
     tx_id: big_endian::U64,

@@ -13,10 +13,15 @@ impl SlabBox {
     pub(super) fn new_raw(size: usize) -> Self {
         assert!(size > 0);
         let flags = libc::MAP_PRIVATE | libc::MAP_ANONYMOUS | libc::MAP_POPULATE;
-        let ptr = unsafe { libc::mmap(std::ptr::null_mut(), size, libc::PROT_READ | libc::PROT_WRITE, flags, -1, 0) };
+        let ptr = unsafe {
+            libc::mmap(std::ptr::null_mut(), size, libc::PROT_READ | libc::PROT_WRITE, flags, -1, 0)
+        };
 
         if ptr == libc::MAP_FAILED {
-            log::error!("mmap allocation failed - stopping. Error: {}", std::io::Error::last_os_error());
+            log::error!(
+                "mmap allocation failed - stopping. Error: {}",
+                std::io::Error::last_os_error()
+            );
             std::process::abort();
         }
 

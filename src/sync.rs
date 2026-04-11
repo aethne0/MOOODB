@@ -16,17 +16,28 @@
 #[allow(unused_imports)]
 mod imp {
     pub(crate) use loom::cell::UnsafeCell;
-    pub(crate) use loom::sync::{
-        Arc, Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
-    };
-    pub(crate) use loom::sync::atomic::{
-        AtomicBool, AtomicI32, AtomicI64, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering,
-    };
+    pub(crate) use loom::sync::Arc;
+    pub(crate) use loom::sync::Condvar;
+    pub(crate) use loom::sync::Mutex;
+    pub(crate) use loom::sync::MutexGuard;
+    pub(crate) use loom::sync::RwLock;
+    pub(crate) use loom::sync::RwLockReadGuard;
+    pub(crate) use loom::sync::RwLockWriteGuard;
+    pub(crate) use loom::sync::atomic::AtomicBool;
+    pub(crate) use loom::sync::atomic::AtomicI32;
+    pub(crate) use loom::sync::atomic::AtomicI64;
+    pub(crate) use loom::sync::atomic::AtomicU16;
+    pub(crate) use loom::sync::atomic::AtomicU32;
+    pub(crate) use loom::sync::atomic::AtomicU64;
+    pub(crate) use loom::sync::atomic::AtomicUsize;
+    pub(crate) use loom::sync::atomic::Ordering;
 
     pub(crate) mod thread {
         // loom does not implement thread::scope — scoped threads would bypass
         // loom's scheduler entirely, so scope is intentionally absent here.
-        pub(crate) use loom::thread::{spawn, yield_now, JoinHandle};
+        pub(crate) use loom::thread::JoinHandle;
+        pub(crate) use loom::thread::spawn;
+        pub(crate) use loom::thread::yield_now;
     }
 }
 
@@ -35,16 +46,30 @@ mod imp {
 #[cfg(all(shuttle, not(loom)))]
 #[allow(unused_imports)]
 mod imp {
+    pub(crate) use shuttle::sync::Arc;
+    pub(crate) use shuttle::sync::Condvar;
+    pub(crate) use shuttle::sync::Mutex;
+    pub(crate) use shuttle::sync::MutexGuard;
+    pub(crate) use shuttle::sync::RwLock;
+    pub(crate) use shuttle::sync::RwLockReadGuard;
+    pub(crate) use shuttle::sync::RwLockWriteGuard;
+    pub(crate) use shuttle::sync::atomic::AtomicBool;
+    pub(crate) use shuttle::sync::atomic::AtomicI32;
+    pub(crate) use shuttle::sync::atomic::AtomicI64;
+    pub(crate) use shuttle::sync::atomic::AtomicU16;
+    pub(crate) use shuttle::sync::atomic::AtomicU32;
+    pub(crate) use shuttle::sync::atomic::AtomicU64;
+    pub(crate) use shuttle::sync::atomic::AtomicUsize;
+    pub(crate) use shuttle::sync::atomic::Ordering;
     pub(crate) use std::cell::UnsafeCell;
-    pub(crate) use shuttle::sync::{
-        Arc, Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
-    };
-    pub(crate) use shuttle::sync::atomic::{
-        AtomicBool, AtomicI32, AtomicI64, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering,
-    };
 
     pub(crate) mod thread {
-        pub(crate) use shuttle::thread::{scope, spawn, yield_now, JoinHandle, Scope, ScopedJoinHandle};
+        pub(crate) use shuttle::thread::JoinHandle;
+        pub(crate) use shuttle::thread::Scope;
+        pub(crate) use shuttle::thread::ScopedJoinHandle;
+        pub(crate) use shuttle::thread::scope;
+        pub(crate) use shuttle::thread::spawn;
+        pub(crate) use shuttle::thread::yield_now;
     }
 }
 
@@ -54,15 +79,29 @@ mod imp {
 #[allow(unused_imports)]
 mod imp {
     pub(crate) use std::cell::UnsafeCell;
-    pub(crate) use std::sync::{
-        Arc, Condvar, Mutex, MutexGuard, RwLock, RwLockReadGuard, RwLockWriteGuard,
-    };
-    pub(crate) use std::sync::atomic::{
-        AtomicBool, AtomicI32, AtomicI64, AtomicU16, AtomicU32, AtomicU64, AtomicUsize, Ordering,
-    };
+    pub(crate) use std::sync::Arc;
+    pub(crate) use std::sync::Condvar;
+    pub(crate) use std::sync::Mutex;
+    pub(crate) use std::sync::MutexGuard;
+    pub(crate) use std::sync::RwLock;
+    pub(crate) use std::sync::RwLockReadGuard;
+    pub(crate) use std::sync::RwLockWriteGuard;
+    pub(crate) use std::sync::atomic::AtomicBool;
+    pub(crate) use std::sync::atomic::AtomicI32;
+    pub(crate) use std::sync::atomic::AtomicI64;
+    pub(crate) use std::sync::atomic::AtomicU16;
+    pub(crate) use std::sync::atomic::AtomicU32;
+    pub(crate) use std::sync::atomic::AtomicU64;
+    pub(crate) use std::sync::atomic::AtomicUsize;
+    pub(crate) use std::sync::atomic::Ordering;
 
     pub(crate) mod thread {
-        pub(crate) use std::thread::{scope, spawn, yield_now, JoinHandle, Scope, ScopedJoinHandle};
+        pub(crate) use std::thread::JoinHandle;
+        pub(crate) use std::thread::Scope;
+        pub(crate) use std::thread::ScopedJoinHandle;
+        pub(crate) use std::thread::scope;
+        pub(crate) use std::thread::spawn;
+        pub(crate) use std::thread::yield_now;
     }
 }
 

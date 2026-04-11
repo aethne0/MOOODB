@@ -1,4 +1,5 @@
-use std::ops::{Deref, DerefMut};
+use std::ops::Deref;
+use std::ops::DerefMut;
 
 use super::base_page::BasePage;
 use super::base_page::RangeExt;
@@ -23,7 +24,9 @@ impl<'b> HeapPage<&'b mut [u8; PAGE_SIZE]> {
     }
 
     /// Wraps `buffer` as a `PageHeap` and initializes the page header.
-    pub(crate) fn new_with_buffer(buffer: &'b mut [u8; PAGE_SIZE], page_id: u64, parent: u64, right: u64) -> Self {
+    pub(crate) fn new_with_buffer(
+        buffer: &'b mut [u8; PAGE_SIZE], page_id: u64, parent: u64, right: u64,
+    ) -> Self {
         let mut page = Self::from_buffer(buffer);
         page.initialize_header(page_id, parent, right);
         page
@@ -51,7 +54,9 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> HeapPage<B> {
             return None;
         }
 
-        if self.free_bytes_contig() < (entry_len + SLOT_SIZE) && self.free_bytes() >= (entry_len + SLOT_SIZE) {
+        if self.free_bytes_contig() < (entry_len + SLOT_SIZE)
+            && self.free_bytes() >= (entry_len + SLOT_SIZE)
+        {
             self.compact();
         }
 
@@ -106,8 +111,8 @@ impl<B: AsRef<[u8]> + AsMut<[u8]>> DerefMut for HeapPage<B> {
 ///  ▀▀▀  ▀▀▀  ▀▀▀▀  ▀▀▀  ▀▀▀▀
 #[cfg(test)]
 mod test {
-    use crate::storage::pages::base_page::PAGE_HEADER_SIZE;
     use super::*;
+    use crate::storage::pages::base_page::PAGE_HEADER_SIZE;
 
     #[test]
     fn test_heap_append_get() {

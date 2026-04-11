@@ -14,42 +14,41 @@ pub(super) struct Pager {
     file: File,
     framer: FrameSlab,
     /// All shards' maps of `page_id` -> `frame_index`
-    shard_dirs: Box<[RwLock<PageBufferShard>]>,
+    shard_dirs: Box<[RwLock<FxHashMap<u64, usize>>]>,
     eviction_hand: AtomicUsize,
     poisoned: AtomicBool,
 }
 
-pub(super) struct PageBufferShard {
-    // making this a struct incase we add more later - might flatten
-    /// Shard's map of `page_id` -> `frame_index`
-    dir: FxHashMap<u64, usize>,
-}
-
 impl Pager {
-    // --------------------------------------------------------------------------------
-    // *            CONSTRUCTOR                                                       *
-    // --------------------------------------------------------------------------------
+    // ---------------------------------------------------------------------------------------------
+    // *            CONSTRUCTOR                                                                    *
+    // ---------------------------------------------------------------------------------------------
 
     pub(super) fn new(frame_count: usize, file: File) -> Self {
-        assert_ne!(frame_count, 0);
-
+        assert!(frame_count > 0);
         let framer = FrameSlab::new(frame_count);
 
         let shard_dirs = (0..Self::SHARD_CNT)
             .map(|_| {
                 let mut map = FxHashMap::default();
                 map.reserve(frame_count / Self::SHARD_CNT);
-                RwLock::new(PageBufferShard { dir: map })
+                RwLock::new(map)
             })
             .collect::<Vec<_>>()
             .into_boxed_slice();
 
-        Self { file, framer, shard_dirs, eviction_hand: AtomicUsize::new(0), poisoned: false.into() }
+        Self {
+            file,
+            framer,
+            shard_dirs,
+            eviction_hand: AtomicUsize::new(0),
+            poisoned: false.into(),
+        }
     }
 
-    // --------------------------------------------------------------------------------
-    // *            UTIL                                                              *
-    // --------------------------------------------------------------------------------
+    // ---------------------------------------------------------------------------------------------
+    // *            UTIL                                                                           *
+    // ---------------------------------------------------------------------------------------------
 
     const SHARD_CNT: usize = 64;
 
@@ -68,67 +67,61 @@ impl Pager {
         }
     }
 
-    // --------------------------------------------------------------------------------
-    // *            PAGING                                                            *
-    // --------------------------------------------------------------------------------
+    // ---------------------------------------------------------------------------------------------
+    // *            PAGING                                                                         *
+    // ---------------------------------------------------------------------------------------------
 
     /// Fetches existing page
-    // **NOTE**: this will always give a frame in the ReadSuccessful state (in the event of an error
-    // Err will be returned, but the frame will exist as ReadErrored)
+    /// **NOTE**: this will always give a frame in the ReadSuccessful state (in the event of an error
+    /// Err will be returned, but the frame will exist as ReadErrored)
+    #[must_use = "RAII FrameGuard releases when dropped"]
     pub(super) fn get_page_existing(
-        &self, page_id: u64,
-    ) -> Result<FrameReadGuard<'_, ReadGuardStateReadable>, StorageError> {
-        let shard = Self::shard_hash(page_id);
+        &self, target_page_id: u64,
+    ) -> Result<FrameReadGuard<'_, Readable>, StorageError> {
+        let shard_idx = Self::shard_hash(target_page_id);
 
         // if its already paged in
-        {
-            let shard_guard = self.shard_dirs[shard].read().unwrap();
+        let dir_guard = self.shard_dirs[shard_idx].read().unwrap();
 
-            if let Some(&frame_index) = shard_guard.dir.get(&page_id) {
-                if let Ok(guard) = self.framer.pin_read(frame_index) {
-                    return Ok(guard);
-                }
-                /*
-                return Ok(self
-                    .framer
-                    .pin_read(frame_index)
-                    .expect("frame shouldn't be found in dir if it was errored"));
-                */
+        if let Some(&frame_idx) = dir_guard.get(&target_page_id) {
+            if let Ok(guard) = self.framer.pin_read(frame_idx) {
+                return Ok(guard);
             }
         }
+        drop(dir_guard);
 
-        // we need to page it in and load it
+        // **IO path**: we need to page it in and load it
+        // ----------------------------------------------
 
         // this puts it in the dir right away, which is useful because other threads can see we
         // already have inflight io
         let frame_guard = self.get_free_frame()?;
-        let mut dir_guard = self.shard_dirs[shard].write().unwrap();
+        let mut dir_guard = self.shard_dirs[shard_idx].write().unwrap();
 
         // we now need to make entry for this page in directory
         //
         // check if another thread beat us to populating this page_id in the dir
         // well abandon our frame and use theirs instead
-        if let Some(&found_frame_index) = dir_guard.dir.get(&page_id) {
-            // we need to set our frame to uninit, to make sure another frame doesnt later choose
-            // it for eviction, see its page_id, then remove that page_id from the dir
-            // (the page_id is the same as the actual frame that were going to take!)
+        if let Some(&found_frame_idx) = dir_guard.get(&target_page_id) {
+            // we need to set our frame to uninit, to make sure another frame doesnt later choose it
+            // for eviction, see its page_id, then remove that page_id from the dir (the page_id is
+            // the same as the actual frame that were going to take!)
             frame_guard.abandon();
 
             // in this case we could retry ourselves, but for now we will just return the error TODO
-            return self.framer.pin_read(found_frame_index);
+            return self.framer.pin_read(found_frame_idx);
         }
 
         // set to pending, insert into dir
-        let frame_guard = frame_guard.mark_load_pending(page_id);
-        {
-            dir_guard.dir.insert(page_id, frame_guard.index);
-            self.framer[frame_guard.index]
-                .page_id_hint
-                .store(page_id, Ordering::Release);
-        }
+        let frame_guard = frame_guard.mark_load_pending(target_page_id);
+
+        // eprintln!("t{}: inserting exist {}...", thread_id(), target_page_id);
+        dir_guard.insert(target_page_id, frame_guard.index);
+        self.framer[frame_guard.index].page_id_hint.store(target_page_id, Ordering::Release);
+        drop(dir_guard);
 
         // fetch data
-        let index = frame_guard.index;
+        let frame_idx = frame_guard.index;
         let res = self.io_read_into_frame(frame_guard);
 
         match res {
@@ -136,46 +129,51 @@ impl Pager {
             Err(err) => {
                 // Remove from dir and clear hint before releasing the frame
                 {
-                    let mut shard_guard = self.shard_dirs[shard].write().unwrap();
-                    shard_guard.dir.remove(&page_id);
-                    self.framer[index].page_id_hint.store(PAGE_ID_NULL, Ordering::Release);
+                    let mut dir_guard = self.shard_dirs[shard_idx].write().unwrap();
+                    dir_guard.remove(&target_page_id);
+                    self.framer[frame_idx].page_id_hint.store(PAGE_ID_NULL, Ordering::Release);
                 }
                 Err(err)
             }
         }
     }
 
-    /// Gives an empty frame with a new page. Its `page_id`, `dirty` flag and `io_err` will be reset.
-    /// The page will be zeroed.
-    ///
-    /// **NOTE**: It is assumed that, for a given `page_id`, `get_page_new` will only ever be called
-    /// once. Multiple threads calling this with the same `page_id` will result in a race.
-    // **NOTE**: this will always give a frame in the Writeable state
+    /// This has some optimizations that rely on the assumption that we will under no circumstances
+    /// find the page_id already resident in the pager. This method is **NOT** correct if this is
+    /// the case. ASSERTS page_id will not be found in pager
+    /// Gives an empty frame with a new page. Its `page_id`, `dirty` flag and `io_err` will be
+    /// reset. The page will be zeroed.
+    #[must_use = "RAII FrameGuard releases when dropped"]
     pub(super) fn get_page_new(
-        &self, new_page_id: u64,
-    ) -> Result<FrameWriteGuard<'_, WriteGuardStateWriteable>, StorageError> {
+        &self, target_page_id: u64,
+    ) -> Result<FrameWriteGuard<'_, Writeable>, StorageError> {
         let mut frame_guard = self.get_free_frame()?;
 
+        // initialize frame
         frame_guard.buffer().zero();
-        let frame_guard = frame_guard.mark_writeable(new_page_id);
+        let frame_guard = frame_guard.mark_writeable(target_page_id);
 
-        let mut dir_guard = self.shard_dirs[Self::shard_hash(new_page_id)].write().unwrap();
-        assert!(!dir_guard.dir.contains_key(&new_page_id), "page was already in directory");
-        dir_guard.dir.insert(new_page_id, frame_guard.index);
+        // put it into the dir
+        let mut dir_guard = self.shard_dirs[Self::shard_hash(target_page_id)].write().unwrap();
 
-        self.framer[frame_guard.index]
-            .page_id_hint
-            .store(new_page_id, Ordering::Release);
+        let prev = dir_guard.insert(target_page_id, frame_guard.index);
+        assert!(
+            prev.is_none(),
+            "page was already in directory - by calling get_page_new you are asserting that \
+            we will not find this page_id in the pager, even AFTER we call get_free_frame"
+        );
 
+        // set hint
+        self.framer[frame_guard.index].page_id_hint.store(target_page_id, Ordering::Release);
         Ok(frame_guard)
     }
 
-    /// Gets, pins, and writelocks and unused frame
-    /// Maybe evicts a frame
+    /// Gets, pins, and writelocks and unused frame. Maybe evicts a frame
     /// **NOTE**: it may contain dirty data, and its fields will not be initialized correctly
     /// (page_id, dirty, is_err)**
     // **NOTE**: this will always give a frame in the Uninitialized state
-    fn get_free_frame(&self) -> Result<FrameWriteGuard<'_, WriteGuardStateUninit>, StorageError> {
+    #[must_use = "RAII FrameGuard releases when dropped"]
+    fn get_free_frame(&self) -> Result<FrameWriteGuard<'_, Uninit>, StorageError> {
         self.check_poisoned()?;
         loop {
             let frame = &self.framer[self.scan_for_eviction_candidate()];
@@ -186,11 +184,14 @@ impl Pager {
                 _ => Some(self.shard_dirs[Self::shard_hash(hinted_page_id)].write().unwrap()),
             };
 
-            match self.framer.pin_write(frame.index) {
-                PinWrite::Beaten => continue,
+            let Some(pin_res) = self.framer.pin_write_cas(frame.index) else {
+                continue;
+            };
+
+            match pin_res {
+                // we got an uninit frame - this should not be in our directory
+                // we can simply hand it out
                 PinWrite::Uninit(frame_guard) => {
-                    // we got an uninit frame - this should not be in our directory
-                    // we can simply hand it out
                     return Ok(frame_guard);
                 }
 
@@ -198,14 +199,15 @@ impl Pager {
                 // are just going to start over, because wed have to drop it and reacquire it, and
                 // to prevent deadlocks we don't want to take locks in the dir -> frame order.
                 // Note: the page_id != hinted_page_id check is CORRECT even if we read "NULL" as
-                // the hint - because the frame is probably only NOW in a dir if it only NOW has a page_id
+                // the hint - because the frame is probably only NOW in a dir if it only NOW has a
+                // page_id
                 //
-                PinWrite::Dirty(frame_guard) => {
+                PinWrite::ResidentDirty(frame_guard) => {
                     // we got a dirty frame - we have to write it out
                     match dir_guard_opt {
                         None => {
-                            // Assumption: If we read pageahint:null but this frame is resident, someone
-                            // put it into the dir SINCE we read the hint.
+                            // Assumption: If we read pageahint:null but this frame is resident,
+                            // someone put it into the dir SINCE we read the hint.
                             // -> retry
                             frame_guard.abandon();
                             continue;
@@ -220,21 +222,25 @@ impl Pager {
                             }
 
                             // we can remove it from the dir now, then do our write-out. We hold a
-                            // exlucsive anyway.
-                            dir_guard.dir.remove(&page_id);
+                            // exclusive anyway.
+                            // eprintln!("t{}: evicting dirty {}...", thread_id(), page_id);
+                            dir_guard.remove(&page_id).expect(
+                                "Either we checked wrong shard \
+                                or someone didn't put frame into dir?",
+                            );
 
-                            let guard = self.io_write_out_frame(frame_guard)?;
+                            let frame_guard = self.io_write_out_frame(frame_guard)?;
                             frame.page_id_hint.store(PAGE_ID_NULL, Ordering::Release);
-                            return Ok(guard);
+                            return Ok(frame_guard);
                         }
                     }
                 }
 
-                PinWrite::Resident(frame_guard) => {
+                PinWrite::ResidentReadable(frame_guard) => {
                     match dir_guard_opt {
                         None => {
-                            // Assumption: If we read pageahint:null but this frame is resident, someone
-                            // put it into the dir SINCE we read the hint.
+                            // Assumption: If we read pageahint:null but this frame is resident,
+                            // someone put it into the dir SINCE we read the hint.
                             // -> retry
                             frame_guard.abandon();
                             continue;
@@ -249,7 +255,11 @@ impl Pager {
                             }
 
                             // otherwise just remove it from the dir and hand out the frame
-                            dir_guard.dir.remove(&page_id);
+                            dir_guard.remove(&page_id).expect(
+                                "Either we checked wrong shard \
+                                or someone didn't put frame into dir?",
+                            );
+
                             frame.page_id_hint.store(PAGE_ID_NULL, Ordering::Release);
                             return Ok(frame_guard.mark_evicted());
                         }
@@ -259,43 +269,29 @@ impl Pager {
         }
     }
 
-    /// Scans for an eviction candidate (frame with 0 pins and 0 usage). This will spin until
-    /// one is found. It is imperative that the caller re-check these conditions once a lock on the
-    /// shard directory has been acquired, so we dont TOCTOU.
+    /// Scans for an eviction candidate (frame with 0 pins and 0 usage). This will spin until one is
+    /// found. It is imperative that the caller re-check these conditions once a lock on the shard
+    /// directory has been acquired, so we dont TOCTOU.
     fn scan_for_eviction_candidate(&self) -> usize {
         let mut checked_count = 0; // for spin hint heuristics
 
         loop {
-            let frame_index = self.eviction_hand.fetch_add(1, Ordering::Relaxed) % self.framer.frame_count();
-            let frame = &self.framer[frame_index];
+            let frame_idx =
+                self.eviction_hand.fetch_add(1, Ordering::Relaxed) % self.framer.frame_count();
+            let frame = &self.framer[frame_idx];
 
+            // This could be Relaxed (maybe) but it might result in more aborts once we take the
+            // lock later? Would need testing really. Either is "correct" because we recheck later.
             if frame.pins.load(Ordering::Acquire) == 0 {
-                // This could be Relaxed but it might result in more aborts once we take the lock
-                // later? Would need testing really. Either is "correct" because we recheck later.
+                let frame_usage_ctr = frame
+                    .usage
+                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                        Some(old.saturating_sub(1))
+                    })
+                    .unwrap();
 
-                let usage = loop {
-                    // theres no atomic saturating sub so we have to do a little dance, otherwise we
-                    // can have a TOCTOU where two threads decrement this usage and it wraps
-                    let fetched_usage = frame.usage.load(Ordering::Relaxed);
-
-                    if fetched_usage == 0 {
-                        break 0;
-                    }
-
-                    let res = frame.usage.compare_exchange(
-                        fetched_usage,
-                        fetched_usage - 1,
-                        Ordering::Relaxed,
-                        Ordering::Relaxed,
-                    );
-
-                    if res.is_ok() {
-                        break fetched_usage;
-                    }
-                };
-
-                if usage == 0 {
-                    return frame_index;
+                if frame_usage_ctr == 0 {
+                    return frame_idx;
                 }
             }
 
@@ -309,13 +305,13 @@ impl Pager {
         }
     }
 
-    // --------------------------------------------------------------------------------
-    // *            IO                                                                *
-    // --------------------------------------------------------------------------------
+    // --------------------------------------------------------------------------------------------
+    // *            IO                                                                            *
+    // --------------------------------------------------------------------------------------------
 
     fn io_read_into_frame<'a>(
-        &self, mut frame_guard: FrameWriteGuard<'a, WriteGuardStateLoadPending>,
-    ) -> Result<FrameReadGuard<'a, ReadGuardStateReadable>, StorageError> {
+        &self, mut frame_guard: FrameWriteGuard<'a, LoadPending>,
+    ) -> Result<FrameReadGuard<'a, Readable>, StorageError> {
         let page_id = frame_guard.page_id();
         let mut result = self
             .file
@@ -339,8 +335,8 @@ impl Pager {
     }
 
     fn io_write_out_frame<'a>(
-        &self, mut frame_guard: FrameWriteGuard<'a, WriteGuardStateDirty>,
-    ) -> Result<FrameWriteGuard<'a, WriteGuardStateUninit>, StorageError> {
+        &self, mut frame_guard: FrameWriteGuard<'a, Dirty>,
+    ) -> Result<FrameWriteGuard<'a, Uninit>, StorageError> {
         let page_id = frame_guard.page_id();
         checksum::set(frame_guard.buffer());
 
@@ -359,3 +355,20 @@ impl Pager {
         Ok(frame_guard.mark_written_out_and_reinit())
     }
 }
+
+// TODO delete
+// CURRENT BUG:
+// we request `get_page_new` on same page_id multiple times,
+// we find free frames (just uninit) so we dont even look in the dir_guard
+// we just put that shit in
+
+// `get_page_new_1` handles all general cases where we want to write to a given arbitrary `page_id`.
+// It should work even if the page is currently resident in the pager and even if the page is
+// currently RW locked. We'll have to revise the Frame state machine rules to support this, as
+// originally wed planned to oinly give out "Writeable" initialized frames but now well be
+// possibly giving out frames that are `Dirty` or read-in from disk (`Readable`)
+
+// `get_page_new_2` will only be correct if we are writing to a page that would notionally be
+// "freed". What this means wrt the pager is that the page should NOT be resident - unlike
+// `get_new_page_1` this should "fail" (in some way) if we pass in a `page_id` that is currently
+// resident in the pager.

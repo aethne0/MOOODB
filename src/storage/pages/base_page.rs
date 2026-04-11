@@ -1,4 +1,5 @@
-use std::ops::{Bound, RangeBounds};
+use std::ops::Bound;
+use std::ops::RangeBounds;
 
 use zerocopy::big_endian;
 
@@ -26,7 +27,9 @@ pub(crate) const PAGE_HEADER_SIZE: u16 = 0x40;
 /// offset 16 │ tx_id      u64
 /// offset 24 │ <reserved> u64
 /// ```
-#[derive(Clone, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
+#[derive(
+    Clone, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout,
+)]
 #[repr(C)]
 pub(crate) struct PagePrefix {
     pub(crate) checksum: big_endian::U64,
@@ -83,10 +86,14 @@ const _: () = assert!(size_of::<PageHeader>() == PAGE_HEADER_SIZE as usize);
 
 impl std::ops::Deref for PageHeader {
     type Target = PagePrefix;
-    fn deref(&self) -> &PagePrefix { &self.prefix }
+    fn deref(&self) -> &PagePrefix {
+        &self.prefix
+    }
 }
 impl std::ops::DerefMut for PageHeader {
-    fn deref_mut(&mut self) -> &mut PagePrefix { &mut self.prefix }
+    fn deref_mut(&mut self) -> &mut PagePrefix {
+        &mut self.prefix
+    }
 }
 
 /// Base slotted-page layout shared by all page types.

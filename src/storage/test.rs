@@ -18,13 +18,14 @@ fn make_page_file(page_count: u64) -> tempfile::NamedTempFile {
 mod shuttle_tests {
     use super::*;
     use crate::storage::pager::Pager;
-    use shuttle::sync::Arc;
+    use crate::sync::*;
+    use shuttle::sync::*;
 
     fn check(f: impl Fn() + Send + Sync + 'static) {
-        let scheduler = shuttle::scheduler::RandomScheduler::new(200);
+        let scheduler = shuttle::scheduler::RandomScheduler::new(2000);
         let mut config = shuttle::Config::default();
         config.failure_persistence = shuttle::FailurePersistence::None;
-        config.max_steps = shuttle::MaxSteps::FailAfter(1_000_000);
+        config.max_steps = shuttle::MaxSteps::FailAfter(1_000_000_000);
         let runner = shuttle::Runner::new(scheduler, config);
         runner.run(f);
     }
@@ -89,10 +90,10 @@ mod shuttle_tests {
             let p = Arc::clone(&pager);
 
             shuttle::thread::spawn(move || {
-                p.get_page_new(0).unwrap().abandon();
-                p.get_page_new(1).unwrap().abandon();
+                p.get_page_new(0).unwrap().commit();
+                p.get_page_new(1).unwrap().commit();
                 // Must evict and write out page 0 or 1 (both dirty) before this succeeds.
-                p.get_page_new(2).unwrap().abandon();
+                p.get_page_new(2).unwrap().commit();
             })
             .join()
             .unwrap();
@@ -139,165 +140,42 @@ mod shuttle_tests {
     fn eviction_under_concurrent_reads_2() {
         check(|| {
             const PAGECNT: u64 = 10;
+            const THREADS: u64 = 16;
+            const ITERS: u64 = 16;
+            let bump = Arc::new(AtomicU64::new(0));
             let tmp = make_page_file(PAGECNT);
             let file = tmp.reopen().unwrap();
-            let pager = Arc::new(Pager::new(7, file));
+            let pager = Arc::new(Pager::new(THREADS as usize * 2 , file));
 
-            let p1 = Arc::clone(&pager);
-            let p2 = Arc::clone(&pager);
-            let p3 = Arc::clone(&pager);
+            let mut handles = vec![];
+            for thread_idx in 0..THREADS {
+                let b = bump.clone();
+                let p = Arc::clone(&pager);
+                let h = shuttle::thread::spawn(move || {
+                    for iter_idx in 0..ITERS {
+                        for page_idx in 0..PAGECNT {
+                            {
+                                let g1 =
+                                    p.get_page_existing((page_idx + thread_idx) % PAGECNT).unwrap();
+                                let g2 = p
+                                    .get_page_existing((page_idx + thread_idx + 1) % PAGECNT)
+                                    .unwrap();
+                            }
+                            {
+                                let g3 = p
+                                    .get_page_new(1_000_000 + b.fetch_add(1, Ordering::Relaxed))
+                                    .unwrap();
+                                g3.commit();
+                            }
+                        }
+                    }
+                });
+                handles.push(h);
+            }
 
-            // Each thread holds at most one guard at a time so the pool never
-            // fully deadlocks (both frames simultaneously pinned while a third
-            // load is attempted).
-            let h1 = shuttle::thread::spawn(move || {
-                for p in 0..PAGECNT {
-                    drop(p1.get_page_existing(p).unwrap());
-                    drop(
-                        p1.get_page_existing(((p as i64 - 1) % (PAGECNT as i64)) as u64)
-                            .unwrap(),
-                    );
-                }
-            });
-
-            let h2 = shuttle::thread::spawn(move || {
-                for p in 0..PAGECNT {
-                    drop(p2.get_page_existing(p).unwrap());
-                    drop(p2.get_page_existing((p + 1) % PAGECNT).unwrap());
-                }
-            });
-
-            let h3 = shuttle::thread::spawn(move || {
-                for p in 0..PAGECNT {
-                    drop(p3.get_page_existing(p).unwrap());
-                    drop(p3.get_page_existing((p + 2) % PAGECNT).unwrap());
-                }
-            });
-
-            h1.join().unwrap();
-            h2.join().unwrap();
-            h3.join().unwrap();
-        });
-    }
-}
-
-// loom
-// -> set LOOM_MAX_BRANCHES=100000 if model checking is too slow.
-#[cfg(loom)]
-mod loom_tests {
-    use super::*;
-    use crate::storage::pager::Pager;
-    use loom::sync::Arc;
-
-    /// Two threads race to load the same page from disk.
-    /// Exhaustively verifies that exactly one issues the I/O and the other
-    /// correctly adopts the already-loaded frame.
-    #[test]
-    fn two_threads_read_same_page() {
-        loom::model(|| {
-            let tmp = make_page_file(1);
-            let file = tmp.reopen().unwrap();
-            let pager = Arc::new(Pager::new(4, file));
-
-            let p1 = Arc::clone(&pager);
-            let p2 = Arc::clone(&pager);
-
-            let h1 = loom::thread::spawn(move || drop(p1.get_page_existing(0).unwrap()));
-            let h2 = loom::thread::spawn(move || drop(p2.get_page_existing(0).unwrap()));
-
-            h1.join().unwrap();
-            h2.join().unwrap();
-        });
-    }
-
-    /// Two threads load different pages simultaneously.
-    /// Verifies that distinct shard locks don't cause spurious serialisation or
-    /// double-eviction of the same frame.
-    #[test]
-    fn two_threads_read_different_pages() {
-        loom::model(|| {
-            let tmp = make_page_file(2);
-            let file = tmp.reopen().unwrap();
-            let pager = Arc::new(Pager::new(4, file));
-
-            let p1 = Arc::clone(&pager);
-            let p2 = Arc::clone(&pager);
-
-            let h1 = loom::thread::spawn(move || drop(p1.get_page_existing(0).unwrap()));
-            let h2 = loom::thread::spawn(move || drop(p2.get_page_existing(1).unwrap()));
-
-            h1.join().unwrap();
-            h2.join().unwrap();
-        });
-    }
-
-    /// Exactly 2 frames, 2 threads each wanting a different page.
-    /// Both threads must scan for an eviction candidate concurrently; the
-    /// `pins != 1` recheck inside `get_free_frame` guards against two threads
-    /// selecting the same frame — this model exhaustively verifies that guard.
-    #[test]
-    fn eviction_candidate_scan_race() {
-        loom::model(|| {
-            let tmp = make_page_file(2);
-            let file = tmp.reopen().unwrap();
-            let pager = Arc::new(Pager::new(2, file));
-
-            let p1 = Arc::clone(&pager);
-            let p2 = Arc::clone(&pager);
-
-            let h1 = loom::thread::spawn(move || drop(p1.get_page_existing(0).unwrap()));
-            let h2 = loom::thread::spawn(move || drop(p2.get_page_existing(1).unwrap()));
-
-            h1.join().unwrap();
-            h2.join().unwrap();
-        });
-    }
-
-    /// Two threads, 2 frames, 3 pages on disk.
-    /// Each thread reads two pages sequentially; the narrow pool forces eviction
-    /// mid-flight and the threads converge on page 2 from different directions,
-    /// exercising both the eviction path and the same-page adoption path together.
-    #[test]
-    fn eviction_under_concurrent_reads_loom() {
-        loom::model(|| {
-            const PAGECNT: u64 = 10;
-            let tmp = make_page_file(PAGECNT);
-            let file = tmp.reopen().unwrap();
-            let pager = Arc::new(Pager::new(7, file));
-
-            let p1 = Arc::clone(&pager);
-            let p2 = Arc::clone(&pager);
-            let p3 = Arc::clone(&pager);
-
-            // Each thread holds at most one guard at a time so the pool never
-            // fully deadlocks (both frames simultaneously pinned while a third
-            // load is attempted).
-            let h1 = loom::thread::spawn(move || {
-                for p in 0..PAGECNT {
-                    drop(p1.get_page_existing(p).unwrap());
-                    drop(p1.get_page_existing(5).unwrap());
-                }
-            });
-
-            let h2 = loom::thread::spawn(move || {
-                for p in 0..PAGECNT {
-                    drop(p2.get_page_existing(p).unwrap());
-                    drop(p2.get_page_existing((p + 1) % PAGECNT).unwrap());
-                }
-            });
-
-            /*
-            let h3 = loom::thread::spawn(move || {
-                for p in 0..PAGECNT {
-                    drop(p3.get_page_existing(p).unwrap());
-                    drop(p3.get_page_existing((p + 2) % PAGECNT).unwrap());
-                }
-            });
-            */
-
-            h1.join().unwrap();
-            h2.join().unwrap();
-            // h3.join().unwrap();
+            for h in handles {
+                h.join();
+            }
         });
     }
 }

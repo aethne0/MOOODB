@@ -1,12 +1,15 @@
 use std::mem::size_of;
 
-use zerocopy::{big_endian, IntoBytes};
+use zerocopy::IntoBytes;
+use zerocopy::big_endian;
 
 use super::PAGE_ID_NULL;
 use super::PagePrefix;
 use crate::storage::PAGE_SIZE;
 
-#[derive(Clone, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
+#[derive(
+    Clone, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout,
+)]
 #[repr(C)]
 pub(crate) struct SuperblockHeader {
     pub(crate) prefix: PagePrefix,
@@ -23,10 +26,14 @@ pub(crate) struct SuperblockHeader {
 
 impl std::ops::Deref for SuperblockHeader {
     type Target = PagePrefix;
-    fn deref(&self) -> &PagePrefix { &self.prefix }
+    fn deref(&self) -> &PagePrefix {
+        &self.prefix
+    }
 }
 impl std::ops::DerefMut for SuperblockHeader {
-    fn deref_mut(&mut self) -> &mut PagePrefix { &mut self.prefix }
+    fn deref_mut(&mut self) -> &mut PagePrefix {
+        &mut self.prefix
+    }
 }
 
 impl SuperblockHeader {
@@ -53,7 +60,8 @@ impl<'buf> SuperblockPage<&'buf mut [u8; PAGE_SIZE]> {
     }
 
     pub(crate) fn new_with_buffer(
-        buffer: &'buf mut [u8; PAGE_SIZE], page_size: u16, page_id: u64, tx_id: u64, bump_alloc_page_id_start: u64,
+        buffer: &'buf mut [u8; PAGE_SIZE], page_size: u16, page_id: u64, tx_id: u64,
+        bump_alloc_page_id_start: u64,
     ) -> Self {
         buffer[size_of::<SuperblockHeader>()..].fill(0);
 
@@ -69,7 +77,9 @@ impl<'buf> SuperblockPage<&'buf mut [u8; PAGE_SIZE]> {
         page
     }
 
-    pub(crate) fn new_with_buffer_from_header(buffer: &'buf mut [u8; PAGE_SIZE], header: &SuperblockHeader) -> Self {
+    pub(crate) fn new_with_buffer_from_header(
+        buffer: &'buf mut [u8; PAGE_SIZE], header: &SuperblockHeader,
+    ) -> Self {
         buffer[..size_of::<SuperblockHeader>()].copy_from_slice(header.as_bytes());
         buffer[size_of::<SuperblockHeader>()..].fill(0);
         Self::from_buffer(buffer)

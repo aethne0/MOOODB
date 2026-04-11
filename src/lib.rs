@@ -1,5 +1,4 @@
 #![allow(dead_code)]
-
 #![warn(clippy::pedantic)]
 #![warn(clippy::perf)]
 #![warn(unreachable_pub)]

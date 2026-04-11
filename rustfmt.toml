@@ -1,15 +1,22 @@
+# REQUIRES:
+# cargo +nightly fmt
 edition = "2024"
-# # Maximum line width (adjust as you like)
-max_width = 120
+unstable_features = true
 
-# Struct and tuple formatting
-struct_lit_width = 120      # keep struct literals on one line if <= 120 chars
-struct_variant_width = 120  # keep enum variants on one line if <= 120 chars
-enum_variant_width = 120    # same as above
-tuple_width = 120           # keep tuples on one line if <= 120 chars
-fn_args_layout = "Compressed"  # compress function arguments onto single line if possible
-fn_call_width = 120         # keep function calls on one line if <= 120 chars
+# # Maximum line width (adjust as you like)
+max_width = 100
+newline_style = "Unix"
+
+# fn_call_width, attr_fn_like_width, struct_lit_width, struct_variant_width,
+# array_width, chain_width, single_line_if_else_max_width
+use_small_heuristics = "Max"
+fn_params_layout = "Compressed"
 
 # # Other options
 # use_small_heuristics = "Max" # prevents small structs/enums from being split unnecessarily
 format_code_in_doc_comments = false
+imports_granularity = "Item"
+
+# this doesnt seem to work but a guy can dream
+struct_field_align_threshold = 80
+use_field_init_shorthand = true
