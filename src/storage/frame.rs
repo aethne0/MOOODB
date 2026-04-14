@@ -1,3 +1,8 @@
+//! frame.rs
+//!
+//! implementation of frames, the overall memory buffer pool and the
+//! lifetime/state-machine logic of frames.
+
 use std::fmt::Debug;
 use std::marker::PhantomData;
 
@@ -76,14 +81,14 @@ impl<'a> Drop for PinDropper<'a> {
 // -------------------------------------------------------------------------------------------------
 
 /// This is a frame that has previously had data loaded into it for reading. We should be getting aa
-pub(super) struct Resident;
+pub(crate) struct Resident;
 /// This is a Write
-pub(super) struct LoadPending;
-pub(super) struct Uninit;
-pub(super) struct Writeable;
-pub(super) struct Dirty;
+pub(crate) struct LoadPending;
+pub(crate) struct Uninit;
+pub(crate) struct Writeable;
+pub(crate) struct Dirty;
 
-pub(super) trait WriteGuardState {}
+pub(crate) trait WriteGuardState {}
 impl WriteGuardState for Resident {}
 impl WriteGuardState for LoadPending {}
 impl WriteGuardState for Uninit {}
@@ -176,11 +181,12 @@ impl<'a> FrameWriteGuard<'a, Writeable> {
         }
     }
 
-    pub(crate) fn commit(mut self) {
+    pub(crate) fn commit(mut self) -> FrameWriteGuard<'a, Dirty> {
         match self.inner.state {
             State::Writeable(page_id) => self.inner.state = State::Dirty(page_id),
             _ => unreachable!(),
         }
+        Self::transition(self)
     }
 
     pub(crate) fn buffer<'b>(&'b mut self) -> &'b mut [u8; PAGE_SIZE] {
@@ -295,11 +301,12 @@ impl<'a> FrameWriteGuard<'a, Dirty> {
     }
 
     /// turns it into a readable frame - use this if you are not trying to evict
-    pub(crate) fn mark_written_out(mut self) {
+    pub(crate) fn mark_written_out(mut self) -> FrameWriteGuard<'a, Resident> {
         match self.inner.state {
             State::Dirty(page_id) => self.inner.state = State::Resident(page_id),
             _ => unreachable!(),
         }
+        Self::transition(self)
     }
 }
 // -------------------------------------------------------------------------------------------------
@@ -321,6 +328,7 @@ unsafe impl Send for FrameSlab {}
 unsafe impl Sync for FrameSlab {}
 
 pub(crate) enum PinWrite<'a> {
+    CasFail,
     Uninit(FrameWriteGuard<'a, Uninit>),
     ResidentReadable(FrameWriteGuard<'a, Resident>),
     ResidentDirty(FrameWriteGuard<'a, Dirty>),
@@ -329,6 +337,7 @@ pub(crate) enum PinWrite<'a> {
 impl<'a> PinWrite<'a> {
     pub(crate) fn abandon(self) {
         match self {
+            PinWrite::CasFail => {}
             PinWrite::ResidentDirty(g) => g.abandon(),
             PinWrite::Uninit(g) => g.abandon(),
             PinWrite::ResidentReadable(g) => g.abandon(),
@@ -421,20 +430,14 @@ impl FrameSlab {
 
     #[must_use = "RAII FrameRef unpins when dropped"]
     pub(crate) fn pin_write<'a>(&'a self, index: usize) -> PinWrite<'a> {
-        self.frames[index].pins.fetch_add(1, Ordering::Release);
-        self.write_lock(index)
-    }
-
-    #[must_use = "RAII FrameRef unpins when dropped"]
-    pub(crate) fn pin_write_cas<'a>(&'a self, index: usize) -> Option<PinWrite<'a>> {
-        match self.frames[index].pins.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire) {
-            Ok(_) => Some(self.write_lock(index)),
-            Err(_) => None,
+        if self.frames[index]
+            .pins
+            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
+            .is_err()
+        {
+            return PinWrite::CasFail;
         }
-    }
 
-    #[must_use = "RAII FrameRef unpins when dropped"]
-    fn write_lock<'a>(&'a self, index: usize) -> PinWrite<'a> {
         self.frames[index].usage.fetch_add(1, Ordering::Relaxed);
         let guard = self.frames[index].inner.write().unwrap();
         // SAFETY

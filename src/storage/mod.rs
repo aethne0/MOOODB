@@ -2,6 +2,7 @@
 mod test;
 
 mod frame;
+pub(crate) mod manager;
 mod pages;
 mod slab;
 

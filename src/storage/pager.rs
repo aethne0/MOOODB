@@ -184,11 +184,10 @@ impl Pager {
                 _ => Some(self.shard_dirs[Self::shard_hash(hinted_page_id)].write().unwrap()),
             };
 
-            let Some(pin_res) = self.framer.pin_write_cas(frame.index) else {
-                continue;
-            };
-
-            match pin_res {
+            match self.framer.pin_write(frame.index) {
+                PinWrite::CasFail => {
+                    continue;
+                }
                 // we got an uninit frame - this should not be in our directory
                 // we can simply hand it out
                 PinWrite::Uninit(frame_guard) => {
@@ -229,7 +228,7 @@ impl Pager {
                                 or someone didn't put frame into dir?",
                             );
 
-                            let frame_guard = self.io_write_out_frame(frame_guard)?;
+                            let frame_guard = self.io_flush_and_reinit(frame_guard)?;
                             frame.page_id_hint.store(PAGE_ID_NULL, Ordering::Release);
                             return Ok(frame_guard);
                         }
@@ -333,9 +332,25 @@ impl Pager {
         }
     }
 
+    // TODO combine these
+
+    pub(crate) fn io_flush_and_resident<'a>(
+        &self, frame_guard: FrameWriteGuard<'a, Dirty>,
+    ) -> Result<FrameWriteGuard<'a, Resident>, StorageError> {
+        let fg = self.io_write_out_frame(frame_guard)?;
+        Ok(fg.mark_written_out())
+    }
+
+    fn io_flush_and_reinit<'a>(
+        &self, frame_guard: FrameWriteGuard<'a, Dirty>,
+    ) -> Result<FrameWriteGuard<'a, Uninit>, StorageError> {
+        let fg = self.io_write_out_frame(frame_guard)?;
+        Ok(fg.mark_written_out_and_reinit())
+    }
+
     fn io_write_out_frame<'a>(
         &self, mut frame_guard: FrameWriteGuard<'a, Dirty>,
-    ) -> Result<FrameWriteGuard<'a, Uninit>, StorageError> {
+    ) -> Result<FrameWriteGuard<'a, Dirty>, StorageError> {
         let page_id = frame_guard.page_id();
         checksum::set(frame_guard.buffer());
 
@@ -351,7 +366,11 @@ impl Pager {
             std::process::abort();
         }
 
-        Ok(frame_guard.mark_written_out_and_reinit())
+        Ok(frame_guard)
+    }
+
+    pub(crate) fn sync(&self) -> Result<(), StorageError> {
+        self.file.sync_all().map_err(|e| e.kind().into())
     }
 }
 
