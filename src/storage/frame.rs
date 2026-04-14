@@ -9,7 +9,6 @@ use crate::sync::*;
 
 #[repr(align(64))]
 pub(crate) struct Frame {
-    // both could be smaller but this is aligned-padded anyway
     pub(crate) index: usize,
     pub(crate) page_id_hint: AtomicU64,
     pub(crate) inner: RwLock<FrameInner>,
@@ -30,32 +29,14 @@ impl Frame {
     }
 }
 
-/// Invarients:
-/// A "frame-cycle" refers to the span of time between it having 0 pins
-/// Within a single frame-cycle:
-/// - the frame should have exactly 1 page_id
-/// - the possible state transitions are possible:
-///     - Writing:      `Uninitialized` -> `Writteable` -> `Dirty` -> `WrittenOut`
-///     - ReadGood:     `Uninitialized` -> `ReadPending` -> `Readin`
-///     - ReadError:    `Uninitialized` -> `ReadPending` -> `ReadErrored`
-///
-/// `Dirty` and `ReadPending` frames may not be transitioned to `Uninitialized`
-/// `ReadSuccessful` | `ReadErrored` -> `Uninitialized`
-///
-/// NOTE there is not "WriteError" state - we poison our page buffer if we have a write-out error
-
 #[derive(PartialEq, Eq, Debug, Clone, Copy)]
 enum State {
     Uninitialized,
-
     LoadPending(u64),
-
-    Readable(u64),
+    Resident(u64),
     ReadErrored(u64, StorageError),
-
     Writeable(u64),
     Dirty(u64),
-
     Poisoned,
 }
 
@@ -94,20 +75,16 @@ impl<'a> Drop for PinDropper<'a> {
 // *            Guards                                                                             *
 // -------------------------------------------------------------------------------------------------
 
-/// This is a Readable frame (has had data loaded in)
-pub(super) struct Readable;
 /// This is a frame that has previously had data loaded into it for reading. We should be getting aa
-pub(super) struct ReadableW;
+pub(super) struct Resident;
 /// This is a Write
 pub(super) struct LoadPending;
 pub(super) struct Uninit;
 pub(super) struct Writeable;
 pub(super) struct Dirty;
 
-pub(super) trait ReadGuardState {}
-impl ReadGuardState for Readable {}
 pub(super) trait WriteGuardState {}
-impl WriteGuardState for ReadableW {}
+impl WriteGuardState for Resident {}
 impl WriteGuardState for LoadPending {}
 impl WriteGuardState for Uninit {}
 impl WriteGuardState for Writeable {}
@@ -117,23 +94,16 @@ impl WriteGuardState for Dirty {}
 // *            FrameReadGuard                                                                     *
 // -------------------------------------------------------------------------------------------------
 
-pub(crate) struct FrameReadGuard<'a, State>
-where
-    State: ReadGuardState,
-{
-    _phantom: PhantomData<State>,
+pub(crate) struct FrameReadGuard<'a> {
     pub(crate) index: usize,
 
     inner: RwLockReadGuard<'a, FrameInner>,
-    slab: &'a FrameSlab,
     buffer: &'a [u8; PAGE_SIZE],
     pin_dropper: Option<PinDropper<'a>>,
 }
 
-// --
-
 // ------------ Readable ---------------------------------------------------------------------------
-impl<'a> FrameReadGuard<'a, Readable> {
+impl<'a> FrameReadGuard<'a> {
     pub(crate) fn buffer(&self) -> &'a [u8; PAGE_SIZE] {
         self.buffer
     }
@@ -199,8 +169,11 @@ impl<'a> FrameWriteGuard<'a, Uninit> {
 
 // ------------ Writeable --------------------------------------------------------------------------
 impl<'a> FrameWriteGuard<'a, Writeable> {
-    pub(crate) fn abandon(self) {
-        todo!("shouldnt abandon a writeable frame because its still in the dir");
+    pub(crate) fn abandon(mut self) {
+        match self.inner.state {
+            State::Writeable(page_id) => self.inner.state = State::Resident(page_id),
+            _ => unreachable!(),
+        }
     }
 
     pub(crate) fn commit(mut self) {
@@ -215,18 +188,18 @@ impl<'a> FrameWriteGuard<'a, Writeable> {
     }
 }
 
-// ------------ ReadableOld ------------------------------------------------------------------------
-impl<'a> FrameWriteGuard<'a, ReadableW> {
+// ------------ Readable ---------------------------------------------------------------------------
+impl<'a> FrameWriteGuard<'a, Resident> {
     pub(crate) fn abandon(self) {
         match self.inner.state {
-            State::Readable(_) => {}
+            State::Resident(_) => {}
             _ => unreachable!(),
         }
     }
 
     pub(crate) fn page_id(&self) -> u64 {
         match self.inner.state {
-            State::Readable(page_id) => {
+            State::Resident(page_id) => {
                 assert!(page_id != PAGE_ID_NULL);
                 page_id
             }
@@ -236,7 +209,7 @@ impl<'a> FrameWriteGuard<'a, ReadableW> {
 
     pub(crate) fn mark_evicted(mut self) -> FrameWriteGuard<'a, Uninit> {
         match self.inner.state {
-            State::Readable(_) => self.inner.state = State::Uninitialized,
+            State::Resident(_) => self.inner.state = State::Uninitialized,
             _ => unreachable!(),
         }
         Self::transition(self)
@@ -259,10 +232,10 @@ impl<'a> FrameWriteGuard<'a, LoadPending> {
         }
     }
 
-    pub(crate) fn mark_load_ok(mut self) -> FrameReadGuard<'a, Readable> {
+    pub(crate) fn mark_load_ok(mut self) -> FrameReadGuard<'a> {
         match self.inner.state {
             State::LoadPending(page_id) => {
-                self.inner.state = State::Readable(page_id);
+                self.inner.state = State::Resident(page_id);
                 self.slab.downgrade_guard(self)
             }
             _ => unreachable!(),
@@ -324,7 +297,7 @@ impl<'a> FrameWriteGuard<'a, Dirty> {
     /// turns it into a readable frame - use this if you are not trying to evict
     pub(crate) fn mark_written_out(mut self) {
         match self.inner.state {
-            State::Dirty(page_id) => self.inner.state = State::Readable(page_id),
+            State::Dirty(page_id) => self.inner.state = State::Resident(page_id),
             _ => unreachable!(),
         }
     }
@@ -349,7 +322,7 @@ unsafe impl Sync for FrameSlab {}
 
 pub(crate) enum PinWrite<'a> {
     Uninit(FrameWriteGuard<'a, Uninit>),
-    ResidentReadable(FrameWriteGuard<'a, ReadableW>),
+    ResidentReadable(FrameWriteGuard<'a, Resident>),
     ResidentDirty(FrameWriteGuard<'a, Dirty>),
 }
 
@@ -398,19 +371,14 @@ impl FrameSlab {
     /// NOTE this does not affect state
     fn downgrade_guard<'a>(
         &'a self, mut guard: FrameWriteGuard<'a, LoadPending>,
-    ) -> FrameReadGuard<'a, Readable> {
-        assert!(matches!(guard.inner.state, State::Readable(_)));
+    ) -> FrameReadGuard<'a> {
+        assert!(matches!(guard.inner.state, State::Resident(_)));
         let index = guard.index;
 
         // take our new pin before releasing the old one
         let pin_dropper = guard.pin_dropper.take();
-        // TODO delete these:
-        // self.frames[index].pins.fetch_add(1, Ordering::Release);
-        // drop guard
 
         drop(guard);
-        // TODO
-        // let guard = self.frames[index].inner.try_read().expect("lock was contested");
         let guard = self.frames[index].inner.read().unwrap();
 
         // SAFETY
@@ -418,21 +386,12 @@ impl FrameSlab {
         let buffer: &[u8; PAGE_SIZE] =
             unsafe { &*(self.page_slab.as_ptr().add(PAGE_SIZE * index) as *const [u8; PAGE_SIZE]) };
 
-        FrameReadGuard {
-            index,
-            slab: self,
-            buffer,
-            inner: guard,
-            _phantom: PhantomData,
-            pin_dropper,
-        }
+        FrameReadGuard { index, buffer, inner: guard, pin_dropper }
     }
 
     /// NOTE this does not affect state
     #[must_use = "RAII FrameRef unpins when dropped"]
-    pub(super) fn pin_read(
-        &self, index: usize,
-    ) -> Result<FrameReadGuard<'_, Readable>, StorageError> {
+    pub(super) fn pin_read(&self, index: usize) -> Result<FrameReadGuard<'_>, StorageError> {
         self.frames[index].pins.fetch_add(1, Ordering::Release);
         self.frames[index].usage.fetch_add(1, Ordering::Relaxed);
         let guard = self.frames[index].inner.read().unwrap();
@@ -443,13 +402,11 @@ impl FrameSlab {
             unsafe { &*(self.page_slab.as_ptr().add(PAGE_SIZE * index) as *const [u8; PAGE_SIZE]) };
 
         match guard.state {
-            State::Readable(_) | State::Dirty(_) => Ok(FrameReadGuard {
+            State::Resident(_) | State::Dirty(_) => Ok(FrameReadGuard {
                 index,
-                slab: self,
                 buffer,
                 inner: guard,
                 pin_dropper: Some(PinDropper { slab: self, index }),
-                _phantom: PhantomData,
             }),
             State::ReadErrored(_, err) => Err(err),
             _ => {
@@ -465,23 +422,19 @@ impl FrameSlab {
     #[must_use = "RAII FrameRef unpins when dropped"]
     pub(crate) fn pin_write<'a>(&'a self, index: usize) -> PinWrite<'a> {
         self.frames[index].pins.fetch_add(1, Ordering::Release);
-        self._pin_write(index)
+        self.write_lock(index)
     }
 
     #[must_use = "RAII FrameRef unpins when dropped"]
     pub(crate) fn pin_write_cas<'a>(&'a self, index: usize) -> Option<PinWrite<'a>> {
-        if self.frames[index]
-            .pins
-            .compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire)
-            .is_ok()
-        {
-            Some(self._pin_write(index))
-        } else {
-            None
+        match self.frames[index].pins.compare_exchange(0, 1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => Some(self.write_lock(index)),
+            Err(_) => None,
         }
     }
 
-    fn _pin_write<'a>(&'a self, index: usize) -> PinWrite<'a> {
+    #[must_use = "RAII FrameRef unpins when dropped"]
+    fn write_lock<'a>(&'a self, index: usize) -> PinWrite<'a> {
         self.frames[index].usage.fetch_add(1, Ordering::Relaxed);
         let guard = self.frames[index].inner.write().unwrap();
         // SAFETY
@@ -505,7 +458,7 @@ impl FrameSlab {
         match state {
             State::Uninitialized => PinWrite::Uninit(fwg),
             State::ReadErrored(_, _) => PinWrite::Uninit(fwg),
-            State::Readable(_) => PinWrite::ResidentReadable(FrameWriteGuard::transition(fwg)),
+            State::Resident(_) => PinWrite::ResidentReadable(FrameWriteGuard::transition(fwg)),
             State::Dirty(_) => PinWrite::ResidentDirty(FrameWriteGuard::transition(fwg)),
 
             State::Poisoned => {

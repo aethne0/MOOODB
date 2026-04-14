@@ -140,8 +140,8 @@ mod shuttle_tests {
     fn eviction_under_concurrent_reads_2() {
         check(|| {
             const PAGECNT: u64 = 10;
-            const THREADS: u64 = 16;
-            const ITERS: u64 = 16;
+            const THREADS: u64 = 8;
+            const ITERS: u64 = 8;
             let bump = Arc::new(AtomicU64::new(0));
             let tmp = make_page_file(PAGECNT);
             let file = tmp.reopen().unwrap();

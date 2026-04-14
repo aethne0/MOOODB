@@ -77,7 +77,7 @@ impl Pager {
     #[must_use = "RAII FrameGuard releases when dropped"]
     pub(super) fn get_page_existing(
         &self, target_page_id: u64,
-    ) -> Result<FrameReadGuard<'_, Readable>, StorageError> {
+    ) -> Result<FrameReadGuard<'_>, StorageError> {
         let shard_idx = Self::shard_hash(target_page_id);
 
         // if its already paged in
@@ -295,7 +295,6 @@ impl Pager {
                 }
             }
 
-            thread::yield_now();
             checked_count += 1;
             if checked_count == self.framer.frame_count() {
                 // hint that were spinning if weve looked through all the frames already
@@ -311,7 +310,7 @@ impl Pager {
 
     fn io_read_into_frame<'a>(
         &self, mut frame_guard: FrameWriteGuard<'a, LoadPending>,
-    ) -> Result<FrameReadGuard<'a, Readable>, StorageError> {
+    ) -> Result<FrameReadGuard<'a>, StorageError> {
         let page_id = frame_guard.page_id();
         let mut result = self
             .file
