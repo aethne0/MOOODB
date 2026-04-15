@@ -33,9 +33,9 @@ pub(crate) const PAGE_HEADER_SIZE: u16 = 0x40;
 #[repr(C)]
 pub(crate) struct PagePrefix {
     pub(crate) checksum: big_endian::U64,
-    pub(crate) page_id: big_endian::U64,
-    pub(crate) tx_id: big_endian::U64,
-    _reserved: big_endian::U64,
+    pub(crate) page_id:  big_endian::U64,
+    pub(crate) tx_id:    big_endian::U64,
+    _reserved:           big_endian::U64,
 }
 const _: () = assert!(size_of::<PagePrefix>() == 32);
 
@@ -73,10 +73,10 @@ pub(crate) struct PageHeader {
     pub(crate) prefix: PagePrefix,
 
     pub(crate) parent_id: big_endian::U64,
-    pub(crate) next_id: big_endian::U64,
+    pub(crate) next_id:   big_endian::U64,
 
-    pub(crate) upper_ptr: big_endian::U16,
-    pub(crate) lower_ptr: big_endian::U16,
+    pub(crate) upper_ptr:  big_endian::U16,
+    pub(crate) lower_ptr:  big_endian::U16,
     pub(crate) free_bytes: big_endian::U16,
     pub(crate) page_flags: big_endian::U16,
 
@@ -283,7 +283,7 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BasePage<Buf> {
 }
 
 pub(crate) struct SlottedPageIterator<'a, Buf: AsRef<[u8]>> {
-    page: &'a BasePage<Buf>,
+    page:       &'a BasePage<Buf>,
     slot_index: u16,
 }
 

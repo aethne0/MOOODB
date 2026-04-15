@@ -2,9 +2,11 @@
 //!
 //! Manages low level write/read-txs and also acts as a bump allocator
 
+use std::ops::AddAssign;
+
+use rustc_hash::FxHashMap;
 use zerocopy::IntoBytes;
 
-use super::frame::Dirty;
 use super::frame::FrameReadGuard;
 use super::frame::FrameWriteGuard;
 use super::frame::Writeable;
@@ -12,27 +14,29 @@ use super::pager::Pager;
 use super::pages::SuperblockHeader;
 use super::pages::SuperblockPage;
 use crate::storage::StorageError;
+use crate::storage::PAGE_SIZE_U16;
 use crate::sync::*;
 
 pub(crate) struct TxManager {
-    pager: Pager,
-    current: RwLock<SuperblockHeader>,
+    pager:      Pager,
+    current:    RwLock<SuperblockHeader>,
     write_lock: Mutex<()>,
 }
 
 #[derive(Clone, Copy)]
 struct Curr {
     superblock_page_id: u64,
-    next_page_id: u64,
-    tx_id: u64,
+    next_page_id:       u64,
+    tx_id:              u64,
 }
 
 impl TxManager {
     /// Initializes a new database - NOTE Destructive!
-    pub(crate) fn new(frame_count: usize, file: std::fs::File, page_size: u16) -> Self {
+    pub(crate) fn new(frame_count: usize, file: std::fs::File) -> Self {
         let superblock_page_id = 0;
         let tx_id = 0;
-        let next_page_id = 1;
+        // page 0&1 are reserved for superblocks
+        let next_page_id = 2;
 
         let pager = Pager::new(frame_count, file);
         // initialize our first superblock page - the frame will be set to dirty on drop
@@ -41,7 +45,7 @@ impl TxManager {
                 .get_page_new(superblock_page_id)
                 .expect("io error on superblock initialization")
                 .buffer(),
-            page_size,
+            PAGE_SIZE_U16,
             superblock_page_id,
             tx_id,
             next_page_id,
@@ -78,16 +82,27 @@ impl TxManager {
 
         log::debug!("write_tx opened with tx_id={}", new_header.tx_id);
 
-        WriteTxHandle { mgr: self, lock, superblock: new_header, dirtied: vec![] }
+        WriteTxHandle {
+            next_superblock_id: (new_header.page_id.get() + 1) % 2,
+            mgr: self,
+            lock,
+            superblock: new_header,
+            created_page_ids: FxHashMap::default(),
+        }
     }
 }
 
-pub(crate) trait PageReader {
-    fn get_page_read(&self, page_id: u64) -> Result<FrameReadGuard<'_>, StorageError>;
+pub(crate) trait PageReader<'tx> {
+    fn get_page_read(&self, page_id: u64) -> Result<FrameReadGuard<'tx>, StorageError>;
 }
 
-pub(crate) trait PageWriter {
-    fn get_page_alloc(&mut self) -> Result<FrameWriteGuard<'_, Writeable>, StorageError>;
+pub(crate) trait PageAlloc<'tx> {
+    fn get_page_alloc(
+        &mut self,
+    ) -> Result<(&mut FrameWriteGuard<'tx, Writeable>, u64), StorageError>;
+    fn get_page_write(
+        &mut self, page_id: u64,
+    ) -> Result<(&mut FrameWriteGuard<'tx, Writeable>, u64), StorageError>;
 }
 
 // --- Read handle ---
@@ -103,8 +118,8 @@ impl Drop for ReadTxHandle<'_> {
     }
 }
 
-impl PageReader for ReadTxHandle<'_> {
-    fn get_page_read(&self, page_id: u64) -> Result<FrameReadGuard<'_>, StorageError> {
+impl<'alloc> PageReader<'alloc> for ReadTxHandle<'alloc> {
+    fn get_page_read(&self, page_id: u64) -> Result<FrameReadGuard<'alloc>, StorageError> {
         self.mgr.pager.get_page_existing(page_id)
     }
 }
@@ -112,37 +127,59 @@ impl PageReader for ReadTxHandle<'_> {
 // --- Write handle ---
 
 pub(crate) struct WriteTxHandle<'tx> {
-    mgr: &'tx TxManager,
-    lock: MutexGuard<'tx, ()>,
     /// Holds this WriteTx's tx_id as well as its new assigned superblock_page_id
+    next_superblock_id:    u64,
+    created_page_ids:      FxHashMap<u64, FrameWriteGuard<'tx, Writeable>>,
+    mgr:                   &'tx TxManager,
+    lock:                  MutexGuard<'tx, ()>,
     pub(crate) superblock: SuperblockHeader,
-    dirtied: Vec<FrameWriteGuard<'tx, Dirty>>,
 }
 
-// TODO this needs to write superblock as well
-impl Drop for WriteTxHandle<'_> {
-    fn drop(&mut self) {
-        *self.mgr.current.write().unwrap() = self.superblock.clone_header();
-    }
-}
-
-// TODO to abort transaction dropping the transaction handle should be sufficient, as long as we
+// to abort transaction dropping the transaction handle should be sufficient, as long as we
 // only write-out pages at the end (keep track of touched pages and mark as dirty at commit)
 // actually if we write out pages early it doesnt really matter- they will be "unallocated" once we
 // roll back to our previous superblock header
 
-impl PageReader for WriteTxHandle<'_> {
-    fn get_page_read(&self, page_id: u64) -> Result<FrameReadGuard<'_>, StorageError> {
+impl<'tx> PageReader<'tx> for WriteTxHandle<'tx> {
+    fn get_page_read(&self, page_id: u64) -> Result<FrameReadGuard<'tx>, StorageError> {
         self.mgr.pager.get_page_existing(page_id)
     }
 }
 
-impl PageWriter for WriteTxHandle<'_> {
+impl<'tx> PageAlloc<'tx> for WriteTxHandle<'tx> {
     /// Bump allocates - also adds page to our dirty-page linked list
-    fn get_page_alloc(&mut self) -> Result<FrameWriteGuard<'_, Writeable>, StorageError> {
+    fn get_page_alloc(
+        &mut self,
+    ) -> Result<(&mut FrameWriteGuard<'tx, Writeable>, u64), StorageError> {
         let page_id = self.superblock.alloc_bump_next_id.get();
-        self.superblock.alloc_bump_next_id += 1;
-        self.mgr.pager.get_page_new(page_id)
+        self.superblock.alloc_bump_next_id.add_assign(1);
+        let frame = self.mgr.pager.get_page_new(page_id)?;
+        self.created_page_ids.insert(page_id, frame);
+        let frame_ref = self.created_page_ids.get_mut(&page_id).unwrap();
+        Ok((frame_ref, page_id))
+    }
+
+    /// should return a writeable new page, or a writeable copy of an existing page (depending on
+    /// page_id)
+    fn get_page_write(
+        &mut self, page_id: u64,
+    ) -> Result<(&mut FrameWriteGuard<'tx, Writeable>, u64), StorageError> {
+        // rust smh
+        if self.created_page_ids.contains_key(&page_id) {
+            // if we say `if let Some(xxx) = created_page_ids.get_mut() ...` then well
+            // be borrowing created_page_ids for the lifetime of the return, therefore if we
+            // dont find some well still be mut borrowing it and can't do the below stuff
+            //
+            // I think the only way around this is to implement our own HashMap
+            return Ok((self.created_page_ids.get_mut(&page_id).unwrap(), page_id));
+        }
+
+        let old_frame = self.get_page_read(page_id)?;
+        let (new_frame, new_page_id) = self.get_page_alloc()?;
+
+        new_frame.buffer().copy_from_slice(old_frame.buffer());
+
+        Ok((new_frame, new_page_id))
     }
 }
 
@@ -152,17 +189,16 @@ pub(crate) enum Durability {
     Sync,
 }
 
-impl WriteTxHandle<'_> {
-    pub(crate) fn commit(mut self, durability: Durability) -> Result<(), StorageError> {
+impl<'a> WriteTxHandle<'a> {
+    pub(crate) fn commit(self, durability: Durability) -> Result<(), StorageError> {
         if matches!(durability, Durability::Flush | Durability::Sync) {
             // we need to make a real page for our superblock, copy our header, then write
-            let mut superblock_frame =
-                self.mgr.pager.get_page_new(self.superblock.page_id.get())?;
+            let mut superblock_frame = self.mgr.pager.get_page_new(self.next_superblock_id)?;
             self.superblock.write_to_prefix(superblock_frame.buffer()).unwrap();
             self.mgr.pager.io_flush_and_resident(superblock_frame.commit())?;
 
-            for page in self.dirtied.drain(..) {
-                self.mgr.pager.io_flush_and_resident(page)?;
+            for page in self.created_page_ids.into_values() {
+                self.mgr.pager.io_flush_and_resident(page.commit())?;
             }
 
             if matches!(durability, Durability::Sync) {
@@ -170,8 +206,9 @@ impl WriteTxHandle<'_> {
             }
         }
 
-        // finally: swap our active superblock
-        std::mem::swap(&mut self.superblock, &mut *self.mgr.current.write().unwrap());
+        // finally: publish our new superblock. Drop will repeat this write, making it idempotent.
+        // (swap would leave the old header in self.superblock which Drop would then write back)
+        *self.mgr.current.write().unwrap() = self.superblock.clone_header();
         Ok(())
     }
 }

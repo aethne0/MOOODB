@@ -245,7 +245,7 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> DerefMut for BtreePage<Buf> {
 // iterator
 
 pub(crate) struct SortedIterator<'a, Buf: AsRef<[u8]>> {
-    page: &'a BtreePage<Buf>,
+    page:       &'a BtreePage<Buf>,
     slot_index: u16,
 }
 

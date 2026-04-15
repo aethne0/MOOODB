@@ -1,3 +1,25 @@
+//! monke.ca
+//! Copyright (c) 2026 yarn (high monke monk)
+//! Enjoy your programming, God willing.
+//!
+//! THE TERMS HAVE BEEN ORDAINED AS FOLLOWS:
+//!
+//! ANY OR ALL USE OF THE CONTAINED CODE COULD PUT YOU AND YOUR FAMILY IN DANGER
+//! THIS INCLUDES BUT IS CERTAINLY NOT LIMITED TO:
+//! - COSMIC DANGER
+//! - MORTAL DANGER
+//! - SPIRITUAL DANGER
+//! - LEGAL DANGER
+//! - DANGER OF A PREVIOUSLY UNKNOWN KIND
+//!
+//! • ▌ ▄ ·.                   ·▄▄▄▄  ▄▄▄▄·
+//! ·██ ▐███▪▪     ▪     ▪     ██▪ ██ ▐█ ▀█▪
+//! ▐█ ▌▐▌▐█· ▄█▀▄  ▄█▀▄  ▄█▀▄ ▐█· ▐█▌▐█▀▀█▄
+//! ██ ██▌▐█▌▐█▌.▐▌▐█▌.▐▌▐█▌.▐▌██. ██ ██▄▪▐█
+//! ▀▀  █▪▀▀▀ ▀█▄▀▪ ▀█▄▀▪ ▀█▄▀▪▀▀▀▀▀• ·▀▀▀▀
+//!
+//! **MOOODB** is a copy-on-write relational database management system.
+
 #![allow(dead_code)]
 #![warn(clippy::pedantic)]
 #![warn(clippy::perf)]
@@ -10,14 +32,6 @@
 #![allow(clippy::doc_markdown)]
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::struct_field_names)]
-
-//! • ▌ ▄ ·.                   ·▄▄▄▄  ▄▄▄▄·
-//! ·██ ▐███▪▪     ▪     ▪     ██▪ ██ ▐█ ▀█▪
-//! ▐█ ▌▐▌▐█· ▄█▀▄  ▄█▀▄  ▄█▀▄ ▐█· ▐█▌▐█▀▀█▄
-//! ██ ██▌▐█▌▐█▌.▐▌▐█▌.▐▌▐█▌.▐▌██. ██ ██▄▪▐█
-//! ▀▀  █▪▀▀▀ ▀█▄▀▪ ▀█▄▀▪ ▀█▄▀▪▀▀▀▀▀• ·▀▀▀▀
-//!
-//! **MOOODB** is a relational database management system
 
 pub(crate) mod storage;
 pub(crate) mod sync;

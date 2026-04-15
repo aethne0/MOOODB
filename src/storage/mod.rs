@@ -1,6 +1,7 @@
 #[cfg(test)]
 mod test;
 
+mod btree;
 mod frame;
 pub(crate) mod manager;
 mod pages;

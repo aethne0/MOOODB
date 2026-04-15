@@ -1,6 +1,7 @@
-use rustc_hash::FxHashMap;
 use std::fs::File;
 use std::os::unix::fs::FileExt;
+
+use rustc_hash::FxHashMap;
 use zerocopy::FromZeros;
 
 use super::frame::*;
@@ -11,12 +12,12 @@ use crate::storage::PAGE_SIZE;
 use crate::sync::*;
 
 pub(super) struct Pager {
-    file: File,
-    framer: FrameSlab,
+    file:          File,
+    framer:        FrameSlab,
     /// All shards' maps of `page_id` -> `frame_index`
-    shard_dirs: Box<[RwLock<FxHashMap<u64, usize>>]>,
+    shard_dirs:    Box<[RwLock<FxHashMap<u64, usize>>]>,
     eviction_hand: AtomicUsize,
-    poisoned: AtomicBool,
+    poisoned:      AtomicBool,
 }
 
 impl Pager {
@@ -72,8 +73,8 @@ impl Pager {
     // ---------------------------------------------------------------------------------------------
 
     /// Fetches existing page
-    /// **NOTE**: this will always give a frame in the ReadSuccessful state (in the event of an error
-    /// Err will be returned, but the frame will exist as ReadErrored)
+    /// **NOTE**: this will always give a frame in the ReadSuccessful state (in the event of an
+    /// error Err will be returned, but the frame will exist as ReadErrored)
     #[must_use = "RAII FrameGuard releases when dropped"]
     pub(super) fn get_page_existing(
         &self, target_page_id: u64,
@@ -303,9 +304,9 @@ impl Pager {
         }
     }
 
-    // --------------------------------------------------------------------------------------------
-    // *            IO                                                                            *
-    // --------------------------------------------------------------------------------------------
+    // ---------------------------------------------------------------------------------------------
+    // *            IO                                                                             *
+    // ---------------------------------------------------------------------------------------------
 
     fn io_read_into_frame<'a>(
         &self, mut frame_guard: FrameWriteGuard<'a, LoadPending>,

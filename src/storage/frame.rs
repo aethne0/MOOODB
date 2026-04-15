@@ -6,30 +6,30 @@
 use std::fmt::Debug;
 use std::marker::PhantomData;
 
-use super::slab::SlabBox;
-use super::StorageError;
 use super::PAGE_ID_NULL;
 use super::PAGE_SIZE;
+use super::StorageError;
+use super::slab::SlabBox;
 use crate::sync::*;
 
 #[repr(align(64))]
 pub(crate) struct Frame {
-    pub(crate) index: usize,
+    pub(crate) index:        usize,
     pub(crate) page_id_hint: AtomicU64,
-    pub(crate) inner: RwLock<FrameInner>,
-    pub(crate) usage: AtomicU32,
-    pub(crate) pins: AtomicU16,
+    pub(crate) inner:        RwLock<FrameInner>,
+    pub(crate) usage:        AtomicU32,
+    pub(crate) pins:         AtomicU16,
 }
 
 impl Frame {
     #[cfg_attr(not(loom), allow(clippy::missing_const_for_fn))]
     pub(crate) fn new(frame_index: usize) -> Self {
         Self {
-            index: frame_index,
+            index:        frame_index,
             page_id_hint: AtomicU64::new(PAGE_ID_NULL),
-            usage: AtomicU32::new(0),
-            pins: AtomicU16::new(0),
-            inner: RwLock::new(FrameInner { state: State::Uninitialized }),
+            usage:        AtomicU32::new(0),
+            pins:         AtomicU16::new(0),
+            inner:        RwLock::new(FrameInner { state: State::Uninitialized }),
         }
     }
 }
@@ -66,7 +66,7 @@ impl Debug for FrameInner {
 }
 
 struct PinDropper<'a> {
-    slab: &'a FrameSlab,
+    slab:  &'a FrameSlab,
     index: usize,
 }
 
@@ -102,8 +102,8 @@ impl WriteGuardState for Dirty {}
 pub(crate) struct FrameReadGuard<'a> {
     pub(crate) index: usize,
 
-    inner: RwLockReadGuard<'a, FrameInner>,
-    buffer: &'a [u8; PAGE_SIZE],
+    inner:       RwLockReadGuard<'a, FrameInner>,
+    buffer:      &'a [u8; PAGE_SIZE],
     pin_dropper: Option<PinDropper<'a>>,
 }
 
@@ -123,23 +123,23 @@ pub(crate) struct FrameWriteGuard<'a, State>
 where
     State: WriteGuardState,
 {
-    _phantom: PhantomData<State>,
+    _phantom:         PhantomData<State>,
     pub(crate) index: usize,
 
-    inner: RwLockWriteGuard<'a, FrameInner>,
-    slab: &'a FrameSlab,
-    buffer: &'a mut [u8; PAGE_SIZE],
-    pin_dropper: Option<PinDropper<'a>>,
+    pub(crate) inner: RwLockWriteGuard<'a, FrameInner>,
+    slab:             &'a FrameSlab,
+    buffer:           &'a mut [u8; PAGE_SIZE],
+    pin_dropper:      Option<PinDropper<'a>>,
 }
 
 impl<'a, Old: WriteGuardState> FrameWriteGuard<'a, Old> {
     fn transition<New: WriteGuardState>(mut self) -> FrameWriteGuard<'a, New> {
         FrameWriteGuard {
-            _phantom: PhantomData,
-            index: self.index,
-            slab: self.slab,
-            inner: self.inner,
-            buffer: self.buffer,
+            _phantom:    PhantomData,
+            index:       self.index,
+            slab:        self.slab,
+            inner:       self.inner,
+            buffer:      self.buffer,
             pin_dropper: self.pin_dropper.take(),
         }
     }
@@ -190,6 +190,10 @@ impl<'a> FrameWriteGuard<'a, Writeable> {
     }
 
     pub(crate) fn buffer<'b>(&'b mut self) -> &'b mut [u8; PAGE_SIZE] {
+        self.buffer
+    }
+
+    pub(crate) fn buffer_ref<'b>(&'b self) -> &'b [u8; PAGE_SIZE] {
         self.buffer
     }
 }
@@ -318,7 +322,7 @@ impl<'a> FrameWriteGuard<'a, Dirty> {
 /// The slot size is rounded up to the nearest 64-byte boundary so that every frame header
 /// remains 64-byte aligned.
 pub(super) struct FrameSlab {
-    frames: Box<[Frame]>,
+    frames:    Box<[Frame]>,
     page_slab: SlabBox,
 }
 

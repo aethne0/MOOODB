@@ -1,8 +1,8 @@
 /// Platform specific memory allocation for the page-buffer
 /// Eventually ill make this work for non-linux (maybe)
 pub(super) struct SlabBox {
-    ptr: *mut [u8],         // fat slice pointer — carries the length for Deref
-    raw: *mut libc::c_void, // thin base pointer for munmap
+    ptr:  *mut [u8],         // fat slice pointer — carries the length for Deref
+    raw:  *mut libc::c_void, // thin base pointer for munmap
     size: usize,
 }
 

@@ -48,6 +48,6 @@ impl From<&[u8]> for U64Entry {
 )]
 #[repr(C)]
 pub(crate) struct FreeEntry {
-    tx_id: big_endian::U64,
+    tx_id:   big_endian::U64,
     page_id: big_endian::U64,
 }
