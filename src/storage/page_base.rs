@@ -3,16 +3,68 @@ use std::ops::RangeBounds;
 
 use zerocopy::big_endian;
 
-use crate::storage::PAGE_SIZE;
+use super::PAGE_SIZE;
 
 // we have some placeholder IDs to mean different things
 // These will start at u64::MAX and count down
 // its impossible for us to get to these page-ids anyway, due to
 // 1. 48/57 bit virtual-addresing
 // 2. some number of our bits are taken up by the page size (12 bits lost for 4kib pages)
-pub(crate) const PAGE_ID_NULL: u64 = u64::MAX;
-pub(crate) const SLOT_SIZE: u16 = 2 * size_of::<u16>() as u16;
-pub(crate) const PAGE_HEADER_SIZE: u16 = 0x40;
+pub(super) const PAGE_ID_NULL: u64 = u64::MAX;
+pub(super) const SLOT_SIZE: u16 = 2 * size_of::<u16>() as u16;
+pub(super) const PAGE_HEADER_SIZE: u16 = 0x40;
+
+// --- IdEntry ---
+
+#[derive(
+    Debug,
+    Clone,
+    Copy,
+    PartialEq,
+    Eq,
+    PartialOrd,
+    Ord,
+    zerocopy::FromBytes,
+    zerocopy::IntoBytes,
+    zerocopy::Immutable,
+    zerocopy::KnownLayout,
+)]
+pub(super) struct U64Entry(big_endian::U64);
+impl U64Entry {
+    pub(super) const SIZE_U16: u16 = size_of::<Self>() as u16;
+
+    pub(super) const fn get(&self) -> u64 {
+        self.0.get()
+    }
+
+    pub(super) fn as_bytes(&self) -> &[u8] {
+        zerocopy::IntoBytes::as_bytes(self)
+    }
+}
+
+impl From<u64> for U64Entry {
+    fn from(v: u64) -> Self {
+        Self(v.into())
+    }
+}
+
+impl From<&[u8]> for U64Entry {
+    fn from(value: &[u8]) -> Self {
+        zerocopy::FromBytes::read_from_bytes(&value[..size_of::<Self>()])
+            .expect("couldnt deserialize U64Entry")
+    }
+}
+
+// --- Free-page Entry ---
+
+#[derive(
+    Clone, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout,
+)]
+#[repr(C)]
+pub(super) struct FreeEntry {
+    tx_id:   big_endian::U64,
+    page_id: big_endian::U64,
+}
 
 /// The first 32 bytes of **every** page on disk, regardless of page type.
 ///
@@ -22,26 +74,37 @@ pub(crate) const PAGE_HEADER_SIZE: u16 = 0x40;
 ///
 /// Layout (all big-endian):
 /// ```text
-/// offset  0 │ checksum   u64
-/// offset  8 │ page_id    u64
-/// offset 16 │ tx_id      u64
-/// offset 24 │ <reserved> u64
+/// offset  0 | checksum   u64
+/// offset  8 | page_id    u64
+/// offset 16 | tx_id      u64
+/// offset 24 | <reserved> u64
 /// ```
 #[derive(
     Clone, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout,
 )]
 #[repr(C)]
-pub(crate) struct PagePrefix {
-    pub(crate) checksum: big_endian::U64,
-    pub(crate) page_id:  big_endian::U64,
-    pub(crate) tx_id:    big_endian::U64,
-    _reserved:           big_endian::U64,
+pub(super) struct PagePrefix {
+    pub(super) checksum: big_endian::U64,
+    pub(super) page_id:  big_endian::U64,
+    pub(super) tx_id:    big_endian::U64,
+    pub(super) pad:      [u8; 8],
 }
 const _: () = assert!(size_of::<PagePrefix>() == 32);
 
+impl PagePrefix {
+    pub(super) fn new(page_id: u64, checksum: u64, tx_id: u64) -> Self {
+        Self {
+            checksum: checksum.into(),
+            page_id:  page_id.into(),
+            tx_id:    tx_id.into(),
+            pad:      *b"MOOODB!!",
+        }
+    }
+}
+
 /// Converts a range whose bounds implement `Into<usize>` into a plain `(Bound<usize>, Bound<usize>)`,
 /// making it usable as a slice index on `[u8]` buffers.
-pub(crate) trait RangeExt<T> {
+pub(super) trait RangeExt<T> {
     fn into_usizes(self) -> (Bound<usize>, Bound<usize>);
 }
 
@@ -69,16 +132,16 @@ where
 
 #[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
 #[repr(C)]
-pub(crate) struct PageHeader {
-    pub(crate) prefix: PagePrefix,
+pub(super) struct PageHeader {
+    pub(super) prefix: PagePrefix,
 
-    pub(crate) parent_id: big_endian::U64,
-    pub(crate) next_id:   big_endian::U64,
+    pub(super) parent_id: big_endian::U64,
+    pub(super) next_id:   big_endian::U64,
 
-    pub(crate) upper_ptr:  big_endian::U16,
-    pub(crate) lower_ptr:  big_endian::U16,
-    pub(crate) free_bytes: big_endian::U16,
-    pub(crate) page_flags: big_endian::U16,
+    pub(super) upper_ptr:  big_endian::U16,
+    pub(super) lower_ptr:  big_endian::U16,
+    pub(super) free_bytes: big_endian::U16,
+    pub(super) page_flags: big_endian::U16,
 
     _pad: [u8; 8],
 }
@@ -97,20 +160,20 @@ impl std::ops::DerefMut for PageHeader {
 }
 
 /// Base slotted-page layout shared by all page types.
-pub(crate) struct BasePage<Buf> {
-    pub(crate) raw: Buf,
+pub(super) struct BasePage<Buf> {
+    pub(super) raw: Buf,
 }
 
 // constructors
 
 impl<'buf> BasePage<&'buf mut [u8; PAGE_SIZE]> {
-    pub(crate) const fn from_buffer(buffer: &'buf mut [u8; PAGE_SIZE]) -> Self {
+    pub(super) const fn from_buffer(buffer: &'buf mut [u8; PAGE_SIZE]) -> Self {
         Self { raw: buffer }
     }
 }
 
 impl<'b> BasePage<&'b [u8; PAGE_SIZE]> {
-    pub(crate) const fn from_buffer_ref(buffer: &'b [u8; PAGE_SIZE]) -> Self {
+    pub(super) const fn from_buffer_ref(buffer: &'b [u8; PAGE_SIZE]) -> Self {
         Self { raw: buffer }
     }
 }
@@ -135,7 +198,7 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> std::ops::DerefMut for BasePage<Buf> {
 // read impl
 
 impl<Buf: AsRef<[u8]>> BasePage<Buf> {
-    pub(crate) fn raw(&self) -> &[u8] {
+    pub(super) fn raw(&self) -> &[u8] {
         self.raw.as_ref()
     }
 
@@ -143,21 +206,17 @@ impl<Buf: AsRef<[u8]>> BasePage<Buf> {
         (self.raw().len() - 1).try_into().unwrap()
     }
 
-    pub(crate) fn free_bytes_contig(&self) -> u16 {
+    pub(super) fn free_bytes_contig(&self) -> u16 {
         1 + self.lower_ptr.get() - self.upper_ptr.get()
     }
 
-    pub(crate) fn free_bytes(&self) -> u16 {
+    pub(super) fn free_bytes(&self) -> u16 {
         self.free_bytes.get()
     }
 
-    pub(crate) fn len(&self) -> u16 {
+    pub(super) fn len(&self) -> u16 {
         assert!(self.upper_ptr.get() >= PAGE_HEADER_SIZE);
         (self.upper_ptr.get() - PAGE_HEADER_SIZE) / SLOT_SIZE
-    }
-
-    pub(crate) fn right(&self) -> u64 {
-        self.next_id.get()
     }
 
     fn read_u16(&self, offset: u16) -> u16 {
@@ -166,14 +225,14 @@ impl<Buf: AsRef<[u8]>> BasePage<Buf> {
         u16::from_be_bytes([buf[idx], buf[idx + 1]])
     }
 
-    pub(crate) fn offset_len_from_slot(&self, slot_index: u16) -> (u16, u16) {
+    pub(super) fn offset_len_from_slot(&self, slot_index: u16) -> (u16, u16) {
         (
             self.read_u16(PAGE_HEADER_SIZE + slot_index * SLOT_SIZE),
             self.read_u16(size_of::<u16>() as u16 + PAGE_HEADER_SIZE + slot_index * SLOT_SIZE),
         )
     }
 
-    pub(crate) fn has_space_entry(&self, entry_len: u16) -> bool {
+    pub(super) fn has_space_entry(&self, entry_len: u16) -> bool {
         assert!(entry_len + SLOT_SIZE < u16::MAX);
         entry_len + SLOT_SIZE <= self.free_bytes.get()
     }
@@ -191,12 +250,12 @@ impl<Buf: AsRef<[u8]>> BasePage<Buf> {
     }
 
     /// Returns an iterator over `(slot_index, value)` pairs in slot order.
-    pub(crate) const fn iter(&self) -> SlottedPageIterator<'_, Buf> {
+    pub(super) const fn iter(&self) -> SlottedPageIterator<'_, Buf> {
         SlottedPageIterator::new(self)
     }
 
     /// Returns the value at `slot_index`, or `None` if the index is out of bounds.
-    pub(crate) fn get_at_slot(&self, slot_index: u16) -> Option<&[u8]> {
+    pub(super) fn get_at_slot(&self, slot_index: u16) -> Option<&[u8]> {
         if slot_index >= self.len() {
             return None;
         }
@@ -207,15 +266,11 @@ impl<Buf: AsRef<[u8]>> BasePage<Buf> {
 // write impl
 
 impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BasePage<Buf> {
-    pub(crate) fn set_right(&mut self, val: u64) {
-        self.next_id = val.into();
-    }
-
-    pub(crate) fn raw_mut(&mut self) -> &mut [u8] {
+    pub(super) fn raw_mut(&mut self) -> &mut [u8] {
         self.raw.as_mut()
     }
 
-    pub(crate) fn write_slot(&mut self, slot_index: u16, offset: u16, len: u16) {
+    pub(super) fn write_slot(&mut self, slot_index: u16, offset: u16, len: u16) {
         let slot_offset = PAGE_HEADER_SIZE + slot_index * SLOT_SIZE;
         self.write_u16(slot_offset, offset);
         self.write_u16(slot_offset + size_of::<u16>() as u16, len);
@@ -227,21 +282,21 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BasePage<Buf> {
         buf[idx..idx + 2].copy_from_slice(&val.to_be_bytes());
     }
 
-    pub(crate) fn initialize_header(&mut self, page_id: u64, parent: u64, right: u64) {
+    pub(super) fn initialize_header(&mut self, page_id: u64, parent: u64, right: u64) {
         self.page_id = page_id.into();
         self.parent_id = parent.into();
         self.next_id = right.into();
         self.clear_entries();
     }
 
-    pub(crate) fn clear_entries(&mut self) {
+    pub(super) fn clear_entries(&mut self) {
         self.upper_ptr = (PAGE_HEADER_SIZE).into();
         self.lower_ptr = self.end_of_page().into();
         let free_contig = 1 + self.lower_ptr.get() - self.upper_ptr.get();
         self.free_bytes = free_contig.into();
     }
 
-    pub(crate) fn prepare_insert(&mut self, slot_index: u16, entry_len: u16) -> Option<u16> {
+    pub(super) fn prepare_insert(&mut self, slot_index: u16, entry_len: u16) -> Option<u16> {
         if !self.has_space_entry(entry_len) {
             return None;
         }
@@ -266,7 +321,7 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BasePage<Buf> {
 
     /// Removes the entry at `slot_index`, shifting subsequent slots left.
     /// Does nothing if `slot_index` is out of bounds.
-    pub(crate) fn delete_slot_entry(&mut self, slot_index: u16) {
+    pub(super) fn delete_slot_entry(&mut self, slot_index: u16) {
         assert!(slot_index < self.len());
         // offset is unused because we dont touch the actual data (compaction takes care of this)
         let (_offset, len) = self.offset_len_from_slot(slot_index);
@@ -282,14 +337,14 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BasePage<Buf> {
     }
 }
 
-pub(crate) struct SlottedPageIterator<'a, Buf: AsRef<[u8]>> {
+pub(super) struct SlottedPageIterator<'a, Buf: AsRef<[u8]>> {
     page:       &'a BasePage<Buf>,
     slot_index: u16,
 }
 
 impl<'a, Buf: AsRef<[u8]>> SlottedPageIterator<'a, Buf> {
     #[must_use]
-    pub(crate) const fn new(page: &'a BasePage<Buf>) -> Self {
+    pub(super) const fn new(page: &'a BasePage<Buf>) -> Self {
         Self { page, slot_index: 0 }
     }
 }

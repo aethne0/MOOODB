@@ -19,4 +19,4 @@ imports_granularity = "Item"
 
 # this doesnt seem to work but a guy can dream
 struct_field_align_threshold = 20
-use_field_init_shorthand = true
+use_field_init_shorthand = false

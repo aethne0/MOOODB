@@ -1,291 +1,195 @@
+use std::cell::RefCell;
+use std::cell::UnsafeCell;
+use std::collections::HashMap;
 use std::fs::File;
+use std::mem::offset_of;
+use std::ops::AddAssign;
 use std::os::unix::fs::FileExt;
 
-use rustc_hash::FxHashMap;
+use xxhash_rust::xxh3;
+use zerocopy::FromBytes;
 use zerocopy::FromZeros;
+use zerocopy::IntoBytes;
 
-use super::frame::*;
-use super::pages::checksum;
-use super::StorageError;
 use super::PAGE_ID_NULL;
-use crate::storage::PAGE_SIZE;
+use super::PAGE_SIZE;
+use super::page_base::PagePrefix;
+use super::page_superblock::SuperblockHeader;
+use crate::mooo_assert;
 use crate::sync::*;
 
+//  ▄▄▄· ▄▄▄·  ▄▄ • ▄▄▄ .    ▄▄▄▄· ▄• ▄▌·▄▄▄·▄▄▄▄▄▄ .▄▄▄
+// ▐█ ▄█▐█ ▀█ ▐█ ▀ ▪▀▄.▀·    ▐█ ▀█▪█▪██▌▐▄▄·▐▄▄·▀▄.▀·▀▄ █·
+//  ██▀·▄█▀▀█ ▄█ ▀█▄▐▀▀▪▄    ▐█▀▀█▄█▌▐█▌██▪ ██▪ ▐▀▀▪▄▐▀▀▄
+// ▐█▪·•▐█ ▪▐▌▐█▄▪▐█▐█▄▄▌    ██▄▪▐█▐█▄█▌██▌.██▌.▐█▄▄▌▐█•█▌
+// .▀    ▀  ▀ ·▀▀▀▀  ▀▀▀     ·▀▀▀▀  ▀▀▀ ▀▀▀ ▀▀▀  ▀▀▀ .▀  ▀
+
+#[repr(align(4096))]
+struct FrameBuffer(UnsafeCell<[u8; PAGE_SIZE]>);
+const SHARD_CNT: usize = 256;
+const FIRST_TX_ID: u64 = 1;
+
 pub(super) struct Pager {
-    file:          File,
-    framer:        FrameSlab,
-    /// All shards' maps of `page_id` -> `frame_index`
-    shard_dirs:    Box<[RwLock<FxHashMap<u64, usize>>]>,
+    file: File,
+
+    frames: Box<[FrameHeader]>,
+    pages:  Box<[FrameBuffer]>,
+
+    // these are Mutexs instead of RwLocks because we often have to take a read-lock, then drop it,
+    // then try to take a writelock, then double check - because of sharding it is probably faster
+    // to just have it be a mutex
+    shard_dirs: Box<[Mutex<HashMap<u64, usize>>]>,
+
     eviction_hand: AtomicUsize,
-    poisoned:      AtomicBool,
+
+    tx_id: AtomicU64,
+
+    current:    RwLock<SuperblockHeader>,
+    write_lock: Mutex<()>,
 }
 
+unsafe impl Sync for Pager {}
+
 impl Pager {
-    // ---------------------------------------------------------------------------------------------
-    // *            CONSTRUCTOR                                                                    *
-    // ---------------------------------------------------------------------------------------------
+    pub(super) fn new(count: usize, file: File) -> Self {
+        let temp_header = SuperblockHeader::new_zeroed();
 
-    pub(super) fn new(frame_count: usize, file: File) -> Self {
-        assert!(frame_count > 0);
-        let framer = FrameSlab::new(frame_count);
+        let pgr = Self {
+            file:          file,
+            frames:        (0..count).map(|i| FrameHeader::new(i)).collect(),
+            pages:         (0..count).map(|_| FrameBuffer::zeros()).collect(),
+            shard_dirs:    (0..SHARD_CNT).map(|_| Mutex::new(HashMap::default())).collect(),
+            eviction_hand: 0.into(),
+            tx_id:         FIRST_TX_ID.into(),
+            write_lock:    Mutex::new(()),
+            current:       RwLock::new(temp_header),
+        };
 
-        let shard_dirs = (0..Self::SHARD_CNT)
-            .map(|_| {
-                let mut map = FxHashMap::default();
-                map.reserve(frame_count / Self::SHARD_CNT);
-                RwLock::new(map)
-            })
-            .collect::<Vec<_>>()
-            .into_boxed_slice();
+        let superblock_page_id = 0;
+        // page 0&1 are reserved for superblocks
+        let next_page_id = 2;
 
-        Self {
-            file,
-            framer,
-            shard_dirs,
-            eviction_hand: AtomicUsize::new(0),
-            poisoned: false.into(),
+        let mut w_hdl = pgr
+            .get_page_write(superblock_page_id, false)
+            .expect("io error on superblock initialization");
+
+        let superblock_header = SuperblockHeader {
+            prefix:             PagePrefix::new(superblock_page_id, 0, FIRST_TX_ID),
+            version:            1.into(),
+            page_size:          (PAGE_SIZE as u16).into(),
+            catalog_head_id:    PAGE_ID_NULL.into(),
+            alloc_free_head_id: PAGE_ID_NULL.into(),
+            alloc_bump_next_id: next_page_id.into(),
+            _pad:               [0; 62],
+        };
+
+        copy_superblock_to_page(w_hdl.buf, &superblock_header);
+        pgr.io_write(&mut w_hdl, FIRST_TX_ID).expect("couldnt initialize superblock to disk");
+        drop(w_hdl);
+
+        pgr.current.write().unwrap().clone_from(&superblock_header);
+        pgr
+    }
+
+    // ------------ frame --------------------------------------------------------------------------
+
+    fn try_pin_write(&self, index: usize) -> Option<WrHdl<'_>> {
+        let frame = &self.frames[index];
+        match frame.pins.compare_exchange(0, -1, Ordering::AcqRel, Ordering::Acquire) {
+            Ok(_) => Some(unsafe {
+                WrHdl::from_pager_index(self, index, self.tx_id.load(Ordering::Relaxed))
+            }),
+            Err(_) => None,
         }
     }
 
-    // ---------------------------------------------------------------------------------------------
-    // *            UTIL                                                                           *
-    // ---------------------------------------------------------------------------------------------
-
-    const SHARD_CNT: usize = 64;
-
-    const fn shard_hash(mut page_id: u64) -> usize {
-        page_id ^= page_id >> 33;
-        page_id = page_id.wrapping_mul(0xff51_afd7_ed55_8ccd);
-        page_id ^= page_id >> 33;
-        (page_id as usize) & (Self::SHARD_CNT - 1)
-    }
-
-    fn check_poisoned(&self) -> Result<(), StorageError> {
-        if self.poisoned.load(Ordering::Acquire) {
-            Err(StorageError::Poisoned)
-        } else {
-            Ok(())
-        }
-    }
-
-    // ---------------------------------------------------------------------------------------------
-    // *            PAGING                                                                         *
-    // ---------------------------------------------------------------------------------------------
-
-    /// Fetches existing page
-    /// **NOTE**: this will always give a frame in the ReadSuccessful state (in the event of an
-    /// error Err will be returned, but the frame will exist as ReadErrored)
-    #[must_use = "RAII FrameGuard releases when dropped"]
-    pub(super) fn get_page_existing(
-        &self, target_page_id: u64,
-    ) -> Result<FrameReadGuard<'_>, StorageError> {
-        let shard_idx = Self::shard_hash(target_page_id);
-
-        // if its already paged in
-        let dir_guard = self.shard_dirs[shard_idx].read().unwrap();
-
-        if let Some(&frame_idx) = dir_guard.get(&target_page_id) {
-            if let Ok(guard) = self.framer.pin_read(frame_idx) {
-                return Ok(guard);
-            }
-        }
-        drop(dir_guard);
-
-        // **IO path**: we need to page it in and load it
-        // ----------------------------------------------
-
-        // this puts it in the dir right away, which is useful because other threads can see we
-        // already have inflight io
-        let frame_guard = self.get_free_frame()?;
-        let mut dir_guard = self.shard_dirs[shard_idx].write().unwrap();
-
-        // we now need to make entry for this page in directory
-        //
-        // check if another thread beat us to populating this page_id in the dir
-        // well abandon our frame and use theirs instead
-        if let Some(&found_frame_idx) = dir_guard.get(&target_page_id) {
-            // we need to set our frame to uninit, to make sure another frame doesnt later choose it
-            // for eviction, see its page_id, then remove that page_id from the dir (the page_id is
-            // the same as the actual frame that were going to take!)
-            frame_guard.abandon();
-
-            // in this case we could retry ourselves, but for now we will just return the error TODO
-            return self.framer.pin_read(found_frame_idx);
-        }
-
-        // set to pending, insert into dir
-        let frame_guard = frame_guard.mark_load_pending(target_page_id);
-
-        // eprintln!("t{}: inserting exist {}...", thread_id(), target_page_id);
-        dir_guard.insert(target_page_id, frame_guard.index);
-        self.framer[frame_guard.index].page_id_hint.store(target_page_id, Ordering::Release);
-        drop(dir_guard);
-
-        // fetch data
-        let frame_idx = frame_guard.index;
-        let res = self.io_read_into_frame(frame_guard);
-
-        match res {
-            Ok(frame_guard) => Ok(frame_guard),
-            Err(err) => {
-                // Remove from dir and clear hint before releasing the frame
-                {
-                    let mut dir_guard = self.shard_dirs[shard_idx].write().unwrap();
-                    dir_guard.remove(&target_page_id);
-                    self.framer[frame_idx].page_id_hint.store(PAGE_ID_NULL, Ordering::Release);
-                }
-                Err(err)
-            }
-        }
-    }
-
-    /// This has some optimizations that rely on the assumption that we will under no circumstances
-    /// find the page_id already resident in the pager. This method is **NOT** correct if this is
-    /// the case. ASSERTS page_id will not be found in pager
-    /// Gives an empty frame with a new page. Its `page_id`, `dirty` flag and `io_err` will be
-    /// reset. The page will be zeroed.
-    #[must_use = "RAII FrameGuard releases when dropped"]
-    pub(super) fn get_page_new(
-        &self, target_page_id: u64,
-    ) -> Result<FrameWriteGuard<'_, Writeable>, StorageError> {
-        let mut frame_guard = self.get_free_frame()?;
-
-        // initialize frame
-        frame_guard.buffer().zero();
-        let frame_guard = frame_guard.mark_writeable(target_page_id);
-
-        // put it into the dir
-        let mut dir_guard = self.shard_dirs[Self::shard_hash(target_page_id)].write().unwrap();
-
-        let prev = dir_guard.insert(target_page_id, frame_guard.index);
-        assert!(
-            prev.is_none(),
-            "page was already in directory - by calling get_page_new you are asserting that \
-            we will not find this page_id in the pager, even AFTER we call get_free_frame"
+    fn pin_write(&self, index: usize) -> WrHdl<'_> {
+        let frame = &self.frames[index];
+        let cas_res = frame.pins.compare_exchange(0, -1, Ordering::AcqRel, Ordering::Acquire);
+        mooo_assert!(
+            cas_res.is_ok(),
+            "pin_write should be uncontested (frame_index: {}, cas was: {})",
+            index,
+            cas_res.unwrap_err()
         );
-
-        // set hint
-        self.framer[frame_guard.index].page_id_hint.store(target_page_id, Ordering::Release);
-        Ok(frame_guard)
+        unsafe { WrHdl::from_pager_index(self, index, self.tx_id.load(Ordering::Relaxed)) }
     }
 
-    /// Gets, pins, and writelocks and unused frame. Maybe evicts a frame
-    /// **NOTE**: it may contain dirty data, and its fields will not be initialized correctly
-    /// (page_id, dirty, is_err)**
-    // **NOTE**: this will always give a frame in the Uninitialized state
-    #[must_use = "RAII FrameGuard releases when dropped"]
-    fn get_free_frame(&self) -> Result<FrameWriteGuard<'_, Uninit>, StorageError> {
-        self.check_poisoned()?;
-        loop {
-            let frame = &self.framer[self.scan_for_eviction_candidate()];
-            let hinted_page_id = frame.page_id_hint.load(Ordering::Acquire);
+    fn try_pin_read(&self, index: usize, expected_page_id: u64) -> Option<RdHdl<'_>> {
+        let frame = &self.frames[index];
 
-            let dir_guard_opt = match hinted_page_id {
-                PAGE_ID_NULL => None,
-                _ => Some(self.shard_dirs[Self::shard_hash(hinted_page_id)].write().unwrap()),
-            };
-
-            match self.framer.pin_write(frame.index) {
-                PinWrite::CasFail => {
-                    continue;
-                }
-                // we got an uninit frame - this should not be in our directory
-                // we can simply hand it out
-                PinWrite::Uninit(frame_guard) => {
-                    return Ok(frame_guard);
-                }
-
-                // in both the Dirty and Resident case, if we are holding the wrong shard lock we
-                // are just going to start over, because wed have to drop it and reacquire it, and
-                // to prevent deadlocks we don't want to take locks in the dir -> frame order.
-                // Note: the page_id != hinted_page_id check is CORRECT even if we read "NULL" as
-                // the hint - because the frame is probably only NOW in a dir if it only NOW has a
-                // page_id
-                //
-                PinWrite::ResidentDirty(frame_guard) => {
-                    // we got a dirty frame - we have to write it out
-                    match dir_guard_opt {
-                        None => {
-                            // Assumption: If we read pageahint:null but this frame is resident,
-                            // someone put it into the dir SINCE we read the hint.
-                            // -> retry
-                            frame_guard.abandon();
-                            continue;
-                        }
-                        Some(mut dir_guard) => {
-                            let page_id = frame_guard.page_id();
-                            if Self::shard_hash(page_id) != Self::shard_hash(hinted_page_id) {
-                                // we are not holding the right dir
-                                // -> retry
-                                frame_guard.abandon();
-                                continue;
-                            }
-
-                            // we can remove it from the dir now, then do our write-out. We hold a
-                            // exclusive anyway.
-                            // eprintln!("t{}: evicting dirty {}...", thread_id(), page_id);
-                            dir_guard.remove(&page_id).expect(
-                                "Either we checked wrong shard \
-                                or someone didn't put frame into dir?",
-                            );
-
-                            let frame_guard = self.io_flush_and_reinit(frame_guard)?;
-                            frame.page_id_hint.store(PAGE_ID_NULL, Ordering::Release);
-                            return Ok(frame_guard);
-                        }
-                    }
-                }
-
-                PinWrite::ResidentReadable(frame_guard) => {
-                    match dir_guard_opt {
-                        None => {
-                            // Assumption: If we read pageahint:null but this frame is resident,
-                            // someone put it into the dir SINCE we read the hint.
-                            // -> retry
-                            frame_guard.abandon();
-                            continue;
-                        }
-                        Some(mut dir_guard) => {
-                            let page_id = frame_guard.page_id();
-                            if Self::shard_hash(page_id) != Self::shard_hash(hinted_page_id) {
-                                // we are not holding the right dir
-                                // -> retry
-                                frame_guard.abandon();
-                                continue;
-                            }
-
-                            // otherwise just remove it from the dir and hand out the frame
-                            dir_guard.remove(&page_id).expect(
-                                "Either we checked wrong shard \
-                                or someone didn't put frame into dir?",
-                            );
-
-                            frame.page_id_hint.store(PAGE_ID_NULL, Ordering::Release);
-                            return Ok(frame_guard.mark_evicted());
-                        }
-                    }
-                }
-            }
+        if *frame.loading.read().unwrap() != expected_page_id {
+            // This was evicted between the time we got it from the dir and the time we got a
+            // read-lock - caller will have to retry
+            return None;
         }
+
+        frame
+            .pins
+            .try_update(Ordering::Release, Ordering::Acquire, |prev| {
+                if prev >= 0 {
+                    Some(prev + 1)
+                } else {
+                    // Someone has a write lock on this frame
+                    None
+                }
+            })
+            .map(|_| unsafe { RdHdl::from_pager_index(self, index) })
+            .ok()
     }
 
-    /// Scans for an eviction candidate (frame with 0 pins and 0 usage). This will spin until one is
-    /// found. It is imperative that the caller re-check these conditions once a lock on the shard
-    /// directory has been acquired, so we dont TOCTOU.
+    fn pin_downgrade(&self, w_hdl: WrHdl<'_>) -> RdHdl<'_> {
+        let index = w_hdl.frame.index;
+        std::mem::forget(w_hdl);
+
+        let frame = &self.frames[index];
+        let cas_res = frame.pins.compare_exchange(-1, 1, Ordering::AcqRel, Ordering::Acquire);
+
+        mooo_assert!(cas_res.is_ok(), "pin_downgrade should be uncontested");
+        unsafe { RdHdl::from_pager_index(self, index) }
+    }
+
+    // ------------ io -----------------------------------------------------------------------------
+
+    fn io_write(&self, w_hdl: &mut WrHdl<'_>, tx_id: u64) -> Result<(), PagerErr> {
+        mooo_assert!(w_hdl.get_page_id() != PAGE_ID_NULL);
+
+        let page_id = w_hdl.get_page_id();
+        let checksum = xxh3::xxh3_64(&w_hdl.buf[offset_of!(PagePrefix, page_id)..]);
+        let header = PagePrefix::mut_from_prefix(w_hdl.buf).unwrap().0;
+        header.checksum.set(checksum);
+        header.page_id.set(page_id);
+        header.tx_id.set(tx_id);
+
+        self.file
+            .write_at(w_hdl.buf, w_hdl.get_page_id() * PAGE_SIZE as u64)
+            .map(|_| {})
+            .map_err(|e| PagerErr::Io(e.kind()))
+    }
+
+    fn io_read(&self, w_hdl: &mut WrHdl<'_>) -> Result<(), PagerErr> {
+        let page_id = w_hdl.get_page_id();
+        mooo_assert!(page_id != PAGE_ID_NULL);
+        self.file
+            .read_exact_at(w_hdl.buf, page_id * PAGE_SIZE as u64)
+            .map_err(|e| PagerErr::Io(e.kind()))
+    }
+
+    // ------------ pages --------------------------------------------------------------------------
+
     fn scan_for_eviction_candidate(&self) -> usize {
         let mut checked_count = 0; // for spin hint heuristics
 
         loop {
-            let frame_idx =
-                self.eviction_hand.fetch_add(1, Ordering::Relaxed) % self.framer.frame_count();
-            let frame = &self.framer[frame_idx];
+            let frame_idx = self.eviction_hand.fetch_add(1, Ordering::Relaxed) % self.frames.len();
+            let frame = &self.frames[frame_idx];
 
             // This could be Relaxed (maybe) but it might result in more aborts once we take the
             // lock later? Would need testing really. Either is "correct" because we recheck later.
             if frame.pins.load(Ordering::Acquire) == 0 {
                 let frame_usage_ctr = frame
                     .usage
-                    .fetch_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
+                    .try_update(Ordering::Relaxed, Ordering::Relaxed, |old| {
                         Some(old.saturating_sub(1))
                     })
                     .unwrap();
@@ -296,98 +200,410 @@ impl Pager {
             }
 
             checked_count += 1;
-            if checked_count == self.framer.frame_count() {
-                // hint that were spinning if weve looked through all the frames already
+            if checked_count == self.frames.len() {
                 std::hint::spin_loop();
                 checked_count = 0;
             }
         }
     }
 
-    // ---------------------------------------------------------------------------------------------
-    // *            IO                                                                             *
-    // ---------------------------------------------------------------------------------------------
+    #[must_use = "RAII RdHdl releases when dropped"]
+    fn get_page_read(&self, page_id: u64) -> Result<RdHdl<'_>, PagerErr> {
+        loop {
+            let mut dir = self.shard_dirs[shard_hash(page_id)].lock().unwrap();
 
-    fn io_read_into_frame<'a>(
-        &self, mut frame_guard: FrameWriteGuard<'a, LoadPending>,
-    ) -> Result<FrameReadGuard<'a>, StorageError> {
-        let page_id = frame_guard.page_id();
-        let mut result = self
-            .file
-            .read_exact_at(frame_guard.buffer(), PAGE_SIZE as u64 * page_id)
-            .map_err(|err| err.kind().into());
+            match dir.get(&page_id) {
+                Some(&frame_index) => match self.try_pin_read(frame_index, page_id) {
+                    None => {
+                        // we got a stale frame - retry
+                        continue;
+                    }
+                    Some(r_hdl) => {
+                        return Ok(r_hdl);
+                    }
+                },
+                None => {
+                    // eviction path - these comments apply to `get_page_write` as well
+                    let mut w_hdl = loop {
+                        let free_frame_index = self.scan_for_eviction_candidate();
+                        match self.try_pin_write(free_frame_index) {
+                            None => continue,
+                            Some(w_hdl) => break w_hdl,
+                        }
+                    };
 
-        if let Err(err) = result {
-            log::error!("read error (page_id={}): {}", page_id, err);
-        } else if !checksum::check(frame_guard.buffer()) {
-            log::error!("read checksum error (page_id={})", page_id);
-            result = Err(StorageError::Checksum);
-        }
+                    // this can be contested, because someone may have found this frame in the dir,
+                    // and is calling `pin_read` and checking the page_id
+                    let mut loading_guard = w_hdl.frame.loading.write().unwrap();
+                    let frame_page_id = std::mem::replace(&mut *loading_guard, page_id);
 
-        match result {
-            Ok(()) => Ok(frame_guard.mark_load_ok()),
-            Err(err) => {
-                frame_guard.mark_load_err(err);
-                return Err(err);
+                    dir.insert(page_id, w_hdl.frame.index);
+                    drop(dir);
+
+                    // remove from old dir if needed
+                    // It is ok if threads find this page before we do this, because we are holding the
+                    // loading lock, and once we release it they will see the new (to them unexpected)
+                    // page_id and they'll retry
+                    let mut old_dir = self.shard_dirs[shard_hash(frame_page_id)].lock().unwrap();
+                    old_dir.remove(&frame_page_id);
+                    drop(old_dir);
+
+                    self.io_read(&mut w_hdl)?;
+
+                    let r_hdl = self.pin_downgrade(w_hdl);
+                    drop(loading_guard);
+                    return Ok(r_hdl);
+                }
             }
         }
     }
 
-    // TODO combine these
+    #[must_use = "RAII WrHdl releases when dropped"]
+    fn get_page_write(&self, page_id: u64, should_load: bool) -> Result<WrHdl<'_>, PagerErr> {
+        let mut dir = self.shard_dirs[shard_hash(page_id)].lock().unwrap();
 
-    pub(crate) fn io_flush_and_resident<'a>(
-        &self, frame_guard: FrameWriteGuard<'a, Dirty>,
-    ) -> Result<FrameWriteGuard<'a, Resident>, StorageError> {
-        let fg = self.io_write_out_frame(frame_guard)?;
-        Ok(fg.mark_written_out())
+        match dir.get(&page_id) {
+            Some(&frame_index) => {
+                return Ok(self.pin_write(frame_index));
+            }
+            None => {
+                let mut w_hdl = loop {
+                    let free_frame_index = self.scan_for_eviction_candidate();
+                    match self.try_pin_write(free_frame_index) {
+                        None => continue,
+                        Some(w_hdl) => break w_hdl,
+                    }
+                };
+
+                let mut loading_guard = w_hdl.frame.loading.write().unwrap();
+                let frame_page_id = std::mem::replace(&mut *loading_guard, page_id);
+
+                dir.insert(page_id, w_hdl.frame.index);
+                drop(dir);
+
+                let mut old_dir = self.shard_dirs[shard_hash(frame_page_id)].lock().unwrap();
+                old_dir.remove(&frame_page_id);
+                drop(old_dir);
+
+                if should_load {
+                    self.io_read(&mut w_hdl)?;
+                }
+
+                return Ok(w_hdl);
+            }
+        };
     }
 
-    fn io_flush_and_reinit<'a>(
-        &self, frame_guard: FrameWriteGuard<'a, Dirty>,
-    ) -> Result<FrameWriteGuard<'a, Uninit>, StorageError> {
-        let fg = self.io_write_out_frame(frame_guard)?;
-        Ok(fg.mark_written_out_and_reinit())
+    #[must_use = "RAII WrHdl releases when dropped"]
+    fn get_frame_write(&self, frame_index: usize) -> WrHdl<'_> {
+        self.try_pin_write(frame_index).expect("must be uncontested")
     }
 
-    fn io_write_out_frame<'a>(
-        &self, mut frame_guard: FrameWriteGuard<'a, Dirty>,
-    ) -> Result<FrameWriteGuard<'a, Dirty>, StorageError> {
-        let page_id = frame_guard.page_id();
-        checksum::set(frame_guard.buffer());
+    #[must_use = "RAII ReadTxHdl releases when dropped"]
+    pub(super) fn read_tx<'tx>(&'tx self) -> ReadTxHdl<'tx> {
+        let superblock = {
+            // we need to hold this guard while we put our value in the registry
+            let curr_guard = self.current.read().expect("todo");
+            let current = curr_guard.clone();
 
-        let result: Result<_, StorageError> = self
-            .file
-            .write_all_at(frame_guard.buffer(), PAGE_SIZE as u64 * page_id)
-            .map_err(|err| err.kind().into());
+            let tx_id = current.tx_id.get();
+            thread_local_tx_registry::register(tx_id);
 
-        if let Err(err) = result {
-            log::error!("write error (page_id={}): {}", page_id, err);
-            self.poisoned.store(true, Ordering::Release);
-            frame_guard.mark_poisoned();
-            std::process::abort();
+            current
+        };
+
+        ReadTxHdl { pager: self, superblock }
+    }
+
+    #[must_use = "RAII WriteTxHdl releases when dropped"]
+    pub(super) fn write_tx<'tx>(&'tx self) -> WriteTxHdl<'tx> {
+        let lock = self.write_lock.lock().unwrap();
+
+        let mut superblock = self.current.read().expect("todo").clone();
+        let prev_page_id = superblock.page_id.get();
+        superblock.tx_id += 1;
+        superblock.page_id.set((prev_page_id + 1) % 2);
+
+        WriteTxHdl {
+            pager: self,
+            _lock: lock,
+            inner: RefCell::new(WriteTxHdlInner { superblock, created_pages: HashMap::new() }),
         }
-
-        Ok(frame_guard)
-    }
-
-    pub(crate) fn sync(&self) -> Result<(), StorageError> {
-        self.file.sync_all().map_err(|e| e.kind().into())
     }
 }
 
-// TODO delete
-// CURRENT BUG:
-// we request `get_page_new` on same page_id multiple times,
-// we find free frames (just uninit) so we dont even look in the dir_guard
-// we just put that shit in
+// -------------------------------------------------------------------------------------------------
+// *            Frame Definitions                                                                  *
+// -------------------------------------------------------------------------------------------------
 
-// `get_page_new_1` handles all general cases where we want to write to a given arbitrary `page_id`.
-// It should work even if the page is currently resident in the pager and even if the page is
-// currently RW locked. We'll have to revise the Frame state machine rules to support this, as
-// originally wed planned to oinly give out "Writeable" initialized frames but now well be
-// possibly giving out frames that are `Dirty` or read-in from disk (`Readable`)
+impl FrameBuffer {
+    #[must_use]
+    fn zeros() -> Self {
+        Self(UnsafeCell::new([0; PAGE_SIZE]))
+    }
+}
 
-// `get_page_new_2` will only be correct if we are writing to a page that would notionally be
-// "freed". What this means wrt the pager is that the page should NOT be resident - unlike
-// `get_new_page_1` this should "fail" (in some way) if we pass in a `page_id` that is currently
-// resident in the pager.
+#[repr(align(64))]
+struct FrameHeader {
+    index:   usize,
+    page_id: UnsafeCell<u64>, // TODO
+    /// Negative is write, positive is read - write is exclusive
+    pins:    AtomicI64,
+    usage:   AtomicU64,
+    loading: RwLock<u64>,
+}
+
+impl FrameHeader {
+    fn new(index: usize) -> Self {
+        Self {
+            index:   index,
+            page_id: PAGE_ID_NULL.into(),
+            pins:    0.into(),
+            usage:   0.into(),
+            loading: RwLock::new(PAGE_ID_NULL),
+        }
+    }
+}
+
+// ------------ WrHdl ------------------------------------------------------------------------------
+
+/// Exclusive frame write-handle
+#[repr(align(64))]
+pub(super) struct WrHdl<'pager> {
+    pub(super) buf: &'pager mut [u8; PAGE_SIZE],
+    pager:          &'pager Pager,
+    frame:          &'pager FrameHeader,
+    tx_id:          u64,
+}
+
+impl<'pager> WrHdl<'pager> {
+    unsafe fn from_pager_index(pager: &'pager Pager, index: usize, tx_id: u64) -> Self {
+        let frame = &pager.frames[index];
+        let buf = unsafe { &mut *pager.pages[index].0.get() };
+        Self { pager: pager, frame: frame, buf: buf, tx_id }
+    }
+
+    pub(super) fn flush(&mut self) -> Result<(), PagerErr> {
+        self.pager.io_write(self, self.tx_id)
+    }
+
+    pub(super) fn get_page_id(&self) -> u64 {
+        *self
+            .frame
+            .loading
+            .try_read()
+            .expect("loading rwlock shouldnt be contested when we have a WrHdl")
+    }
+
+    pub(super) fn get_frame_index(&self) -> usize {
+        self.frame.index
+    }
+}
+
+impl Drop for WrHdl<'_> {
+    fn drop(&mut self) {
+        let prev = self.pager.frames[self.frame.index].pins.fetch_add(1, Ordering::AcqRel);
+        mooo_assert!(prev == -1, "write-pin should have been -1");
+    }
+}
+
+// ------------ RdHdl ------------------------------------------------------------------------------
+
+/// Shared frame read-handle
+#[repr(align(64))]
+pub(super) struct RdHdl<'pager> {
+    pub(super) buf: &'pager [u8; PAGE_SIZE],
+    pager:          &'pager Pager,
+    frame:          &'pager FrameHeader,
+}
+
+impl<'pager> RdHdl<'pager> {
+    unsafe fn from_pager_index(pager: &'pager Pager, index: usize) -> Self {
+        let frame = &pager.frames[index];
+        let buf = unsafe { &*pager.pages[index].0.get() };
+        Self { pager: pager, frame: frame, buf: buf }
+    }
+}
+
+impl Drop for RdHdl<'_> {
+    fn drop(&mut self) {
+        let prev = self.pager.frames[self.frame.index].pins.fetch_sub(1, Ordering::Release);
+        mooo_assert!(prev > 0, "read-pin should have been 1 or greater");
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub enum PagerErr {
+    Io(std::io::ErrorKind),
+}
+
+// -------------------------------------------------------------------------------------------------
+// *            Tx Definitions                                                                     *
+// -------------------------------------------------------------------------------------------------
+
+pub(super) enum Durability {
+    None,
+    Flush,
+    Sync,
+}
+
+// ------------ Traits -----------------------------------------------------------------------------
+
+pub(super) trait PgRdr<'tx> {
+    fn get_page_read(&self, page_id: u64) -> Result<RdHdl<'tx>, PagerErr>;
+}
+
+pub(super) trait PgAlloc<'tx> {
+    fn get_page_alloc(&self) -> Result<WrHdl<'tx>, PagerErr>;
+    fn get_page_write(&self, page_id: u64) -> Result<WrHdl<'tx>, PagerErr>;
+}
+
+// ------------ ReadTx -----------------------------------------------------------------------------
+
+pub(super) struct ReadTxHdl<'tx> {
+    pager:      &'tx Pager,
+    superblock: SuperblockHeader,
+}
+
+impl Drop for ReadTxHdl<'_> {
+    fn drop(&mut self) {
+        thread_local_tx_registry::deregister();
+    }
+}
+
+impl<'tx> PgRdr<'tx> for ReadTxHdl<'tx> {
+    fn get_page_read(&self, page_id: u64) -> Result<RdHdl<'tx>, PagerErr> {
+        self.pager.get_page_read(page_id)
+    }
+}
+
+// ------------ WriteTx ----------------------------------------------------------------------------
+
+pub(super) struct WriteTxHdl<'tx> {
+    pager: &'tx Pager,
+    inner: RefCell<WriteTxHdlInner>,
+    _lock: MutexGuard<'tx, ()>,
+}
+
+struct WriteTxHdlInner {
+    superblock:    SuperblockHeader,
+    created_pages: HashMap<u64, usize>,
+}
+
+impl WriteTxHdl<'_> {
+    pub(super) fn commit(self, durability: Durability) -> Result<(), PagerErr> {
+        let inner = self.inner.borrow_mut();
+
+        for &frame_index in inner.created_pages.values() {
+            let mut w_hdl = self.pager.get_frame_write(frame_index);
+            // TODO check durability
+            self.pager.io_write(&mut w_hdl, inner.superblock.tx_id.get())?;
+        }
+
+        let sb_page_id = inner.superblock.page_id.get();
+        let mut w_hdl = self.pager.get_page_write(sb_page_id, false)?;
+        copy_superblock_to_page(w_hdl.buf, &inner.superblock);
+        self.pager.io_write(&mut w_hdl, inner.superblock.tx_id.get())?;
+
+        // these don't need to be atomic - we are holding _lock anyway
+        *self.pager.current.write().unwrap() = inner.superblock.clone();
+        self.pager.tx_id.store(inner.superblock.tx_id.get(), Ordering::Relaxed);
+
+        Ok(())
+    }
+}
+
+impl<'tx> PgRdr<'tx> for WriteTxHdl<'tx> {
+    fn get_page_read(&self, page_id: u64) -> Result<RdHdl<'tx>, PagerErr> {
+        self.pager.get_page_read(page_id)
+    }
+}
+
+impl<'tx> PgAlloc<'tx> for WriteTxHdl<'tx> {
+    /// Bump allocates - also adds page to our dirty-page linked list
+    fn get_page_alloc(&self) -> Result<WrHdl<'tx>, PagerErr> {
+        let mut inner = self.inner.borrow_mut();
+        let page_id = inner.superblock.alloc_bump_next_id.get();
+        inner.superblock.alloc_bump_next_id.add_assign(1);
+        let w_hdl = self.pager.get_page_write(page_id, false)?;
+        inner.created_pages.insert(page_id, w_hdl.get_frame_index());
+        Ok(w_hdl)
+    }
+
+    /// should return a writeable new page, or a writeable copy of an existing page (depending on
+    /// page_id)
+    fn get_page_write(&self, page_id: u64) -> Result<WrHdl<'tx>, PagerErr> {
+        if let Some(&index) = self.inner.borrow().created_pages.get(&page_id) {
+            return Ok(self.pager.get_frame_write(index));
+        }
+
+        let old_r_hdl = self.get_page_read(page_id)?;
+        let new_w_hdl = self.get_page_alloc()?;
+        new_w_hdl.buf.copy_from_slice(old_r_hdl.buf);
+        Ok(new_w_hdl)
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// *            Thread-Local Read-tx Registry                                                      *
+// -------------------------------------------------------------------------------------------------
+
+mod thread_local_tx_registry {
+    use crate::mooo_assert;
+    use crate::sync::*;
+
+    const MAX_THREADS: usize = 256;
+    static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
+    fn get_next_thread_local_index() -> usize {
+        let next = NEXT_ID.fetch_add(1, Ordering::Relaxed);
+        mooo_assert!(next < MAX_THREADS);
+        next
+    }
+
+    // possibly these should be spaced out for a cache-line each
+    static COUNTERS: [AtomicU64; MAX_THREADS] = [const { AtomicU64::new(u64::MAX) }; MAX_THREADS];
+    thread_local! {
+        static THREAD_INDEX: usize = get_next_thread_local_index();
+    }
+
+    pub(super) fn register(tx_id: u64) {
+        THREAD_INDEX.with(|&thread_index| {
+            COUNTERS[thread_index]
+                .compare_exchange(u64::MAX, tx_id, Ordering::Release, Ordering::Relaxed)
+                .expect("tried to take re-entrant read guard");
+        });
+    }
+    pub(super) fn deregister() {
+        THREAD_INDEX.with(|&thread_index| {
+            COUNTERS[thread_index].store(u64::MAX, Ordering::Release);
+        });
+    }
+
+    pub(super) fn get_min() -> u64 {
+        // its ok if our max index gets stale, because the new thread we didnt see will definitely have
+        // a tx_id GE to any of these
+        let count = NEXT_ID.load(Ordering::Relaxed);
+        let mut earliest = u64::MAX;
+        for i in 0..count {
+            earliest = earliest.min(COUNTERS[i].load(Ordering::Acquire));
+        }
+        earliest
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// *            Util                                                                               *
+// -------------------------------------------------------------------------------------------------
+
+/// Does not compute checksum
+fn copy_superblock_to_page(buf: &mut [u8; PAGE_SIZE], sb_header: &SuperblockHeader) {
+    buf.zero();
+    sb_header.write_to_prefix(buf).unwrap();
+}
+
+const fn shard_hash(mut page_id: u64) -> usize {
+    page_id ^= page_id >> 33;
+    page_id = page_id.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    page_id ^= page_id >> 33;
+    (page_id as usize) & (SHARD_CNT - 1)
+}

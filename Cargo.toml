@@ -2,25 +2,21 @@
 name = "mooo"
 version = "0.1.0"
 edition = "2024"
-description = "mooo!"
+description = "is your btree imoootable?"
 repository = "https://git.monke.ca/yarn/MOOODB"
 readme = "README.md"
 license-file = "LICENSE"
-authors = ["yarn https://git.monke.ca/yarn"]
+authors = ["yarn"]
 
 [dependencies]
 libc = "0.2.183"
-rustc-hash = "2.1.2"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 zerocopy = { version = "0.8.48", features = ["derive"] }
-log = "0.4.29"
-# loom and shuttle instrument sync primitives throughout library code (src/sync.rs),
-# so they must be regular dependencies, not dev-dependencies.
 loom = { version = "0.7.2", optional = true }
 shuttle = { version = "0.8.1", optional = true }
 
 [dev-dependencies]
-rand = "0.10.0"
+rand = "0.10.1"
 tempfile = "3.27.0"
 
 [lints.rust]

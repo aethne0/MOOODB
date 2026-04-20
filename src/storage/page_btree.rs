@@ -1,35 +1,36 @@
 use std::ops::Deref;
 use std::ops::DerefMut;
 
-use super::U64Entry;
-use super::base_page::BasePage;
-use super::base_page::RangeExt;
-use super::base_page::SLOT_SIZE;
+use super::page_base::BasePage;
+use super::page_base::RangeExt;
+use super::page_base::SLOT_SIZE;
+use super::page_base::U64Entry;
 use crate::storage::PAGE_SIZE;
 
 /// A sorted B-tree page storing key-value pairs in ascending key order.
-pub(crate) struct BtreePage<Buf> {
+pub(super) struct BtreePage<Buf> {
     core: BasePage<Buf>,
 }
 
 // constructors
 
 impl<'buf> BtreePage<&'buf mut [u8; PAGE_SIZE]> {
-    pub(crate) fn new_with_buffer(
+    pub(super) fn new_with_buffer(
         buffer: &'buf mut [u8; PAGE_SIZE], page_id: u64, parent: u64, right: u64,
     ) -> Self {
         let mut page = Self::from_buffer(buffer);
+        page.pad = *b"BTREE!!!";
         page.initialize_header(page_id, parent, right);
         page
     }
 
-    pub(crate) const fn from_buffer(buffer: &'buf mut [u8; PAGE_SIZE]) -> Self {
+    pub(super) const fn from_buffer(buffer: &'buf mut [u8; PAGE_SIZE]) -> Self {
         Self { core: BasePage::from_buffer(buffer) }
     }
 }
 
 impl<'b> BtreePage<&'b [u8; PAGE_SIZE]> {
-    pub(crate) const fn from_buffer_ref(buffer: &'b [u8; PAGE_SIZE]) -> Self {
+    pub(super) const fn from_buffer_ref(buffer: &'b [u8; PAGE_SIZE]) -> Self {
         Self { core: BasePage::from_buffer_ref(buffer) }
     }
 }
@@ -39,7 +40,7 @@ const TYPE_LEAF: u16 = 0;
 const TYPE_INNER: u16 = 1;
 
 impl<Buf: AsRef<[u8]>> BtreePage<Buf> {
-    pub(crate) fn is_leaf(&self) -> bool {
+    pub(super) fn is_leaf(&self) -> bool {
         // TODO - use generic page flags field
         self.page_flags.get() == TYPE_LEAF
     }
@@ -88,12 +89,12 @@ impl<Buf: AsRef<[u8]>> BtreePage<Buf> {
     }
 
     /// Returns an iterator over `(key, value)` pairs in ascending key order.
-    pub(crate) const fn iter(&self) -> SortedIterator<'_, Buf> {
+    pub(super) const fn iter(&self) -> SortedIterator<'_, Buf> {
         SortedIterator { page: self, slot_index: 0 }
     }
 
     /// Returns the value associated with `key`, or `None` if not present.
-    pub(crate) fn get(&self, key: &[u8]) -> Option<U64Entry> {
+    pub(super) fn get(&self, key: &[u8]) -> Option<U64Entry> {
         match self.find_key_slot(key) {
             SearchResult::Found(slot_index) => Some(self.entry_at_slot(slot_index).1),
             _ => None,
@@ -103,7 +104,7 @@ impl<Buf: AsRef<[u8]>> BtreePage<Buf> {
     /// TODO rename
     /// gets first slot that is AT LEAST key (slot_key >= arg_key)
     /// This corresponds to which child page you should go it in a tree traversal
-    pub(crate) fn get_first_slot_ge_key(&self, key: &[u8]) -> Option<U64Entry> {
+    pub(super) fn get_first_slot_ge_key(&self, key: &[u8]) -> Option<U64Entry> {
         assert!(!self.is_leaf(), "shouldnt be called on leaf node");
         assert!(self.len() > 0, "inner node shouldnt be empty");
 
@@ -128,17 +129,17 @@ impl<Buf: AsRef<[u8]>> BtreePage<Buf> {
 // write impl
 
 impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
-    pub(crate) fn set_is_leaf(&mut self, is_leaf: bool) {
+    pub(super) fn set_is_leaf(&mut self, is_leaf: bool) {
         self.page_flags.set(if is_leaf { TYPE_LEAF } else { TYPE_INNER });
     }
 
     /// Removes all entries, reclaiming all entry space.
-    pub(crate) fn clear(&mut self) {
+    pub(super) fn clear(&mut self) {
         self.clear_entries();
     }
 
     /// Removes the entry with `key`. Does nothing if the key is not present.
-    pub(crate) fn delete(&mut self, key: &[u8]) {
+    pub(super) fn delete(&mut self, key: &[u8]) {
         if let SearchResult::Found(slot_index) = self.find_key_slot(key) {
             self.delete_slot_entry(slot_index);
         }
@@ -201,18 +202,18 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
     }
 
     /// Inserts or updates `(key, val)` maintaining sorted order. Returns `false` if the page is full.
-    pub(crate) fn insert(&mut self, key: &[u8], pk: U64Entry) -> bool {
+    pub(super) fn insert(&mut self, key: &[u8], pk: U64Entry) -> bool {
         self.insert_internal(key, pk, true)
     }
 
     /// Appends `(key, val)` to the end of the slot array without a binary search.
     /// **Breaks the sort invariant** unless the caller guarantees the entry belongs at the end.
-    pub(crate) fn insert_unordered(&mut self, key: &[u8], pk: U64Entry) -> bool {
+    pub(super) fn insert_unordered(&mut self, key: &[u8], pk: U64Entry) -> bool {
         self.insert_internal(key, pk, false)
     }
 
     /// Defragments the page by rewriting all live entries into a contiguous block. Sort order is preserved.
-    pub(crate) fn compact(&mut self) {
+    pub(super) fn compact(&mut self) {
         let mut cloned_raw = [0u8; PAGE_SIZE];
 
         cloned_raw.copy_from_slice(self.raw());
@@ -244,7 +245,7 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> DerefMut for BtreePage<Buf> {
 
 // iterator
 
-pub(crate) struct SortedIterator<'a, Buf: AsRef<[u8]>> {
+pub(super) struct SortedIterator<'a, Buf: AsRef<[u8]>> {
     page:       &'a BtreePage<Buf>,
     slot_index: u16,
 }
@@ -272,7 +273,7 @@ impl<'a, Buf: AsRef<[u8]>> IntoIterator for &'a BtreePage<Buf> {
 }
 
 /// Outcome of a binary search over the slot array.
-pub(crate) enum SearchResult {
+pub(super) enum SearchResult {
     /// The key was found at this slot index.
     Found(u16),
     /// The key was not found; this slot index is where it would be inserted.
@@ -288,6 +289,10 @@ pub(crate) enum SearchResult {
 ///  ▀▀▀  ▀▀▀  ▀▀▀▀  ▀▀▀  ▀▀▀▀
 #[cfg(test)]
 mod test {
+    use crate::storage::page_base::PAGE_HEADER_SIZE;
+    use crate::storage::page_base::U64Entry;
+    use crate::storage::page_btree::BtreePage;
+
     use super::PAGE_SIZE;
     use std::collections::BTreeMap;
     use std::collections::HashMap;
@@ -298,10 +303,6 @@ mod test {
     use rand::SeedableRng;
     use rand::rngs::StdRng;
     use rand::seq::IteratorRandom;
-
-    use crate::storage::pages::BtreePage;
-    use crate::storage::pages::U64Entry;
-    use crate::storage::pages::base_page::PAGE_HEADER_SIZE;
 
     fn make_leaf_page(buffer: &mut [u8; PAGE_SIZE]) -> BtreePage<&mut [u8; PAGE_SIZE]> {
         BtreePage::new_with_buffer(buffer, 2, 1, 3)

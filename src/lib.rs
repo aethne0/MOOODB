@@ -20,10 +20,9 @@
 //!
 //! **MOOODB** is a copy-on-write relational database management system.
 
-#![allow(dead_code)]
+#![warn(unreachable_pub)]
 #![warn(clippy::pedantic)]
 #![warn(clippy::perf)]
-#![warn(unreachable_pub)]
 #![warn(clippy::redundant_clone)]
 #![warn(clippy::let_and_return)]
 #![warn(clippy::needless_pub_self)]
@@ -33,5 +32,6 @@
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::struct_field_names)]
 
-pub(crate) mod storage;
-pub(crate) mod sync;
+pub mod assert;
+pub mod storage;
+pub mod sync;

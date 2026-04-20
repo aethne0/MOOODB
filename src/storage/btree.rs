@@ -1,78 +1,99 @@
 use std::mem::MaybeUninit;
 
-use super::manager::PageAlloc;
-use super::manager::PageReader;
-use super::pages::BtreePage;
-use super::pages::U64Entry;
-use super::StorageError;
+use super::page_base::U64Entry;
+use super::page_btree::BtreePage;
+use super::pager::*;
+use super::PagerErr;
 use super::PAGE_ID_NULL;
 
+struct Btree(u64);
+
 // ------------ Get ----------------------------------------------------------------------------
-pub(crate) fn get<'tx, R: PageReader<'tx>>(
-    root_page_id: u64, handle: &R, key: &[u8],
-) -> Result<Option<U64Entry>, StorageError> {
-    let mut page_id = root_page_id;
-
-    loop {
-        let page = BtreePage::from_buffer_ref(handle.get_page_read(page_id)?.buffer());
-
-        if page.is_leaf() {
-            return Ok(page.get(key));
-        }
-
-        page_id = page.get_first_slot_ge_key(key).unwrap().get();
-    }
-}
-
-// ------------ New ----------------------------------------------------------------------------
-pub(crate) fn new<'tx, R: PageReader<'tx> + PageAlloc<'tx>>(
-    handle: &mut R,
-) -> Result<u64, StorageError> {
-    let (frame, page_id) = handle.get_page_alloc()?;
-    BtreePage::new_with_buffer(frame.buffer(), page_id, PAGE_ID_NULL, PAGE_ID_NULL);
-    Ok(page_id)
-}
-
-// ------------ Insert -------------------------------------------------------------------------
-pub(crate) fn insert<'tx, R: PageReader<'tx> + PageAlloc<'tx>>(
-    root_page_id: u64, handle: &mut R, key: &[u8], value: U64Entry,
-) -> Result<u64, StorageError> {
-    let mut new_root_page_id = root_page_id;
-    let mut next_page_id = root_page_id;
-    let mut page_stack = PageStack::new();
-
-    let had_space = loop {
-        let (frame, page_id) = handle.get_page_write(next_page_id)?;
-        let mut page = BtreePage::from_buffer(frame.buffer());
-
-        if page_stack.len() == 0 {
-            // update root_id with the first page we touch (top)
-            new_root_page_id = page_id;
-        }
-
-        if page.is_leaf() {
-            break page.insert(key, value);
-        } else {
-            next_page_id = page.get_first_slot_ge_key(key).unwrap().get(); // todo
-            page_stack.push(page_id);
-        }
-    };
-
-    let mut prev_page_id = PAGE_ID_NULL;
-    for page_id in page_stack {
-        let (frame, found_page_id) = handle.get_page_write(page_id)?;
-        assert!(page_id == found_page_id, "new pages should already be allocated");
-        let mut page = BtreePage::from_buffer(frame.buffer());
-        page.page_id.set(page_id);
-        page.parent_id.set(prev_page_id);
-        prev_page_id = page_id;
+impl Btree {
+    #[must_use]
+    pub(crate) fn with_root(root_page_id: u64) -> Self {
+        Self(root_page_id)
     }
 
-    if !had_space {
-        todo!()
+    pub(crate) fn root_id(&self) -> u64 {
+        self.0
     }
 
-    Ok(new_root_page_id)
+    pub(crate) fn get<'tx, R: PgRdr<'tx>>(
+        &self, handle: &R, key: &[u8],
+    ) -> Result<Option<U64Entry>, PagerErr> {
+        let mut page_id = self.0;
+
+        loop {
+            let page = BtreePage::from_buffer_ref(handle.get_page_read(page_id)?.buf);
+
+            if page.is_leaf() {
+                return Ok(page.get(key));
+            }
+
+            page_id = page.get_first_slot_ge_key(key).unwrap().get();
+        }
+    }
+
+    // ------------ New ----------------------------------------------------------------------------
+    pub(crate) fn new<'tx, R: PgRdr<'tx> + PgAlloc<'tx>>(tx: &R) -> Result<Btree, PagerErr> {
+        let w_hdl = tx.get_page_alloc()?;
+        let page_id = w_hdl.get_page_id();
+        BtreePage::new_with_buffer(w_hdl.buf, page_id, PAGE_ID_NULL, PAGE_ID_NULL);
+        Ok(Self::with_root(page_id))
+    }
+
+    // ------------ Insert -------------------------------------------------------------------------
+    pub(crate) fn insert<'tx, R: PgRdr<'tx> + PgAlloc<'tx>>(
+        &mut self, tx: &R, key: &[u8], value: U64Entry,
+    ) -> Result<(), PagerErr> {
+        let mut new_root_page_id = self.0;
+        let mut next_page_id = self.0;
+        let mut page_stack = PageStack::new();
+
+        loop {
+            let w_hdl = tx.get_page_write(next_page_id)?;
+            let page_id = w_hdl.get_page_id();
+            let mut page = BtreePage::from_buffer(w_hdl.buf);
+
+            if page_stack.len() == 0 {
+                // update root_id with the first page we touch (top)
+                new_root_page_id = page_id;
+            }
+
+            if page.is_leaf() {
+                page.page_id.set(page_id);
+                let had_space = page.insert(key, value);
+
+                if !had_space {
+                    let right_w_hdl = tx.get_page_alloc()?;
+                    let right_page_id = right_w_hdl.get_page_id();
+                    page.next_id = right_page_id.into();
+                    let right_page =
+                        BtreePage::new_with_buffer(right_w_hdl.buf, page_id, right_page_id, 555);
+                }
+
+                break;
+            } else {
+                next_page_id = page.get_first_slot_ge_key(key).unwrap().get(); // todo
+                page_stack.push(page_id);
+            }
+        }
+
+        let mut prev_page_id = PAGE_ID_NULL;
+        for page_id in page_stack {
+            let w_hdl = tx.get_page_write(page_id)?;
+            let found_page_id = w_hdl.get_page_id();
+            assert!(page_id == found_page_id, "new pages should already be allocated");
+            let mut page = BtreePage::from_buffer(w_hdl.buf);
+            page.page_id.set(page_id);
+            page.parent_id.set(prev_page_id);
+            prev_page_id = page_id;
+        }
+
+        self.0 = new_root_page_id;
+        Ok(())
+    }
 }
 
 // ------------ Delete -------------------------------------------------------------------------
@@ -121,30 +142,79 @@ impl Iterator for PageStack {
 
 #[cfg(test)]
 mod test {
-    use crate::storage::btree;
-    use crate::storage::manager::Durability;
-    use crate::storage::manager::TxManager;
+
+    use crate::sync;
+
+    use super::*;
 
     #[test]
     fn btree_inserts() {
         let file = tempfile::tempfile().unwrap();
-        let mgr = TxManager::new(32, file);
+        let mgr = Pager::new(64, file);
 
-        let page_id = {
-            let mut tx = mgr.write_tx();
+        let w_tx = mgr.write_tx();
 
-            let mut page_id = btree::new(&mut tx).unwrap();
-            page_id = btree::insert(page_id, &mut tx, b"asd", 152.into()).unwrap();
-            page_id = btree::insert(page_id, &mut tx, b"zxc", 642.into()).unwrap();
-            page_id = btree::insert(page_id, &mut tx, b"rewt", 324.into()).unwrap();
+        let mut btree = Btree::new(&w_tx).unwrap();
+        let root_id = btree.root_id();
+        btree.insert(&w_tx, b"asd", 0xab.into()).unwrap();
+        btree.insert(&w_tx, b"zxc", 0xbc.into()).unwrap();
+        btree.insert(&w_tx, b"rewt", 0xde.into()).unwrap();
 
-            tx.commit(Durability::Sync).unwrap();
-            page_id
-        };
+        w_tx.commit(Durability::Flush).unwrap();
 
-        let tx = mgr.read_tx();
+        let r_tx = mgr.read_tx();
 
-        let res = btree::get(page_id, &tx, b"rewt").unwrap();
-        assert!(res.is_some_and(|val| val.get() == 324));
+        let res = btree.get(&r_tx, b"rewt").unwrap();
+        assert!(res.is_some_and(|val| val.get() == 0xde));
+
+        let w_tx = mgr.write_tx();
+
+        let mut btree = Btree::with_root(root_id);
+        btree.insert(&w_tx, b"xxx", 0x12.into()).unwrap();
+        btree.insert(&w_tx, b"zxc", 0x55.into()).unwrap();
+        btree.insert(&w_tx, b"rewz", 0x77.into()).unwrap();
+
+        w_tx.commit(Durability::Flush).unwrap();
+    }
+
+    #[test]
+    fn btree_inserts_threads() {
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .write(true)
+            .read(true)
+            .open("/xblk/test/test.moo")
+            .unwrap();
+        let mgr = Pager::new(64, file);
+
+        sync::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    let w_tx = mgr.write_tx();
+
+                    let mut btree = Btree::new(&w_tx).unwrap();
+                    let root_id = btree.root_id();
+                    btree.insert(&w_tx, b"asd", 0xab.into()).unwrap();
+                    btree.insert(&w_tx, b"zxc", 0xbc.into()).unwrap();
+                    btree.insert(&w_tx, b"rewt", 0xde.into()).unwrap();
+
+                    w_tx.commit(Durability::Flush).unwrap();
+
+                    let r_tx = mgr.read_tx();
+
+                    let res = btree.get(&r_tx, b"rewt").unwrap();
+                    assert!(res.is_some_and(|val| val.get() == 0xde));
+
+                    let w_tx = mgr.write_tx();
+
+                    let mut btree = Btree::with_root(root_id);
+                    btree.insert(&w_tx, b"xxx", 0x12.into()).unwrap();
+                    btree.insert(&w_tx, b"zxc", 0x55.into()).unwrap();
+                    btree.insert(&w_tx, b"rewz", 0x77.into()).unwrap();
+
+                    w_tx.commit(Durability::Flush).unwrap();
+                });
+            }
+        });
     }
 }

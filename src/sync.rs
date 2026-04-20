@@ -1,47 +1,4 @@
-//! Sync primitive shim — selects the right implementation based on the active
-//! testing harness:
-//!
-//! | Build flag          | Source   | How to activate                          |
-//! |---------------------|----------|------------------------------------------|
-//! | `--cfg loom`        | loom     | `RUSTFLAGS="--cfg loom" cargo test`      |
-//! | `--cfg shuttle`     | shuttle  | `RUSTFLAGS="--cfg shuttle" cargo test`   |
-//! | *(neither)*         | std      | normal builds / tests                    |
-//!
-//! Import from here instead of `std::sync` so that loom/shuttle can intercept
-//! all synchronisation points during model-checking runs.
-
-// ── loom ─────────────────────────────────────────────────────────────────────
-
-#[cfg(loom)]
-#[allow(unused_imports)]
-mod imp {
-    pub(crate) use loom::cell::UnsafeCell;
-    pub(crate) use loom::sync::Arc;
-    pub(crate) use loom::sync::Condvar;
-    pub(crate) use loom::sync::Mutex;
-    pub(crate) use loom::sync::MutexGuard;
-    pub(crate) use loom::sync::RwLock;
-    pub(crate) use loom::sync::RwLockReadGuard;
-    pub(crate) use loom::sync::RwLockWriteGuard;
-    pub(crate) use loom::sync::atomic::AtomicBool;
-    pub(crate) use loom::sync::atomic::AtomicI32;
-    pub(crate) use loom::sync::atomic::AtomicI64;
-    pub(crate) use loom::sync::atomic::AtomicU16;
-    pub(crate) use loom::sync::atomic::AtomicU32;
-    pub(crate) use loom::sync::atomic::AtomicU64;
-    pub(crate) use loom::sync::atomic::AtomicUsize;
-    pub(crate) use loom::sync::atomic::Ordering;
-
-    pub(crate) mod thread {
-        // loom does not implement thread::scope — scoped threads would bypass
-        // loom's scheduler entirely, so scope is intentionally absent here.
-        pub(crate) use loom::thread::JoinHandle;
-        pub(crate) use loom::thread::spawn;
-        pub(crate) use loom::thread::yield_now;
-    }
-}
-
-// ── shuttle ───────────────────────────────────────────────────────────────────
+// --- shuttle ---
 
 #[cfg(all(shuttle, not(loom)))]
 #[allow(unused_imports)]
@@ -73,7 +30,7 @@ mod imp {
     }
 }
 
-// ── std ───────────────────────────────────────────────────────────────────────
+// --- std ---
 
 #[cfg(not(any(loom, shuttle)))]
 #[allow(unused_imports)]
