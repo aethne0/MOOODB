@@ -2,31 +2,22 @@ use std::cell::RefCell;
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::fs::File;
-use std::mem::offset_of;
 use std::ops::AddAssign;
 use std::os::unix::fs::FileExt;
 
+use super::compute_checksum;
+use super::hash_u64_modulo;
 use super::page_base::PagePrefix;
-use super::page_superblock::copy_superblock_to_page;
-use super::page_superblock::SuperblockHeader;
-use super::serialization::ByteToFrom;
-use super::PAGE_ID_NULL;
+use super::page_superblock::*;
+use super::pgid_valid;
+use super::serialization::*;
 use super::PAGE_SIZE;
+use super::PGID_NULL;
 use crate::mooo_assert;
-use crate::storage::compute_checksum;
-use crate::storage::hash_u64_modulo;
 use crate::sync::*;
 
-#[repr(align(4096))]
-struct FrameBuffer(UnsafeCell<[u8; PAGE_SIZE]>);
 const SHARD_CNT: usize = 256;
 const FIRST_TX_ID: u64 = 1;
-
-//  ▄▄▄· ▄▄▄·  ▄▄ • ▄▄▄ .    ▄▄▄▄· ▄• ▄▌·▄▄▄·▄▄▄▄▄▄ .▄▄▄
-// ▐█ ▄█▐█ ▀█ ▐█ ▀ ▪▀▄.▀·    ▐█ ▀█▪█▪██▌▐▄▄·▐▄▄·▀▄.▀·▀▄ █·
-//  ██▀·▄█▀▀█ ▄█ ▀█▄▐▀▀▪▄    ▐█▀▀█▄█▌▐█▌██▪ ██▪ ▐▀▀▪▄▐▀▀▄
-// ▐█▪·•▐█ ▪▐▌▐█▄▪▐█▐█▄▄▌    ██▄▪▐█▐█▄█▌██▌.██▌.▐█▄▄▌▐█•█▌
-// .▀    ▀  ▀ ·▀▀▀▀  ▀▀▀     ·▀▀▀▀  ▀▀▀ ▀▀▀ ▀▀▀  ▀▀▀ .▀  ▀
 
 pub(super) struct Pager {
     file: File,
@@ -65,37 +56,36 @@ impl Pager {
         };
 
         // page 0&1 are reserved for superblocks
-        let superblock_page_id = 0;
-        let next_superblock_page_id = superblock_page_id + 1;
-        let next_page_id = next_superblock_page_id + 1;
+        let superblock_pgid = 0;
+        let next_superblock_pgid = superblock_pgid + 1;
+        let next_pgid = next_superblock_pgid + 1;
 
         {
             // write empty second superblock
-            let mut w_hdl = pgr
-                .get_page_write(next_superblock_page_id, false)
+            let mut whdl = pgr
+                .get_page_write(next_superblock_pgid, false)
                 .expect("io error on superblock initialization");
-            w_hdl.buf.fill(0);
-            pgr.io_write(&mut w_hdl, 0).expect("io error on superblock initialization");
+            whdl.buf.fill(0);
+            pgr.io_write(&mut whdl, 0).expect("io error on superblock initialization");
         }
 
         let header = {
             // write actua first superblock
-            let mut w_hdl = pgr
-                .get_page_write(superblock_page_id, false)
+            let mut whdl = pgr
+                .get_page_write(superblock_pgid, false)
                 .expect("io error on superblock initialization");
 
             let superblock_header = SuperblockHeader {
-                prefix:             PagePrefix::new(superblock_page_id, 0, FIRST_TX_ID),
-                version:            0x766572_00_0000_0001.into(),
-                page_size:          (PAGE_SIZE as u16).into(),
-                catalog_head_id:    PAGE_ID_NULL.into(),
-                alloc_free_head_id: PAGE_ID_NULL.into(),
-                alloc_bump_next_id: next_page_id.into(),
-                _pad:               [0; 62],
+                prefix:               PagePrefix::new(superblock_pgid, 0, FIRST_TX_ID),
+                version:              SerializedU64(*b"ver:0001"),
+                alloc_free_head_pgid: PGID_NULL.into(),
+                alloc_bump_next_pgid: next_pgid.into(),
+                catalog_head_pgid:    PGID_NULL.into(),
+                page_size:            (PAGE_SIZE as u16).into(),
             };
 
-            copy_superblock_to_page(w_hdl.buf, &superblock_header);
-            pgr.io_write(&mut w_hdl, FIRST_TX_ID).expect("io error on superblock initialization");
+            copy_superblock_to_page(whdl.buf, &superblock_header);
+            pgr.io_write(&mut whdl, FIRST_TX_ID).expect("io error on superblock initialization");
             superblock_header
         };
 
@@ -107,6 +97,7 @@ impl Pager {
 
     // ------------ frame --------------------------------------------------------------------------
 
+    #[must_use = "RAII WrHdl releases when dropped"]
     fn try_pin_write(&self, index: usize) -> Option<WrHdl<'_>> {
         let frame = &self.frames[index];
         match frame.pins.compare_exchange(0, -1, Ordering::AcqRel, Ordering::Acquire) {
@@ -117,6 +108,7 @@ impl Pager {
         }
     }
 
+    #[must_use = "RAII WrHdl releases when dropped"]
     fn pin_write(&self, index: usize) -> WrHdl<'_> {
         let frame = &self.frames[index];
         let cas_res = frame.pins.compare_exchange(0, -1, Ordering::AcqRel, Ordering::Acquire);
@@ -129,10 +121,11 @@ impl Pager {
         unsafe { WrHdl::from_pager_index(self, index, self.tx_id.load(Ordering::Relaxed)) }
     }
 
-    fn try_pin_read(&self, index: usize, expected_page_id: u64) -> Option<RdHdl<'_>> {
+    #[must_use = "RAII RdHdl releases when dropped"]
+    fn try_pin_read(&self, index: usize, expected_pgid: u64) -> Option<RdHdl<'_>> {
         let frame = &self.frames[index];
 
-        if *frame.loading.read().unwrap() != expected_page_id {
+        if *frame.loading.read().unwrap() != expected_pgid {
             // This was evicted between the time we got it from the dir and the time we got a
             // read-lock - caller will have to retry
             return None;
@@ -152,9 +145,10 @@ impl Pager {
             .ok()
     }
 
-    fn pin_downgrade(&self, w_hdl: WrHdl<'_>) -> RdHdl<'_> {
-        let index = w_hdl.frame.index;
-        std::mem::forget(w_hdl);
+    #[must_use = "RAII RdHdl releases when dropped"]
+    fn pin_downgrade(&self, whdl: WrHdl<'_>) -> RdHdl<'_> {
+        let index = whdl.frame.index;
+        std::mem::forget(whdl);
 
         let frame = &self.frames[index];
         let cas_res = frame.pins.compare_exchange(-1, 1, Ordering::AcqRel, Ordering::Acquire);
@@ -165,32 +159,51 @@ impl Pager {
 
     // ------------ io -----------------------------------------------------------------------------
 
-    fn io_write(&self, w_hdl: &mut WrHdl<'_>, tx_id: u64) -> Result<(), PagerErr> {
-        mooo_assert!(w_hdl.get_page_id() != PAGE_ID_NULL);
+    /// Note: `pgid` must be set on `whdl`! We use that to know which page to read!
+    #[must_use = "must handle error"]
+    fn io_write(&self, whdl: &mut WrHdl<'_>, txid: u64) -> Result<(), PagerErr> {
+        let pgid = whdl.get_pgid();
+        mooo_assert!(pgid_valid(pgid));
 
-        let page_id = w_hdl.get_page_id();
-        let checksum = compute_checksum(&w_hdl.buf[offset_of!(PagePrefix, page_id)..]);
-        let header = PagePrefix::mut_from_prefix(w_hdl.buf);
-        header.checksum.set(checksum);
-        header.page_id.set(page_id);
-        header.tx_id.set(tx_id);
+        {
+            let header = PagePrefix::mut_from_prefix(whdl.buf);
+            header.pgid.set(pgid);
+            header.txid.set(txid);
+        }
+        // Checksum must computed after other sets!
+        {
+            let checksum = compute_checksum(&whdl.buf[size_of::<SerializedU32>()..]);
+            let header = PagePrefix::mut_from_prefix(whdl.buf);
+            header.checksum.set(checksum);
+        }
 
         self.file
-            .write_at(w_hdl.buf, w_hdl.get_page_id() * PAGE_SIZE as u64)
+            .write_at(whdl.buf, pgid * PAGE_SIZE as u64)
             .map(|_| {})
             .map_err(|e| PagerErr::Io(e.kind()))
     }
 
-    fn io_read(&self, w_hdl: &mut WrHdl<'_>) -> Result<(), PagerErr> {
-        let page_id = w_hdl.get_page_id();
-        mooo_assert!(page_id != PAGE_ID_NULL);
+    #[must_use = "must handle error"]
+    fn io_read(&self, whdl: &mut WrHdl<'_>, pgid: u64) -> Result<(), PagerErr> {
+        mooo_assert!(pgid_valid(pgid));
+
         self.file
-            .read_exact_at(w_hdl.buf, page_id * PAGE_SIZE as u64)
-            .map_err(|e| PagerErr::Io(e.kind()))
+            .read_exact_at(whdl.buf, pgid * PAGE_SIZE as u64)
+            .map_err(|e| PagerErr::Io(e.kind()))?;
+
+        let checksum = compute_checksum(&whdl.buf[size_of::<SerializedU32>()..]);
+        {
+            let header = PagePrefix::mut_from_prefix(whdl.buf);
+            // TODO should just be an error eventually
+            mooo_assert!(header.checksum.get() == checksum, "checksums must match");
+        }
+
+        Ok(())
     }
 
     // ------------ pages --------------------------------------------------------------------------
 
+    #[must_use = "no side effects"]
     fn scan_for_eviction_candidate(&self) -> usize {
         let mut checked_count = 0; // for spin hint heuristics
 
@@ -222,97 +235,111 @@ impl Pager {
     }
 
     #[must_use = "RAII RdHdl releases when dropped"]
-    fn get_page_read(&self, page_id: u64) -> Result<RdHdl<'_>, PagerErr> {
+    fn get_page_read(&self, pgid: u64) -> Result<RdHdl<'_>, PagerErr> {
+        mooo_assert!(pgid_valid(pgid));
         loop {
-            let mut dir = self.shard_dirs[hash_u64_modulo(page_id, SHARD_CNT)].lock().unwrap();
+            let mut dir = self.shard_dirs[hash_u64_modulo(pgid, SHARD_CNT)].lock().unwrap();
 
-            match dir.get(&page_id) {
-                Some(&frame_index) => match self.try_pin_read(frame_index, page_id) {
+            match dir.get(&pgid) {
+                Some(&frame_index) => match self.try_pin_read(frame_index, pgid) {
                     None => {
                         // we got a stale frame - retry
                         continue;
                     }
-                    Some(r_hdl) => {
-                        return Ok(r_hdl);
+                    Some(rhdl) => {
+                        return Ok(rhdl);
                     }
                 },
                 None => {
                     // eviction path - these comments apply to `get_page_write` as well
-                    let mut w_hdl = loop {
+                    let mut whdl = loop {
                         let free_frame_index = self.scan_for_eviction_candidate();
                         match self.try_pin_write(free_frame_index) {
                             None => continue,
-                            Some(w_hdl) => break w_hdl,
+                            Some(whdl) => break whdl,
                         }
                     };
 
                     // this can be contested, because someone may have found this frame in the dir,
-                    // and is calling `pin_read` and checking the page_id
-                    let mut loading_guard = w_hdl.frame.loading.write().unwrap();
-                    let frame_page_id = std::mem::replace(&mut *loading_guard, page_id);
+                    // and is calling `pin_read` and checking the pgid
+                    let mut loading_guard = whdl.frame.loading.write().unwrap();
+                    let frame_pgid = std::mem::replace(&mut *loading_guard, pgid);
 
-                    dir.insert(page_id, w_hdl.frame.index);
+                    dir.insert(pgid, whdl.frame.index);
                     drop(dir);
 
                     // remove from old dir if needed
                     // It is ok if threads find this page before we do this, because we are holding the
                     // loading lock, and once we release it they will see the new (to them unexpected)
-                    // page_id and they'll retry
+                    // pgid and they'll retry
                     let mut old_dir =
-                        self.shard_dirs[hash_u64_modulo(frame_page_id, SHARD_CNT)].lock().unwrap();
-                    old_dir.remove(&frame_page_id);
+                        self.shard_dirs[hash_u64_modulo(frame_pgid, SHARD_CNT)].lock().unwrap();
+                    old_dir.remove(&frame_pgid);
                     drop(old_dir);
 
-                    self.io_read(&mut w_hdl)?;
+                    self.io_read(&mut whdl, pgid)?;
 
-                    let r_hdl = self.pin_downgrade(w_hdl);
+                    let rhdl = self.pin_downgrade(whdl);
                     drop(loading_guard);
-                    return Ok(r_hdl);
+                    return Ok(rhdl);
                 }
             }
         }
     }
 
+    // TODO its possible were never passing should_load = true, because writetx just keeps a list of
+    // frame indicies to get writeguards again
+    /// gets an exclusive WHdl to a frame with `pgid`.
+    /// Note: this method will initialize the `WHdl`'s `pgid` field
     #[must_use = "RAII WrHdl releases when dropped"]
-    fn get_page_write(&self, page_id: u64, should_load: bool) -> Result<WrHdl<'_>, PagerErr> {
-        let mut dir = self.shard_dirs[hash_u64_modulo(page_id, SHARD_CNT)].lock().unwrap();
+    fn get_page_write(&self, pgid: u64, should_load: bool) -> Result<WrHdl<'_>, PagerErr> {
+        mooo_assert!(pgid_valid(pgid));
+        let mut dir = self.shard_dirs[hash_u64_modulo(pgid, SHARD_CNT)].lock().unwrap();
 
-        match dir.get(&page_id) {
+        match dir.get(&pgid) {
             Some(&frame_index) => {
-                return Ok(self.pin_write(frame_index));
+                let mut whdl = self.pin_write(frame_index);
+                whdl.pgid = pgid;
+                return Ok(whdl);
             }
             None => {
-                let mut w_hdl = loop {
+                let mut whdl = loop {
                     let free_frame_index = self.scan_for_eviction_candidate();
                     match self.try_pin_write(free_frame_index) {
                         None => continue,
-                        Some(w_hdl) => break w_hdl,
+                        Some(mut whdl) => {
+                            whdl.pgid = pgid;
+                            break whdl;
+                        }
                     }
                 };
 
-                let mut loading_guard = w_hdl.frame.loading.write().unwrap();
-                let frame_page_id = std::mem::replace(&mut *loading_guard, page_id);
+                let mut loading_guard = whdl.frame.loading.write().unwrap();
+                let frame_pgid = std::mem::replace(&mut *loading_guard, pgid);
 
-                dir.insert(page_id, w_hdl.frame.index);
+                dir.insert(pgid, whdl.frame.index);
                 drop(dir);
 
                 let mut old_dir =
-                    self.shard_dirs[hash_u64_modulo(frame_page_id, SHARD_CNT)].lock().unwrap();
-                old_dir.remove(&frame_page_id);
+                    self.shard_dirs[hash_u64_modulo(frame_pgid, SHARD_CNT)].lock().unwrap();
+                old_dir.remove(&frame_pgid);
                 drop(old_dir);
 
                 if should_load {
-                    self.io_read(&mut w_hdl)?;
+                    self.io_read(&mut whdl, pgid)?;
                 }
 
-                return Ok(w_hdl);
+                whdl.pgid = pgid;
+                return Ok(whdl);
             }
         };
     }
 
     #[must_use = "RAII WrHdl releases when dropped"]
     fn get_frame_write(&self, frame_index: usize) -> WrHdl<'_> {
-        self.try_pin_write(frame_index).expect("must be uncontested")
+        let mut whdl = self.try_pin_write(frame_index).expect("must be uncontested");
+        whdl.pgid = *self.frames[frame_index].loading.read().unwrap(); // this could be better
+        whdl
     }
 
     #[must_use = "RAII ReadTxHdl releases when dropped"]
@@ -322,8 +349,8 @@ impl Pager {
             let curr_guard = self.curr_superblock.read().expect("todo");
             let current = curr_guard.clone();
 
-            let tx_id = current.tx_id.get();
-            thread_local_tx_registry::register(tx_id);
+            let txid = current.txid.get();
+            thread_local_tx_registry::register(txid);
 
             current
         };
@@ -336,16 +363,15 @@ impl Pager {
         let lock = self.write_tx_lock.lock().unwrap();
 
         let mut superblock = self.curr_superblock.read().expect("todo").clone();
-        let prev_page_id = superblock.page_id.get();
-        superblock.tx_id += 1;
-        superblock.page_id.set((prev_page_id + 1) % 2);
+        let prev_pgid = superblock.pgid.get();
+        superblock.txid += 1;
+        superblock.pgid.set((prev_pgid + 1) % 2);
 
         WriteBumpTxHdl {
             pager: self,
             inner: RefCell::new(WriteTxHdlInner {
                 superblock:    superblock,
                 created_pages: HashMap::new(),
-                freed_pages:   vec![],
             }),
             _lock: lock,
         }
@@ -355,6 +381,9 @@ impl Pager {
 // -------------------------------------------------------------------------------------------------
 // *            Frame Definitions                                                                  *
 // -------------------------------------------------------------------------------------------------
+
+#[repr(align(4096))]
+struct FrameBuffer(UnsafeCell<[u8; PAGE_SIZE]>);
 
 impl FrameBuffer {
     #[must_use]
@@ -366,7 +395,6 @@ impl FrameBuffer {
 #[repr(align(64))]
 struct FrameHeader {
     index:   usize,
-    page_id: UnsafeCell<u64>, // TODO
     /// Negative is write, positive is read - write is exclusive
     pins:    AtomicI64,
     usage:   AtomicU64,
@@ -377,10 +405,9 @@ impl FrameHeader {
     fn new(index: usize) -> Self {
         Self {
             index:   index,
-            page_id: PAGE_ID_NULL.into(),
             pins:    0.into(),
             usage:   0.into(),
-            loading: RwLock::new(PAGE_ID_NULL),
+            loading: RwLock::new(PGID_NULL), // TODO might not be using this value anymore
         }
     }
 }
@@ -388,31 +415,28 @@ impl FrameHeader {
 // ------------ WrHdl ------------------------------------------------------------------------------
 
 /// Exclusive frame write-handle
-#[repr(align(64))]
 pub(super) struct WrHdl<'pager> {
     pub(super) buf: &'pager mut [u8; PAGE_SIZE],
     pager:          &'pager Pager,
     frame:          &'pager FrameHeader,
-    tx_id:          u64,
+    txid:           u64,
+    pgid:           u64,
 }
 
 impl<'pager> WrHdl<'pager> {
-    unsafe fn from_pager_index(pager: &'pager Pager, index: usize, tx_id: u64) -> Self {
+    unsafe fn from_pager_index(pager: &'pager Pager, index: usize, txid: u64) -> Self {
         let frame = &pager.frames[index];
         let buf = unsafe { &mut *pager.pages[index].0.get() };
-        Self { pager: pager, frame: frame, buf: buf, tx_id }
+        Self { pager: pager, frame: frame, buf: buf, txid, pgid: PGID_NULL }
     }
 
     pub(super) fn flush(&mut self) -> Result<(), PagerErr> {
-        self.pager.io_write(self, self.tx_id)
+        self.pager.io_write(self, self.txid)
     }
 
-    pub(super) fn get_page_id(&self) -> u64 {
-        *self
-            .frame
-            .loading
-            .try_read()
-            .expect("loading rwlock shouldnt be contested when we have a WrHdl")
+    pub(super) fn get_pgid(&self) -> u64 {
+        mooo_assert!(pgid_valid(self.pgid));
+        self.pgid
     }
 
     pub(super) fn get_frame_index(&self) -> usize {
@@ -430,7 +454,6 @@ impl Drop for WrHdl<'_> {
 // ------------ RdHdl ------------------------------------------------------------------------------
 
 /// Shared frame read-handle
-#[repr(align(64))]
 pub(super) struct RdHdl<'pager> {
     pub(super) buf: &'pager [u8; PAGE_SIZE],
     pager:          &'pager Pager,
@@ -469,20 +492,30 @@ pub(super) enum Durability {
 
 // ------------ Traits -----------------------------------------------------------------------------
 
-pub(super) trait PgrReader<'tx> {
-    fn get_page_read(&self, page_id: u64) -> Result<RdHdl<'tx>, PagerErr>;
+pub(super) trait PageReader<'tx> {
+    fn get_page_read(&self, pgid: u64) -> Result<RdHdl<'tx>, PagerErr>;
     fn get_catalog_root_id(&self) -> u64;
 }
 
-pub(super) trait PgrWriter<'tx> {
-    /// This will give out a writeable frame with a new, free page_id
+pub(super) trait PageWriter<'tx> {
+    /// This will give out a writeable frame with a new, free `pgid`
+    ///
+    /// Note: it is the implementors job to set the `pgid` of this handed our WrHdl
     fn get_page_alloc(&self) -> Result<WrHdl<'tx>, PagerErr>;
-    /// This will give a writeable page from a requested `page_id`, which can mean one of two things
-    /// 1. This page_id is from a prev tx, in which case we will copy `page_id`'s frame's contents
+    /// This will give a writeable page from a requested `pgid`, which can mean one of two things
+    /// - This `pgid` is from a prev tx, in which case we will copy `pgid`'s frame's contents
     ///    to a new page, and return that new page
-    /// 2. This `page_id` is from the current tx, in which case well return that `page_id`'s frame
-    fn get_page_write(&self, page_id: u64) -> Result<WrHdl<'tx>, PagerErr>;
-    fn update_catalog_root_id(&self, page_id: u64);
+    /// - This `pgid` is from the current tx, in which case well return that `pgid`'s frame
+    ///
+    /// This method should also handle page freeing - in the former case, when an old page is
+    /// copied, that old page should be added to any sort of free-list that the implementor
+    /// maintains. This part is optional and up to the implementor - endlessly bump-allocating and
+    /// "leaking" pages is "correct".
+    ///
+    /// Note: it is the implementors job to set the `pgid` of this handed our WrHdl
+    fn get_page_write(&self, pgid: u64) -> Result<WrHdl<'tx>, PagerErr>;
+    fn update_catalog_root_id(&self, pgid: u64);
+    fn free_page(&self, pgid: u64) -> Result<(), PagerErr>;
 }
 
 // ------------ ReadTx -----------------------------------------------------------------------------
@@ -498,13 +531,13 @@ impl Drop for ReadTxHdl<'_> {
     }
 }
 
-impl<'tx> PgrReader<'tx> for ReadTxHdl<'tx> {
-    fn get_page_read(&self, page_id: u64) -> Result<RdHdl<'tx>, PagerErr> {
-        self.pager.get_page_read(page_id)
+impl<'tx> PageReader<'tx> for ReadTxHdl<'tx> {
+    fn get_page_read(&self, pgid: u64) -> Result<RdHdl<'tx>, PagerErr> {
+        self.pager.get_page_read(pgid)
     }
 
     fn get_catalog_root_id(&self) -> u64 {
-        self.superblock.catalog_head_id.get()
+        self.superblock.catalog_head_pgid.get()
     }
 }
 
@@ -520,7 +553,6 @@ pub(super) struct WriteBumpTxHdl<'tx> {
 struct WriteTxHdlInner {
     superblock:    SuperblockHeader,
     created_pages: HashMap<u64, usize>,
-    freed_pages:   Vec<u64>,
 }
 
 impl WriteBumpTxHdl<'_> {
@@ -528,64 +560,71 @@ impl WriteBumpTxHdl<'_> {
         let inner = self.inner.borrow_mut();
 
         for &frame_index in inner.created_pages.values() {
-            let mut w_hdl = self.pager.get_frame_write(frame_index);
+            let mut whdl = self.pager.get_frame_write(frame_index);
             // TODO check durability
-            self.pager.io_write(&mut w_hdl, inner.superblock.tx_id.get())?;
+            // btw we need a version of this that will update pgid and tx_id and stuff without
+            // actually writing
+            self.pager.io_write(&mut whdl, inner.superblock.txid.get())?;
         }
 
-        let sb_page_id = inner.superblock.page_id.get();
-        let mut w_hdl = self.pager.get_page_write(sb_page_id, false)?;
-        copy_superblock_to_page(w_hdl.buf, &inner.superblock);
-        self.pager.io_write(&mut w_hdl, inner.superblock.tx_id.get())?;
+        let sb_pgid = inner.superblock.pgid.get();
+        let mut whdl = self.pager.get_page_write(sb_pgid, false)?;
+        copy_superblock_to_page(whdl.buf, &inner.superblock);
+        self.pager.io_write(&mut whdl, inner.superblock.txid.get())?;
 
         // these don't need to be atomic - we are holding _lock anyway
         *self.pager.curr_superblock.write().unwrap() = inner.superblock.clone();
-        self.pager.tx_id.store(inner.superblock.tx_id.get(), Ordering::Relaxed);
+        self.pager.tx_id.store(inner.superblock.txid.get(), Ordering::Relaxed);
 
         Ok(())
     }
 }
 
-impl<'tx> PgrReader<'tx> for WriteBumpTxHdl<'tx> {
-    fn get_page_read(&self, page_id: u64) -> Result<RdHdl<'tx>, PagerErr> {
-        self.pager.get_page_read(page_id)
+impl<'tx> PageReader<'tx> for WriteBumpTxHdl<'tx> {
+    fn get_page_read(&self, pgid: u64) -> Result<RdHdl<'tx>, PagerErr> {
+        self.pager.get_page_read(pgid)
     }
 
     fn get_catalog_root_id(&self) -> u64 {
-        self.inner.borrow().superblock.catalog_head_id.get()
+        self.inner.borrow().superblock.catalog_head_pgid.get()
     }
 }
 
-impl<'tx> PgrWriter<'tx> for WriteBumpTxHdl<'tx> {
+impl<'tx> PageWriter<'tx> for WriteBumpTxHdl<'tx> {
     /// Bump allocates - also adds page to our dirty-page linked list
     fn get_page_alloc(&self) -> Result<WrHdl<'tx>, PagerErr> {
         let mut inner = self.inner.borrow_mut();
-        let page_id = inner.superblock.alloc_bump_next_id.get();
-        inner.superblock.alloc_bump_next_id.add_assign(1);
-        let w_hdl = self.pager.get_page_write(page_id, false)?;
-        inner.created_pages.insert(page_id, w_hdl.get_frame_index());
-        Ok(w_hdl)
+        let pgid = inner.superblock.alloc_bump_next_pgid.get();
+        inner.superblock.alloc_bump_next_pgid.add_assign(1);
+        let whdl = self.pager.get_page_write(pgid, false)?;
+        inner.created_pages.insert(pgid, whdl.get_frame_index());
+        Ok(whdl)
     }
 
     /// should return a writeable new page, or a writeable copy of an existing page (depending on
-    /// page_id)
-    fn get_page_write(&self, page_id: u64) -> Result<WrHdl<'tx>, PagerErr> {
-        if let Some(&index) = self.inner.borrow().created_pages.get(&page_id) {
+    /// pgid)
+    fn get_page_write(&self, pgid: u64) -> Result<WrHdl<'tx>, PagerErr> {
+        if let Some(&index) = self.inner.borrow().created_pages.get(&pgid) {
             // this is already a new page per our writetx
             return Ok(self.pager.get_frame_write(index));
         }
 
         // we need to Copy-on-Write
-        self.inner.borrow_mut().freed_pages.push(page_id);
-        let old_r_hdl = self.get_page_read(page_id)?;
-        let new_w_hdl = self.get_page_alloc()?;
-        new_w_hdl.buf.copy_from_slice(old_r_hdl.buf);
+        let old_rhdl = self.get_page_read(pgid)?;
+        let new_whdl = self.get_page_alloc()?;
+        new_whdl.buf.copy_from_slice(old_rhdl.buf);
 
-        Ok(new_w_hdl)
+        Ok(new_whdl)
     }
 
-    fn update_catalog_root_id(&self, page_id: u64) {
-        self.inner.borrow_mut().superblock.catalog_head_id.set(page_id);
+    fn update_catalog_root_id(&self, pgid: u64) {
+        self.inner.borrow_mut().superblock.catalog_head_pgid.set(pgid);
+    }
+
+    fn free_page(&self, _pgid: u64) -> Result<(), PagerErr> {
+        // TODO actually this should probably be implicitly called by get_page_write
+        // no-op
+        Ok(())
     }
 }
 

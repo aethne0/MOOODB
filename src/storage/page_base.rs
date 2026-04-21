@@ -1,8 +1,9 @@
 use std::ops::Bound;
 use std::ops::RangeBounds;
 
-use super::serialization::ByteToFrom;
+use super::serialization::Serialized;
 use super::serialization::SerializedU16;
+use super::serialization::SerializedU32;
 use super::serialization::SerializedU64;
 use super::PAGE_SIZE;
 
@@ -11,78 +12,41 @@ use super::PAGE_SIZE;
 // its impossible for us to get to these page-ids anyway, due to
 // 1. 48/57 bit virtual-addresing
 // 2. some number of our bits are taken up by the page size (12 bits lost for 4kib pages)
-pub(super) const PAGE_ID_NULL: u64 = u64::MAX;
+pub(super) const PAGE_HEADER_SIZE: u16 = 0x20;
 pub(super) const SLOT_SIZE: u16 = 2 * size_of::<u16>() as u16;
-pub(super) const PAGE_HEADER_SIZE: u16 = 0x40;
-
-// --- IdEntry ---
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-#[repr(transparent)]
-pub(super) struct U64Entry(SerializedU64); // TODO 48+16 entry for heap-ids
-impl U64Entry {
-    pub(super) const SIZE_U16: u16 = size_of::<Self>() as u16;
-
-    pub(super) const fn get(&self) -> u64 {
-        self.0.get()
-    }
-
-    pub(super) fn as_bytes(&self) -> &[u8] {
-        ByteToFrom::as_bytes(self)
-    }
-}
-
-impl From<u64> for U64Entry {
-    fn from(v: u64) -> Self {
-        Self(v.into())
-    }
-}
-
-impl From<&[u8]> for U64Entry {
-    fn from(value: &[u8]) -> Self {
-        Self::read_from_bytes(&value[..size_of::<Self>()])
-    }
-}
-
-// --- Free-page Entry ---
-
-#[derive(Clone)]
-#[repr(C)]
-pub(super) struct FreeEntry {
-    tx_id:   SerializedU64,
-    page_id: SerializedU64,
-}
+pub(super) const SLOT_IDX_NULL: u16 = u16::MAX;
+const END_OF_PAGE: u16 = PAGE_SIZE as u16 - 1;
 
 /// The first 32 bytes of **every** page on disk, regardless of page type.
 ///
 /// The pager and I/O layer can cast any raw page buffer to this type to read or
-/// write the common fields (checksum, page_id, tx_id) without knowing which
+/// write the common fields (checksum, pgid, tx_id) without knowing which
 /// concrete page type lives in the rest of the buffer.
 ///
 /// Layout (all big-endian):
 /// ```text
 /// offset  0 | checksum   u64
-/// offset  8 | page_id    u64
+/// offset  8 | pgid       u64
 /// offset 16 | tx_id      u64
 /// offset 24 | <reserved> u64
 /// ```
 #[derive(Clone)]
 #[repr(C)]
 pub(super) struct PagePrefix {
-    pub(super) checksum: SerializedU64,
-    pub(super) page_id:  SerializedU64,
-    pub(super) tx_id:    SerializedU64,
-    pub(super) dbg_pad:  [u8; 8],
+    pub(super) checksum: SerializedU32,
+    pub(super) dbg_pad:  [u8; 4],
+    pub(super) txid:     SerializedU64,
+    pub(super) pgid:     SerializedU64,
 }
-const _: () = assert!(size_of::<PagePrefix>() == 32);
+const _: () = assert!(size_of::<PagePrefix>() == 24);
 
 impl PagePrefix {
-    pub(super) fn new(page_id: u64, checksum: u64, tx_id: u64) -> Self {
+    pub(super) fn new(pgid: u64, checksum: u32, tx_id: u64) -> Self {
         Self {
             checksum: checksum.into(),
-            page_id:  page_id.into(),
-            tx_id:    tx_id.into(),
-            dbg_pad:  *b"superblk",
+            dbg_pad:  *b"SUPA",
+            pgid:     pgid.into(),
+            txid:     tx_id.into(),
         }
     }
 }
@@ -117,23 +81,16 @@ where
 
 #[repr(C)]
 pub(super) struct PageHeader {
-    pub(super) prefix: PagePrefix,
-
+    pub(super) prefix:     PagePrefix,
     pub(super) page_flags: SerializedU16,
     pub(super) upper_ptr:  SerializedU16,
     pub(super) free_bytes: SerializedU16,
     pub(super) lower_ptr:  SerializedU16,
-
-    pub(super) parent_id: SerializedU64,
-
-    _pad: [u8; 16],
 }
 const _: () = assert!(size_of::<PageHeader>() == PAGE_HEADER_SIZE as usize);
 
-unsafe impl ByteToFrom for U64Entry {}
-unsafe impl ByteToFrom for FreeEntry {}
-unsafe impl ByteToFrom for PagePrefix {}
-unsafe impl ByteToFrom for PageHeader {}
+unsafe impl Serialized for PagePrefix {}
+unsafe impl Serialized for PageHeader {}
 
 /*
 impl std::ops::Deref for PageHeader {
@@ -190,10 +147,6 @@ impl<Buf: AsRef<[u8]>> BasePage<Buf> {
         self.raw.as_ref()
     }
 
-    fn end_of_page(&self) -> u16 {
-        (self.raw().len() - 1).try_into().unwrap()
-    }
-
     pub(super) fn free_bytes_contig(&self) -> u16 {
         1 + self.lower_ptr.get() - self.upper_ptr.get()
     }
@@ -208,11 +161,10 @@ impl<Buf: AsRef<[u8]>> BasePage<Buf> {
     }
 
     fn read_u16(&self, offset: u16) -> u16 {
-        let buf = self.raw.as_ref();
-        let idx = offset as usize;
-        u16::from_be_bytes([buf[idx], buf[idx + 1]])
+        SerializedU16::ref_from_bytes(&self.raw.as_ref()[offset as usize..]).get()
     }
 
+    /// offset, len
     pub(super) fn offset_len_from_slot(&self, slot_index: u16) -> (u16, u16) {
         (
             self.read_u16(PAGE_HEADER_SIZE + slot_index * SLOT_SIZE),
@@ -258,26 +210,20 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BasePage<Buf> {
         self.raw.as_mut()
     }
 
+    fn write_u16(&mut self, offset: u16, val: u16) {
+        SerializedU16::from(val).write_to_prefix(&mut self.raw.as_mut()[offset as usize..]);
+    }
+
+    /// writes just the slot in the slot-array itself, literally just the (offset, len)
     pub(super) fn write_slot(&mut self, slot_index: u16, offset: u16, len: u16) {
         let slot_offset = PAGE_HEADER_SIZE + slot_index * SLOT_SIZE;
         self.write_u16(slot_offset, offset);
         self.write_u16(slot_offset + size_of::<u16>() as u16, len);
     }
 
-    fn write_u16(&mut self, offset: u16, val: u16) {
-        let buf = self.raw.as_mut();
-        let idx = offset as usize;
-        buf[idx..idx + 2].copy_from_slice(&val.to_be_bytes());
-    }
-
-    pub(super) fn initialize_header(&mut self, parent: u64) {
-        self.parent_id = parent.into();
-        self.clear_entries();
-    }
-
     pub(super) fn clear_entries(&mut self) {
         self.upper_ptr = (PAGE_HEADER_SIZE).into();
-        self.lower_ptr = self.end_of_page().into();
+        self.lower_ptr = END_OF_PAGE.into();
         let free_contig = 1 + self.lower_ptr.get() - self.upper_ptr.get();
         self.free_bytes = free_contig.into();
 

@@ -1,240 +1,338 @@
+use std::cell::Ref;
+use std::cell::RefCell;
+use std::cell::RefMut;
 use std::mem::MaybeUninit;
 
+use super::page_base::SLOT_IDX_NULL;
+use super::page_btree::BtreePage;
+use super::pager::*;
+use super::serialization::SerializedU64;
+use super::PagerErr;
 use crate::mooo_assert;
 use crate::storage::page_btree::BtreePageType;
 
-use super::page_base::U64Entry;
-use super::page_btree::BtreePage;
-use super::pager::*;
-use super::PagerErr;
-use super::PAGE_ID_NULL;
+// TODO page leaks on early return - maybe we should call commit or something on CoW shadowed pages
+// er wait no i dont think it matters... cause we will just recover the old superblock
+// unless we keep doing stuff with the same wtx...
 
-/// It is the responsibility of the caller to update anything that may point to this `root_page_id`
-pub(super) struct Btree(u64);
+/// It is the responsibility of the caller to update anything that may point to this `root_pgid`
+pub(crate) struct Btree {
+    root_pgid: u64,
+}
 impl Btree {
-    // ------------ Constructors -------------------------------------------------------------------
+    // ------------ Constructors, Accessors --------------------------------------------------------
+
+    /// For opening an EXISTING btree
+    #[must_use]
+    pub(crate) fn new_from_root_pgid(root_pgid: u64) -> Self {
+        Self { root_pgid }
+    }
 
     #[must_use]
-    pub(crate) fn from_root_id(root_page_id: u64) -> Self {
-        Self(root_page_id)
+    pub(crate) fn new<'tx, R: PageReader<'tx> + PageWriter<'tx>>(
+        tx: &R,
+    ) -> Result<Btree, PagerErr> {
+        let whdl = tx.get_page_alloc()?;
+        let pgid = whdl.get_pgid();
+        BtreePage::new_with_buffer(whdl.buf, BtreePageType::Leaf);
+        Ok(Self::new_from_root_pgid(pgid))
     }
 
-    pub(crate) fn root_id(&self) -> u64 {
-        self.0
+    pub(crate) fn get_root_pgid(&self) -> u64 {
+        self.root_pgid
     }
 
-    // ------------ Get ----------------------------------------------------------------------------
+    // ------------ Util ---------------------------------------------------------------------------
 
-    pub(crate) fn get<'tx, R: PgrReader<'tx>>(
-        &self, handle: &R, key: &[u8],
-    ) -> Result<Option<U64Entry>, PagerErr> {
-        let mut page_id = self.0;
+    fn traverse<'tx, R: PageReader<'tx>>(
+        &mut self, tx: &R, key: &[u8],
+    ) -> Result<TraversalRead<'tx>, PagerErr> {
+        let mut traversal = TraversalRead::new();
+        let mut next_pgid = self.root_pgid;
 
         loop {
-            let page = BtreePage::from_buffer_ref(handle.get_page_read(page_id)?.buf);
+            let rhdl = tx.get_page_read(next_pgid)?;
 
-            if page.is_leaf() {
-                return Ok(page.get(key));
-            }
-
-            page_id = page.get_traversal_next_page(key).unwrap().get();
-        }
-    }
-
-    // ------------ New ----------------------------------------------------------------------------
-
-    pub(crate) fn new<'tx, R: PgrReader<'tx> + PgrWriter<'tx>>(tx: &R) -> Result<Btree, PagerErr> {
-        let w_hdl = tx.get_page_alloc()?;
-        let page_id = w_hdl.get_page_id();
-        BtreePage::new_with_buffer(w_hdl.buf, PAGE_ID_NULL, BtreePageType::Leaf);
-        Ok(Self::from_root_id(page_id))
-    }
-
-    // ------------ Insert -------------------------------------------------------------------------
-
-    /*
-    pub(crate) fn insert_old<'tx, R: PgrReader<'tx> + PgrWriter<'tx>>(
-        &mut self, tx: &R, key: &[u8], value: U64Entry,
-    ) -> Result<(), PagerErr> {
-        let mut new_root_page_id = self.0;
-        let mut next_page_id = self.0;
-        let mut page_stack = FixedList::new();
-
-        loop {
-            let w_hdl = tx.get_page_write(next_page_id)?;
-            let curr_page_id = w_hdl.get_page_id();
-            let mut curr_page = BtreePage::from_buffer(w_hdl.buf);
-
-            if page_stack.len() == 0 {
-                // update root_id with the first page we touch (top)
-                new_root_page_id = curr_page_id;
-            }
-
-            if curr_page.is_leaf() {
-                // page.page_id.set(page_id);
-                let had_space = curr_page.insert(key, value);
-
-                if !had_space {
-                    let right_w_hdl = tx.get_page_alloc()?;
-                    let right_page_id = right_w_hdl.get_page_id();
-                    // this stuff will be correct assuming we dont split
-                    let mut right_page = BtreePage::new_with_buffer(
-                        right_w_hdl.buf,
-                        curr_page.parent_id.get(),
-                        curr_page.get_page_type(),
-                    );
-
-                    // redistribute and insert
-                    curr_page.redistribute_into(&mut right_page);
-                    if key < right_page.entry_at_slot(0).0 {
-                        curr_page.insert(key, value);
-                    } else {
-                        right_page.insert(key, value);
-                    }
-
-                    if curr_page.parent_id.get() == PAGE_ID_NULL {
-                        // if we are the root
-                        let parent_w_hdl = tx.get_page_alloc()?;
-                        let parent_page_id = parent_w_hdl.get_page_id();
-                        let mut parent_page = BtreePage::new_with_buffer(
-                            parent_w_hdl.buf,
-                            PAGE_ID_NULL,
-                            BtreePageType::Inner,
-                        );
-
-                        parent_page
-                            .insert_unordered(curr_page.entry_at_slot(0).0, curr_page_id.into());
-                        curr_page.parent_id.set(parent_page_id);
-
-                        parent_page
-                            .insert_unordered(right_page.entry_at_slot(0).0, right_page_id.into());
-                        right_page.parent_id.set(parent_page_id);
-
-                        new_root_page_id = parent_page_id;
-                    } else {
-                        // this is the case where we had a inner-node parent; we are not the root
-                        let parent_w_hdl = tx.get_page_write(curr_page.parent_id.get())?;
-                        let parent_page_id = parent_w_hdl.get_page_id();
-                        let mut parent_page = BtreePage::from_buffer(parent_w_hdl.buf);
-
-                        let had_space =
-                            parent_page.insert(right_page.entry_at_slot(0).0, right_page_id.into());
-                        if !had_space {
-                            todo!(
-                                "inner page {} already had {} entries",
-                                parent_page_id,
-                                parent_page.len()
-                            );
-                        }
-                    }
-                }
-
-                break;
-            } else {
-                next_page_id = curr_page.get_traversal_next_page(key).unwrap().get(); // todo
-                page_stack.push(curr_page_id);
-            }
-        }
-
-        let mut prev_page_id = PAGE_ID_NULL;
-        for page_id in &page_stack {
-            // this is just for setting parent-pointers
-            let w_hdl = tx.get_page_write(page_id)?;
-            let found_page_id = w_hdl.get_page_id();
-            assert!(page_id == found_page_id, "new pages should already be allocated");
-            let mut page = BtreePage::from_buffer(w_hdl.buf);
-            page.parent_id.set(prev_page_id);
-            prev_page_id = page_id;
-        }
-
-        self.0 = new_root_page_id;
-        Ok(())
-    }
-    */
-
-    pub(crate) fn insert<'tx, R: PgrReader<'tx> + PgrWriter<'tx>>(
-        &mut self, tx: &R, key: &[u8], pk: U64Entry,
-    ) -> Result<(), PagerErr> {
-        let mut traversal_path = FixedList::new();
-        let mut traversal_next_page_id = self.0;
-
-        loop {
-            let w_hdl = tx.get_page_write(traversal_next_page_id)?;
-            traversal_path.push(w_hdl.get_page_id());
-            let curr_page = BtreePage::from_buffer(w_hdl.buf);
+            let curr_page = BtreePage::from_buffer_ref(rhdl.buf);
 
             match curr_page.get_page_type() {
                 BtreePageType::Inner => {
-                    traversal_next_page_id = curr_page.get_traversal_next_page(key).unwrap().get();
+                    let (pgid_entry, slot) = curr_page.get_traversal_next_page(key).unwrap();
+                    next_pgid = pgid_entry.get();
+                    traversal.push((rhdl, slot));
                 }
                 BtreePageType::Leaf => {
+                    traversal.push((rhdl, SLOT_IDX_NULL));
                     break;
                 }
             }
         }
 
-        for page in &traversal_path {
-            eprintln!("-> {}", page);
+        Ok(traversal)
+    }
+
+    fn traverse_cow<'tx, R: PageReader<'tx> + PageWriter<'tx>>(
+        &mut self, tx: &R, key: &[u8],
+    ) -> Result<TraversalWrite<'tx>, PagerErr> {
+        let mut traversal = TraversalWrite::new();
+        let mut next_pgid = self.root_pgid;
+
+        loop {
+            let whdl = tx.get_page_write(next_pgid)?;
+
+            // fix parent_ptr
+            if traversal.len() > 0 {
+                let (mut parent_whdl, slot_idx) = traversal.last_mut();
+                let mut parent_page = BtreePage::from_buffer(parent_whdl.buf);
+                parent_page.overwrite_value_with_slot_index(slot_idx, whdl.get_pgid().into());
+            }
+
+            let curr_page = BtreePage::from_buffer(whdl.buf);
+
+            match curr_page.get_page_type() {
+                BtreePageType::Inner => {
+                    let (pgid_entry, slot) = curr_page.get_traversal_next_page(key).unwrap();
+                    next_pgid = pgid_entry.get();
+                    traversal.push((whdl, slot));
+                }
+                BtreePageType::Leaf => {
+                    traversal.push((whdl, SLOT_IDX_NULL));
+                    break;
+                }
+            }
         }
 
-        // try to insert into our found leaf
-        let (had_space, mut curr_page_id) = {
-            let leaf_page_id = traversal_path.pop().unwrap();
-            let w_hdl = tx.get_page_write(traversal_next_page_id)?;
-            let mut curr_page = BtreePage::from_buffer(w_hdl.buf);
-            (curr_page.insert(key, pk), leaf_page_id)
+        Ok(traversal)
+    }
+
+    // ------------ Get ----------------------------------------------------------------------------
+
+    #[must_use = "this fn has no side effects - why are you calling this?"]
+    pub(crate) fn get<'tx, R: PageReader<'tx>>(
+        &self, tx: &R, key: &[u8],
+    ) -> Result<Option<SerializedU64>, PagerErr> {
+        let mut next_pgid = self.root_pgid;
+
+        // not using `traverse`, because theres no need to keep the other pages pinned
+        loop {
+            let page = BtreePage::from_buffer_ref(tx.get_page_read(next_pgid)?.buf);
+            if page.is_leaf() {
+                return Ok(page.get(key));
+            }
+            next_pgid = page.get_traversal_next_page(key).unwrap().0.get();
+        }
+    }
+
+    #[must_use = "this fn has no side effects - why are you calling this?"]
+    pub(crate) fn get_min<'tx, R: PageReader<'tx>>(
+        &self, tx: &R,
+    ) -> Result<Option<SerializedU64>, PagerErr> {
+        let mut next_pgid = self.root_pgid;
+
+        loop {
+            let page = BtreePage::from_buffer_ref(tx.get_page_read(next_pgid)?.buf);
+            if page.len() == 0 {
+                // todo - shouldnt be possible once delete is working correctly
+                // actually, with a brand new root its possible, nvm maybe
+                return Ok(None);
+            }
+            if page.is_leaf() {
+                return Ok(Some(page.entry_at_slot(0).1));
+            }
+            next_pgid = page.entry_at_slot(0).1.get()
+        }
+    }
+
+    #[must_use = "this fn has no side effects - why are you calling this?"]
+    pub(crate) fn get_max<'tx, R: PageReader<'tx>>(
+        &self, tx: &R,
+    ) -> Result<Option<SerializedU64>, PagerErr> {
+        let mut next_pgid = self.root_pgid;
+
+        loop {
+            let page = BtreePage::from_buffer_ref(tx.get_page_read(next_pgid)?.buf);
+            if page.len() == 0 {
+                // todo - shouldnt be possible once delete is working correctly
+                // actually, with a brand new root its possible, nvm maybe
+                return Ok(None);
+            }
+            if page.is_leaf() {
+                return Ok(Some(page.entry_at_slot(page.len() - 1).1));
+            }
+            next_pgid = page.entry_at_slot(page.len() - 1).1.get()
+        }
+    }
+
+    // ------------ Insert -------------------------------------------------------------------------
+
+    pub(crate) fn insert<'tx, R: PageReader<'tx> + PageWriter<'tx>>(
+        &mut self, tx: &R, key: &[u8], val: impl Into<SerializedU64>,
+    ) -> Result<(), PagerErr> {
+        let val = val.into();
+
+        let traversal = self.traverse_cow(tx, key)?;
+
+        let had_space = {
+            let (mut leaf, _) = traversal.last_mut();
+            let mut curr_page = BtreePage::from_buffer(leaf.buf);
+            curr_page.insert(key, val)
         };
 
-        if !had_space {
-            todo!()
+        if had_space {
+            // if we had space to insert we just are good
+            self.root_pgid = traversal.index_ref(0).0.get_pgid();
+            return Ok(());
         }
 
-        // repair parent-ptrs
-        while let Some(parent_page_id) = traversal_path.pop() {
-            let w_hdl = tx.get_page_write(curr_page_id)?;
-            let mut curr_page = BtreePage::from_buffer(w_hdl.buf);
-            curr_page.parent_id.set(parent_page_id);
-            curr_page_id = parent_page_id;
+        // we have to split our leaf node
+
+        let (mut left_whdl, _) = traversal.last_mut();
+        let mut right_whdl = tx.get_page_alloc()?;
+        redistribute(&mut left_whdl, &mut right_whdl, key, val);
+
+        // we have to (maybe) propogate our split
+
+        let mut traversal_idx = traversal.len() - 1;
+        while traversal_idx > 0 {
+            // theres a page above us
+            // we will decrement our traversal_idx and fetch that page
+
+            traversal_idx -= 1;
+            let (mut parent_whdl, _) = traversal.index_mut(traversal_idx);
+            let had_space = insert_child_ptr(&mut parent_whdl, &mut right_whdl);
+
+            if had_space {
+                drop(parent_whdl); // drop RefCell RefMut incase it was root
+                self.root_pgid = traversal.index_ref(0).0.get_pgid();
+                return Ok(());
+            } else {
+                let mut right_parent_whdl = tx.get_page_alloc()?;
+                redistribute_with_child_ptr(&mut parent_whdl, &mut right_parent_whdl, &right_whdl);
+                left_whdl = parent_whdl;
+                right_whdl = right_parent_whdl;
+            }
         }
 
-        self.0 = curr_page_id;
-        Ok(())
+        // if we havent returned by now, we need to make a new root, because we split the previous
+        // layer which WAS the root
+
+        let mut root_whdl = tx.get_page_alloc()?;
+        BtreePage::new_with_buffer(root_whdl.buf, BtreePageType::Inner);
+        insert_child_ptr(&mut root_whdl, &mut left_whdl);
+        insert_child_ptr(&mut root_whdl, &mut right_whdl);
+
+        self.root_pgid = root_whdl.get_pgid();
+        return Ok(());
     }
 
     // ------------ Delete -------------------------------------------------------------------------
-    // pub(crate) fn delete( key: &[u8]) -> U64Entry {
-    //     todo!()
-    // }
+
+    pub(crate) fn delete<'tx, R: PageReader<'tx> + PageWriter<'tx>>(
+        &mut self, tx: &R, key: &[u8],
+    ) -> Result<(), PagerErr> {
+        // TODO
+        let traversal = self.traverse_cow(tx, key)?;
+
+        let page_full_enough = {
+            let (mut leaf, _) = traversal.last_mut();
+            let (page_full_enough, page_empty) = {
+                let mut curr_page = BtreePage::from_buffer(leaf.buf);
+                curr_page.delete(key);
+                (curr_page.is_half_full_or_more(), curr_page.len() == 0)
+            };
+
+            page_full_enough
+        };
+
+        if true || page_full_enough {
+            // if we had space to insert we just are good
+            self.root_pgid = traversal.index_ref(0).0.get_pgid();
+            return Ok(());
+        }
+
+        todo!()
+    }
 }
 
 // -------------------------------------------------------------------------------------------------
-// *            Page traversal list                                                                *
+// *            Helpers                                                                            *
 // -------------------------------------------------------------------------------------------------
 
-const STACK_SIZE: usize = 62; // covers any traversal no matter how pathologically bad
-struct FixedList {
+/// these pages should be initialized
+fn insert_child_ptr(parent_whdl: &mut WrHdl<'_>, child_whdl: &mut WrHdl<'_>) -> bool {
+    // insert split leafs into new root
+    let child_pgid = child_whdl.get_pgid();
+    let child_page = BtreePage::from_buffer(child_whdl.buf);
+    let mut parent_page = BtreePage::from_buffer(parent_whdl.buf);
+    parent_page.insert(child_page.entry_at_slot(0).0, child_pgid.into())
+}
+
+/// left should be initialized, right should NOT be initiliazed
+fn redistribute(
+    left_whdl: &mut WrHdl<'_>, right_whdl: &mut WrHdl<'_>, key: &[u8], pk: SerializedU64,
+) {
+    let mut left = BtreePage::from_buffer(left_whdl.buf);
+    let mut right = BtreePage::new_with_buffer(right_whdl.buf, left.get_page_type());
+    left.redistribute_into(&mut right);
+    if key < right.entry_at_slot(0).0 {
+        let _had_space = left.insert(key, pk);
+        mooo_assert!(_had_space);
+    } else {
+        let _had_space = right.insert(key, pk);
+        mooo_assert!(_had_space);
+    }
+}
+
+/// exact same as `redistribute` except it automatically gets key + pk from a `child_whdl` page
+fn redistribute_with_child_ptr(
+    left_whdl: &mut WrHdl<'_>, right_whdl: &mut WrHdl<'_>, child_whdl: &WrHdl<'_>,
+) {
+    let child_pgid = child_whdl.get_pgid();
+    let child_page = BtreePage::from_buffer_ref(child_whdl.buf);
+    redistribute(left_whdl, right_whdl, child_page.entry_at_slot(0).0, child_pgid.into());
+}
+
+// ------------ Page traversal list ----------------------------------------------------------------
+
+type TraversalWrite<'a> = _Traversal<WrHdl<'a>>;
+type TraversalRead<'a> = _Traversal<RdHdl<'a>>;
+
+const STACK_SIZE: usize = 48;
+struct _Traversal<T> {
     head: usize,
-    arr:  [MaybeUninit<u64>; STACK_SIZE],
+    arr:  [MaybeUninit<(RefCell<T>, u16)>; STACK_SIZE],
 }
 
-impl FixedList {
+impl<T> _Traversal<T> {
     fn new() -> Self {
         Self { arr: [const { MaybeUninit::uninit() }; STACK_SIZE], head: 0 }
     }
 
-    fn push(&mut self, item: u64) {
+    /// this should be the slot-index in the corresponding WrHdl page's parent
+    fn push(&mut self, item: (T, u16)) {
         mooo_assert!(self.head < STACK_SIZE);
-        self.arr[self.head] = MaybeUninit::new(item);
+        self.arr[self.head] = MaybeUninit::new((RefCell::new(item.0), item.1));
         self.head += 1;
     }
 
-    fn pop(&mut self) -> Option<u64> {
-        if self.head == 0 {
-            None
-        } else {
-            self.head -= 1;
-            Some(unsafe { self.arr[self.head].assume_init() })
-        }
+    fn index_ref<'b>(&'b self, index: usize) -> (Ref<'b, T>, u16) {
+        mooo_assert!(index < self.head);
+        let entry = unsafe { self.arr[index].assume_init_ref() };
+        (entry.0.borrow(), entry.1)
+    }
+
+    fn index_mut<'b>(&'b self, index: usize) -> (RefMut<'b, T>, u16) {
+        mooo_assert!(index < self.head);
+        let entry = unsafe { self.arr[index].assume_init_ref() };
+        (entry.0.borrow_mut(), entry.1)
+    }
+
+    fn last_ref<'b>(&'b self) -> (Ref<'b, T>, u16) {
+        self.index_ref(self.head - 1)
+    }
+
+    fn last_mut<'b>(&'b self) -> (RefMut<'b, T>, u16) {
+        self.index_mut(self.head - 1)
     }
 
     fn len(&self) -> usize {
@@ -242,29 +340,10 @@ impl FixedList {
     }
 }
 
-struct FixedListIter<'a> {
-    front: usize,
-    list:  &'a FixedList,
-}
-
-impl<'a> IntoIterator for &'a FixedList {
-    type Item = u64;
-    type IntoIter = FixedListIter<'a>;
-
-    fn into_iter(self) -> FixedListIter<'a> {
-        FixedListIter { front: 0, list: self }
-    }
-}
-
-impl Iterator for FixedListIter<'_> {
-    type Item = u64;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        if self.front == self.list.head {
-            return None;
+impl<T> Drop for _Traversal<T> {
+    fn drop(&mut self) {
+        for i in 0..self.len() {
+            unsafe { self.arr[i].assume_init_drop() };
         }
-        let i = self.front;
-        self.front += 1;
-        Some(unsafe { self.list.arr[i].assume_init() })
     }
 }

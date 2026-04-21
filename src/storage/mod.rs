@@ -3,35 +3,45 @@
 //! ▄▀▀▀█▄ ▐█.▪ ▄█▀▄ ▐▀▀▄ ▄█▀▀█ ▄█ ▀█▄▐▀▀▪▄
 //! ▐█▄▪▐█ ▐█▌·▐█▌.▐▌▐█•█▌▐█ ▪▐▌▐█▄▪▐█▐█▄▄▌
 //!  ▀▀▀▀  ▀▀▀  ▀█▄▀▪.▀  ▀ ▀  ▀ ·▀▀▀▀  ▀▀▀
-mod btree;
 mod page_base;
 mod page_btree;
+mod page_heap;
 mod page_superblock;
-mod pager;
 mod serialization;
+
+mod btree;
+mod heap;
+mod manager;
+mod pager;
 
 #[cfg(test)]
 mod test;
 
+use crate::mooo_assert;
+pub(crate) use page_btree::BTREE_KEY_MAX_LEN;
 use pager::*;
 
-use crate::mooo_assert;
 const PAGE_SIZE: usize = 256;
-const PAGE_ID_NULL: u64 = u64::MAX;
+const PGID_NULL: u64 = u64::MAX;
+
+const fn pgid_valid(pgid: u64) -> bool {
+    const _PGID_MAX: u64 = (1 << 48) - 1;
+    pgid <= _PGID_MAX
+}
 
 /// MurmurHash3
-const fn hash_u64_modulo(mut page_id: u64, modulo: usize) -> usize {
+const fn hash_u64_modulo(mut pgid: u64, modulo: usize) -> usize {
     mooo_assert!(modulo & (modulo - 1) == 0, "modulo must be power of 2");
-    page_id ^= page_id >> 33;
-    page_id = page_id.wrapping_mul(0xff51_afd7_ed55_8ccd);
-    page_id ^= page_id >> 33;
-    page_id = page_id.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
-    page_id ^= page_id >> 33;
-    (page_id as usize) & (modulo - 1)
+    pgid ^= pgid >> 33;
+    pgid = pgid.wrapping_mul(0xff51_afd7_ed55_8ccd);
+    pgid ^= pgid >> 33;
+    pgid = pgid.wrapping_mul(0xc4ce_b9fe_1a85_ec53);
+    pgid ^= pgid >> 33;
+    (pgid as usize) & (modulo - 1)
 }
 
 /// crc32c
-const fn compute_checksum(bytes: &[u8]) -> u64 {
+const fn compute_checksum(bytes: &[u8]) -> u32 {
     const _CRC32C_TABLE: [u32; 256] = {
         let mut table = [0u32; 256];
         let mut i = 0;
@@ -59,5 +69,5 @@ const fn compute_checksum(bytes: &[u8]) -> u64 {
         crc = (crc >> 8) ^ _CRC32C_TABLE[idx];
         i += 1;
     }
-    (crc as u64 ^ 0xffff_ffff) << 32
+    crc ^ 0xffff_ffff
 }

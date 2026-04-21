@@ -4,8 +4,8 @@ use crate::mooo_assert;
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(transparent)]
-pub(super) struct SerializedU64([u8; 8]);
-unsafe impl ByteToFrom for SerializedU64 {}
+pub(super) struct SerializedU64(pub(super) [u8; 8]);
+unsafe impl Serialized for SerializedU64 {}
 
 impl PartialOrd for SerializedU64 {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
@@ -43,8 +43,47 @@ impl AddAssign<u64> for SerializedU64 {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(transparent)]
+pub(super) struct SerializedU32([u8; 4]);
+unsafe impl Serialized for SerializedU32 {}
+
+impl PartialOrd for SerializedU32 {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SerializedU32 {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.get().cmp(&other.get())
+    }
+}
+
+impl SerializedU32 {
+    pub(super) const fn get(&self) -> u32 {
+        u32::from_be_bytes(self.0)
+    }
+
+    pub(super) fn set(&mut self, val: u32) {
+        self.0 = val.to_be_bytes();
+    }
+}
+
+impl From<u32> for SerializedU32 {
+    fn from(v: u32) -> Self {
+        Self(v.to_be_bytes())
+    }
+}
+
+impl AddAssign<u32> for SerializedU32 {
+    fn add_assign(&mut self, rhs: u32) {
+        self.set(self.get() + rhs);
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(transparent)]
 pub(super) struct SerializedU16([u8; 2]);
-unsafe impl ByteToFrom for SerializedU16 {}
+unsafe impl Serialized for SerializedU16 {}
 
 impl PartialOrd for SerializedU16 {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
@@ -74,9 +113,11 @@ impl From<u16> for SerializedU16 {
     }
 }
 
+/// A type that is serializable, and resides on disk, or chaced pages, or network packet, in
+/// serialized form.
 /// # SAFETY
 /// POD `#[repr(C)]` or `#[repr(transparent)]` only!!
-pub(super) unsafe trait ByteToFrom: Sized {
+pub(super) unsafe trait Serialized: Sized {
     fn as_bytes(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self as *const Self as *const u8, size_of::<Self>()) }
     }

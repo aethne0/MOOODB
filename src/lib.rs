@@ -36,3 +36,7 @@
 pub mod assert;
 pub mod storage;
 pub mod sync;
+
+// TODO
+// 1. in page-base we are using read_u16 etc - we should be using our serialized types
+// 2. metrics: rare frog event counter

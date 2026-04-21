@@ -1,5 +1,4 @@
 /target
-.session.vim
-.vscode/
-.notes/
+.*
+.*/
 Cargo.lock
