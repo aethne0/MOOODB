@@ -1,8 +1,9 @@
 use std::ops::Bound;
 use std::ops::RangeBounds;
 
-use zerocopy::big_endian;
-
+use super::serialization::ByteToFrom;
+use super::serialization::SerializedU16;
+use super::serialization::SerializedU64;
 use super::PAGE_SIZE;
 
 // we have some placeholder IDs to mean different things
@@ -16,20 +17,9 @@ pub(super) const PAGE_HEADER_SIZE: u16 = 0x40;
 
 // --- IdEntry ---
 
-#[derive(
-    Debug,
-    Clone,
-    Copy,
-    PartialEq,
-    Eq,
-    PartialOrd,
-    Ord,
-    zerocopy::FromBytes,
-    zerocopy::IntoBytes,
-    zerocopy::Immutable,
-    zerocopy::KnownLayout,
-)]
-pub(super) struct U64Entry(big_endian::U64);
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+#[repr(transparent)]
+pub(super) struct U64Entry(SerializedU64); // TODO 48+16 entry for heap-ids
 impl U64Entry {
     pub(super) const SIZE_U16: u16 = size_of::<Self>() as u16;
 
@@ -38,7 +28,7 @@ impl U64Entry {
     }
 
     pub(super) fn as_bytes(&self) -> &[u8] {
-        zerocopy::IntoBytes::as_bytes(self)
+        ByteToFrom::as_bytes(self)
     }
 }
 
@@ -50,20 +40,17 @@ impl From<u64> for U64Entry {
 
 impl From<&[u8]> for U64Entry {
     fn from(value: &[u8]) -> Self {
-        zerocopy::FromBytes::read_from_bytes(&value[..size_of::<Self>()])
-            .expect("couldnt deserialize U64Entry")
+        Self::read_from_bytes(&value[..size_of::<Self>()])
     }
 }
 
 // --- Free-page Entry ---
 
-#[derive(
-    Clone, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout,
-)]
+#[derive(Clone)]
 #[repr(C)]
 pub(super) struct FreeEntry {
-    tx_id:   big_endian::U64,
-    page_id: big_endian::U64,
+    tx_id:   SerializedU64,
+    page_id: SerializedU64,
 }
 
 /// The first 32 bytes of **every** page on disk, regardless of page type.
@@ -79,14 +66,12 @@ pub(super) struct FreeEntry {
 /// offset 16 | tx_id      u64
 /// offset 24 | <reserved> u64
 /// ```
-#[derive(
-    Clone, zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout,
-)]
+#[derive(Clone)]
 #[repr(C)]
 pub(super) struct PagePrefix {
-    pub(super) checksum: big_endian::U64,
-    pub(super) page_id:  big_endian::U64,
-    pub(super) tx_id:    big_endian::U64,
+    pub(super) checksum: SerializedU64,
+    pub(super) page_id:  SerializedU64,
+    pub(super) tx_id:    SerializedU64,
     pub(super) dbg_pad:  [u8; 8],
 }
 const _: () = assert!(size_of::<PagePrefix>() == 32);
@@ -130,21 +115,25 @@ where
     }
 }
 
-#[derive(zerocopy::FromBytes, zerocopy::IntoBytes, zerocopy::Immutable, zerocopy::KnownLayout)]
 #[repr(C)]
 pub(super) struct PageHeader {
     pub(super) prefix: PagePrefix,
 
-    pub(super) page_flags: big_endian::U16,
-    pub(super) upper_ptr:  big_endian::U16,
-    pub(super) free_bytes: big_endian::U16,
-    pub(super) lower_ptr:  big_endian::U16,
+    pub(super) page_flags: SerializedU16,
+    pub(super) upper_ptr:  SerializedU16,
+    pub(super) free_bytes: SerializedU16,
+    pub(super) lower_ptr:  SerializedU16,
 
-    pub(super) parent_id: big_endian::U64,
+    pub(super) parent_id: SerializedU64,
 
     _pad: [u8; 16],
 }
 const _: () = assert!(size_of::<PageHeader>() == PAGE_HEADER_SIZE as usize);
+
+unsafe impl ByteToFrom for U64Entry {}
+unsafe impl ByteToFrom for FreeEntry {}
+unsafe impl ByteToFrom for PagePrefix {}
+unsafe impl ByteToFrom for PageHeader {}
 
 /*
 impl std::ops::Deref for PageHeader {
@@ -184,15 +173,13 @@ impl<'b> BasePage<&'b [u8; PAGE_SIZE]> {
 impl<Buf: AsRef<[u8]>> std::ops::Deref for BasePage<Buf> {
     type Target = PageHeader;
     fn deref(&self) -> &Self::Target {
-        zerocopy::FromBytes::ref_from_bytes(&self.raw.as_ref()[..PAGE_HEADER_SIZE as usize])
-            .expect("page buffer must be large enough for header")
+        PageHeader::ref_from_bytes(&self.raw.as_ref()[..PAGE_HEADER_SIZE as usize])
     }
 }
 
 impl<Buf: AsRef<[u8]> + AsMut<[u8]>> std::ops::DerefMut for BasePage<Buf> {
     fn deref_mut(&mut self) -> &mut Self::Target {
-        zerocopy::FromBytes::mut_from_bytes(&mut self.raw.as_mut()[..PAGE_HEADER_SIZE as usize])
-            .expect("page buffer must be large enough for header")
+        PageHeader::mut_from_bytes(&mut self.raw.as_mut()[..PAGE_HEADER_SIZE as usize])
     }
 }
 

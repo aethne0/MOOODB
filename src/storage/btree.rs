@@ -1,5 +1,6 @@
 use std::mem::MaybeUninit;
 
+use crate::mooo_assert;
 use crate::storage::page_btree::BtreePageType;
 
 use super::page_base::U64Entry;
@@ -51,12 +52,12 @@ impl Btree {
 
     // ------------ Insert -------------------------------------------------------------------------
 
-    pub(crate) fn insert<'tx, R: PgrReader<'tx> + PgrWriter<'tx>>(
+    pub(crate) fn insert_old<'tx, R: PgrReader<'tx> + PgrWriter<'tx>>(
         &mut self, tx: &R, key: &[u8], value: U64Entry,
     ) -> Result<(), PagerErr> {
         let mut new_root_page_id = self.0;
         let mut next_page_id = self.0;
-        let mut page_stack = PageStack::new();
+        let mut page_stack = FixedList::new();
 
         loop {
             let w_hdl = tx.get_page_write(next_page_id)?;
@@ -82,10 +83,15 @@ impl Btree {
                         curr_page.get_page_type(),
                     );
 
-                    // redistribute
+                    // redistribute and insert
                     curr_page.redistribute_into(&mut right_page);
+                    if key < right_page.entry_at_slot(0).0 {
+                        curr_page.insert(key, value);
+                    } else {
+                        right_page.insert(key, value);
+                    }
 
-                    if curr_page.parent_id == PAGE_ID_NULL {
+                    if curr_page.parent_id.get() == PAGE_ID_NULL {
                         // if we are the root
                         let parent_w_hdl = tx.get_page_alloc()?;
                         let parent_page_id = parent_w_hdl.get_page_id();
@@ -130,7 +136,7 @@ impl Btree {
         }
 
         let mut prev_page_id = PAGE_ID_NULL;
-        for page_id in page_stack {
+        for page_id in &page_stack {
             // this is just for setting parent-pointers
             let w_hdl = tx.get_page_write(page_id)?;
             let found_page_id = w_hdl.get_page_id();
@@ -144,6 +150,55 @@ impl Btree {
         Ok(())
     }
 
+    pub(crate) fn insert<'tx, R: PgrReader<'tx> + PgrWriter<'tx>>(
+        &mut self, tx: &R, key: &[u8], pk: U64Entry,
+    ) -> Result<(), PagerErr> {
+        let mut traversal_path = FixedList::new();
+        let mut traversal_next_page_id = self.0;
+
+        loop {
+            let w_hdl = tx.get_page_write(traversal_next_page_id)?;
+            traversal_path.push(w_hdl.get_page_id());
+            let curr_page = BtreePage::from_buffer(w_hdl.buf);
+
+            match curr_page.get_page_type() {
+                BtreePageType::Inner => {
+                    traversal_next_page_id = curr_page.get_traversal_next_page(key).unwrap().get();
+                }
+                BtreePageType::Leaf => {
+                    break;
+                }
+            }
+        }
+
+        for page in &traversal_path {
+            eprintln!("-> {}", page);
+        }
+
+        // try to insert into our found leaf
+        let (had_space, mut curr_page_id) = {
+            let leaf_page_id = traversal_path.pop().unwrap();
+            let w_hdl = tx.get_page_write(traversal_next_page_id)?;
+            let mut curr_page = BtreePage::from_buffer(w_hdl.buf);
+            (curr_page.insert(key, pk), leaf_page_id)
+        };
+
+        if !had_space {
+            todo!()
+        }
+
+        // repair parent-ptrs
+        while let Some(parent_page_id) = traversal_path.pop() {
+            let w_hdl = tx.get_page_write(curr_page_id)?;
+            let mut curr_page = BtreePage::from_buffer(w_hdl.buf);
+            curr_page.parent_id.set(parent_page_id);
+            curr_page_id = parent_page_id;
+        }
+
+        self.0 = curr_page_id;
+        Ok(())
+    }
+
     // ------------ Delete -------------------------------------------------------------------------
     // pub(crate) fn delete( key: &[u8]) -> U64Entry {
     //     todo!()
@@ -154,22 +209,30 @@ impl Btree {
 // *            Page traversal list                                                                *
 // -------------------------------------------------------------------------------------------------
 
-const STACK_SIZE: usize = 16;
-struct PageStack {
-    arr:   [MaybeUninit<u64>; STACK_SIZE],
-    front: usize,
-    head:  usize,
+const STACK_SIZE: usize = 62; // covers any traversal no matter how pathologically bad
+struct FixedList {
+    head: usize,
+    arr:  [MaybeUninit<u64>; STACK_SIZE],
 }
 
-impl PageStack {
+impl FixedList {
     fn new() -> Self {
-        Self { arr: [const { MaybeUninit::uninit() }; STACK_SIZE], front: 0, head: 0 }
+        Self { arr: [const { MaybeUninit::uninit() }; STACK_SIZE], head: 0 }
     }
 
     fn push(&mut self, item: u64) {
-        assert!(self.head < STACK_SIZE);
+        mooo_assert!(self.head < STACK_SIZE);
         self.arr[self.head] = MaybeUninit::new(item);
         self.head += 1;
+    }
+
+    fn pop(&mut self) -> Option<u64> {
+        if self.head == 0 {
+            None
+        } else {
+            self.head -= 1;
+            Some(unsafe { self.arr[self.head].assume_init() })
+        }
     }
 
     fn len(&self) -> usize {
@@ -177,15 +240,29 @@ impl PageStack {
     }
 }
 
-impl Iterator for PageStack {
+struct FixedListIter<'a> {
+    front: usize,
+    list:  &'a FixedList,
+}
+
+impl<'a> IntoIterator for &'a FixedList {
+    type Item = u64;
+    type IntoIter = FixedListIter<'a>;
+
+    fn into_iter(self) -> FixedListIter<'a> {
+        FixedListIter { front: 0, list: self }
+    }
+}
+
+impl Iterator for FixedListIter<'_> {
     type Item = u64;
 
     fn next(&mut self) -> Option<Self::Item> {
-        if self.front == self.head {
+        if self.front == self.list.head {
             return None;
         }
         let i = self.front;
         self.front += 1;
-        Some(unsafe { std::mem::replace(&mut self.arr[i], MaybeUninit::uninit()).assume_init() })
+        Some(unsafe { self.list.arr[i].assume_init() })
     }
 }

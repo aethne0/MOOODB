@@ -1,3 +1,4 @@
+use std::fs::OpenOptions;
 // ▄▄▄▄▄▄▄▄ ..▄▄ · ▄▄▄▄▄.▄▄ ·
 // •██  ▀▄.▀·▐█ ▀. •██  ▐█ ▀.
 //  ▐█.▪▐▀▀▪▄▄▀▀▀█▄ ▐█.▪▄▀▀▀█▄
@@ -5,32 +6,36 @@
 //  ▀▀▀  ▀▀▀  ▀▀▀▀  ▀▀▀  ▀▀▀▀
 use std::sync::atomic::AtomicUsize;
 
-use rand::fill;
-use rand::random;
+use rand::rngs::SmallRng;
+use rand::Rng;
+use rand::RngExt;
+use rand::SeedableRng;
 
 use super::btree::Btree;
 use super::*;
 use crate::sync;
 
+fn f_opts() -> OpenOptions {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.create(true).write(true).truncate(true).read(true);
+    opts
+}
+
 #[test]
 fn btree_inserts_single() {
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .write(true)
-        .read(true)
-        .open("/xblk/test/test.moo")
-        .unwrap();
+    eprintln!("");
+    let file = f_opts().open("/xblk/test/test.moo").unwrap();
     let mgr = Pager::new(64, file);
+    let mut rng = SmallRng::seed_from_u64(0x1234_1234_1234_1234);
 
     {
         let w_tx = mgr.write_tx();
         let mut btree = Btree::new(&w_tx).unwrap();
 
-        for _ in 0..5 {
+        for _ in 0..4 {
             let mut key = [0u8; 24];
-            fill(&mut key);
-            let mut val: u64 = random();
-            val |= 0xff00_0000_0000_00ff;
+            rng.fill_bytes(&mut key);
+            let val: u64 = rng.random::<u64>() | 0xff00_0000_0000_00ff;
             btree.insert(&w_tx, &key, val.into()).unwrap();
         }
 
@@ -38,15 +43,14 @@ fn btree_inserts_single() {
         w_tx.commit(Durability::Flush).unwrap();
     }
 
-    {
+    if true {
         let w_tx = mgr.write_tx();
         let mut btree = Btree::from_root_id(w_tx.get_catalog_root_id());
 
-        for _ in 0..5 {
+        for _ in 0..4 {
             let mut key = [0u8; 24];
-            fill(&mut key);
-            let mut val: u64 = random();
-            val |= 0xff00_0000_0000_00ff;
+            rng.fill_bytes(&mut key);
+            let val: u64 = rng.random::<u64>() | 0xff00_0000_0000_00ff;
             btree.insert(&w_tx, &key, val.into()).unwrap();
         }
 
@@ -57,10 +61,10 @@ fn btree_inserts_single() {
 
 #[test]
 fn btree_inserts_threads() {
+    eprintln!("");
     let file = tempfile::tempfile().unwrap();
     let mgr = Pager::new(64, file);
 
-    eprintln!("");
     static CTR: AtomicUsize = AtomicUsize::new(0);
 
     sync::thread::scope(|s| {

@@ -6,16 +6,15 @@ use std::mem::offset_of;
 use std::ops::AddAssign;
 use std::os::unix::fs::FileExt;
 
-use xxhash_rust::xxh3;
-use zerocopy::FromBytes;
-use zerocopy::FromZeros;
-use zerocopy::IntoBytes;
-
 use super::page_base::PagePrefix;
+use super::page_superblock::copy_superblock_to_page;
 use super::page_superblock::SuperblockHeader;
+use super::serialization::ByteToFrom;
 use super::PAGE_ID_NULL;
 use super::PAGE_SIZE;
 use crate::mooo_assert;
+use crate::storage::compute_checksum;
+use crate::storage::hash_u64_modulo;
 use crate::sync::*;
 
 #[repr(align(4096))]
@@ -65,29 +64,44 @@ impl Pager {
             curr_superblock: RwLock::new(temp_header),
         };
 
-        let superblock_page_id = 0;
         // page 0&1 are reserved for superblocks
-        let next_page_id = 2;
+        let superblock_page_id = 0;
+        let next_superblock_page_id = superblock_page_id + 1;
+        let next_page_id = next_superblock_page_id + 1;
 
-        let mut w_hdl = pgr
-            .get_page_write(superblock_page_id, false)
-            .expect("io error on superblock initialization");
+        {
+            // write empty second superblock
+            let mut w_hdl = pgr
+                .get_page_write(next_superblock_page_id, false)
+                .expect("io error on superblock initialization");
+            w_hdl.buf.fill(0);
+            pgr.io_write(&mut w_hdl, 0).expect("io error on superblock initialization");
+        }
 
-        let superblock_header = SuperblockHeader {
-            prefix:             PagePrefix::new(superblock_page_id, 0, FIRST_TX_ID),
-            version:            0x766572_00_0000_0001.into(),
-            page_size:          (PAGE_SIZE as u16).into(),
-            catalog_head_id:    PAGE_ID_NULL.into(),
-            alloc_free_head_id: PAGE_ID_NULL.into(),
-            alloc_bump_next_id: next_page_id.into(),
-            _pad:               [0; 62],
+        let header = {
+            // write actua first superblock
+            let mut w_hdl = pgr
+                .get_page_write(superblock_page_id, false)
+                .expect("io error on superblock initialization");
+
+            let superblock_header = SuperblockHeader {
+                prefix:             PagePrefix::new(superblock_page_id, 0, FIRST_TX_ID),
+                version:            0x766572_00_0000_0001.into(),
+                page_size:          (PAGE_SIZE as u16).into(),
+                catalog_head_id:    PAGE_ID_NULL.into(),
+                alloc_free_head_id: PAGE_ID_NULL.into(),
+                alloc_bump_next_id: next_page_id.into(),
+                _pad:               [0; 62],
+            };
+
+            copy_superblock_to_page(w_hdl.buf, &superblock_header);
+            pgr.io_write(&mut w_hdl, FIRST_TX_ID).expect("io error on superblock initialization");
+            superblock_header
         };
 
-        copy_superblock_to_page(w_hdl.buf, &superblock_header);
-        pgr.io_write(&mut w_hdl, FIRST_TX_ID).expect("couldnt initialize superblock to disk");
-        drop(w_hdl);
+        pgr.file.sync_all().expect("io error on superblock initialization");
 
-        pgr.curr_superblock.write().unwrap().clone_from(&superblock_header);
+        pgr.curr_superblock.write().unwrap().clone_from(&header);
         pgr
     }
 
@@ -155,8 +169,8 @@ impl Pager {
         mooo_assert!(w_hdl.get_page_id() != PAGE_ID_NULL);
 
         let page_id = w_hdl.get_page_id();
-        let checksum = xxh3::xxh3_64(&w_hdl.buf[offset_of!(PagePrefix, page_id)..]);
-        let header = PagePrefix::mut_from_prefix(w_hdl.buf).unwrap().0;
+        let checksum = compute_checksum(&w_hdl.buf[offset_of!(PagePrefix, page_id)..]);
+        let header = PagePrefix::mut_from_prefix(w_hdl.buf);
         header.checksum.set(checksum);
         header.page_id.set(page_id);
         header.tx_id.set(tx_id);
@@ -210,7 +224,7 @@ impl Pager {
     #[must_use = "RAII RdHdl releases when dropped"]
     fn get_page_read(&self, page_id: u64) -> Result<RdHdl<'_>, PagerErr> {
         loop {
-            let mut dir = self.shard_dirs[shard_hash(page_id)].lock().unwrap();
+            let mut dir = self.shard_dirs[hash_u64_modulo(page_id, SHARD_CNT)].lock().unwrap();
 
             match dir.get(&page_id) {
                 Some(&frame_index) => match self.try_pin_read(frame_index, page_id) {
@@ -244,7 +258,8 @@ impl Pager {
                     // It is ok if threads find this page before we do this, because we are holding the
                     // loading lock, and once we release it they will see the new (to them unexpected)
                     // page_id and they'll retry
-                    let mut old_dir = self.shard_dirs[shard_hash(frame_page_id)].lock().unwrap();
+                    let mut old_dir =
+                        self.shard_dirs[hash_u64_modulo(frame_page_id, SHARD_CNT)].lock().unwrap();
                     old_dir.remove(&frame_page_id);
                     drop(old_dir);
 
@@ -260,7 +275,7 @@ impl Pager {
 
     #[must_use = "RAII WrHdl releases when dropped"]
     fn get_page_write(&self, page_id: u64, should_load: bool) -> Result<WrHdl<'_>, PagerErr> {
-        let mut dir = self.shard_dirs[shard_hash(page_id)].lock().unwrap();
+        let mut dir = self.shard_dirs[hash_u64_modulo(page_id, SHARD_CNT)].lock().unwrap();
 
         match dir.get(&page_id) {
             Some(&frame_index) => {
@@ -281,7 +296,8 @@ impl Pager {
                 dir.insert(page_id, w_hdl.frame.index);
                 drop(dir);
 
-                let mut old_dir = self.shard_dirs[shard_hash(frame_page_id)].lock().unwrap();
+                let mut old_dir =
+                    self.shard_dirs[hash_u64_modulo(frame_page_id, SHARD_CNT)].lock().unwrap();
                 old_dir.remove(&frame_page_id);
                 drop(old_dir);
 
@@ -459,7 +475,12 @@ pub(super) trait PgrReader<'tx> {
 }
 
 pub(super) trait PgrWriter<'tx> {
+    /// This will give out a writeable frame with a new, free page_id
     fn get_page_alloc(&self) -> Result<WrHdl<'tx>, PagerErr>;
+    /// This will give a writeable page from a requested `page_id`, which can mean one of two things
+    /// 1. This page_id is from a prev tx, in which case we will copy `page_id`'s frame's contents
+    ///    to a new page, and return that new page
+    /// 2. This `page_id` is from the current tx, in which case well return that `page_id`'s frame
     fn get_page_write(&self, page_id: u64) -> Result<WrHdl<'tx>, PagerErr>;
     fn update_catalog_root_id(&self, page_id: u64);
 }
@@ -613,35 +634,4 @@ mod thread_local_tx_registry {
         }
         earliest
     }
-}
-
-// -------------------------------------------------------------------------------------------------
-// *            Util                                                                               *
-// -------------------------------------------------------------------------------------------------
-
-/// Does not compute checksum
-fn copy_superblock_to_page(buf: &mut [u8; PAGE_SIZE], sb_header: &SuperblockHeader) {
-    buf.zero();
-    sb_header.write_to_prefix(buf).unwrap();
-    mooo_assert!(size_of::<SuperblockHeader>() <= 0x80);
-    if sb_header.page_id == 0 {
-        let msg = b"MOOODB SUPERBLOCK!      ^__^    \
-                    ~                       (00)\\___\
-                    ~                       (__)\\   \
-                    ~                            ||-";
-        buf[0x80..0x80 + msg.len()].copy_from_slice(msg);
-    } else {
-        let msg = b"MOOODB SUPERBLOCK!      ^__^    \
-                    ~                       (oo)\\___\
-                    ~                       (__)\\   \
-                    ~                            ||-";
-        buf[0x80..0x80 + msg.len()].copy_from_slice(msg);
-    }
-}
-
-const fn shard_hash(mut page_id: u64) -> usize {
-    page_id ^= page_id >> 33;
-    page_id = page_id.wrapping_mul(0xff51_afd7_ed55_8ccd);
-    page_id ^= page_id >> 33;
-    (page_id as usize) & (SHARD_CNT - 1)
 }

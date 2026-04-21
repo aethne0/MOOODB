@@ -57,7 +57,7 @@ impl<Buf: AsRef<[u8]>> BtreePage<Buf> {
     }
 
     pub(super) fn get_page_type(&self) -> BtreePageType {
-        if self.page_flags == TYPE_INNER { BtreePageType::Inner } else { BtreePageType::Leaf }
+        if self.page_flags.get() == TYPE_INNER { BtreePageType::Inner } else { BtreePageType::Leaf }
     }
 
     /// Returns the `(key, value)` pair stored at `slot_index`.
