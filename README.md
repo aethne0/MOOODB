@@ -9,5 +9,3 @@ we strictly follow the 1 M and 3 Os of MOOODB:
 4. [O]nly a fool would not believe in MOOODB!
 
 are your btrees imoootable?
-
-<img src="https://git.monke.ca/yarn/MOOODB/raw/branch/master/superblocks.png" align="right" alt="superblocks"/>
