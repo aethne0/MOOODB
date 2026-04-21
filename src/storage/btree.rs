@@ -52,6 +52,7 @@ impl Btree {
 
     // ------------ Insert -------------------------------------------------------------------------
 
+    /*
     pub(crate) fn insert_old<'tx, R: PgrReader<'tx> + PgrWriter<'tx>>(
         &mut self, tx: &R, key: &[u8], value: U64Entry,
     ) -> Result<(), PagerErr> {
@@ -149,6 +150,7 @@ impl Btree {
         self.0 = new_root_page_id;
         Ok(())
     }
+    */
 
     pub(crate) fn insert<'tx, R: PgrReader<'tx> + PgrWriter<'tx>>(
         &mut self, tx: &R, key: &[u8], pk: U64Entry,
