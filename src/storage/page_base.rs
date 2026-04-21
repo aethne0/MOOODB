@@ -384,7 +384,7 @@ mod test {
 
     #[test]
     fn test_initialize_header() {
-        let mut buffer = [0u8; 4096];
+        let mut buffer = [0u8; PAGE_SIZE];
         let mut page = BasePage::from_buffer(&mut buffer);
         page.initialize_header(42, 1, 2);
 
@@ -392,13 +392,13 @@ mod test {
         assert_eq!(page.parent_id.get(), 1);
         assert_eq!(page.next_id.get(), 2);
         assert_eq!(page.upper_ptr.get(), PAGE_HEADER_SIZE);
-        assert_eq!(page.lower_ptr.get(), 4095);
+        assert_eq!(page.lower_ptr.get(), PAGE_SIZE as u16 - 1);
         assert_eq!(page.len(), 0);
     }
 
     #[test]
     fn test_space_and_pointers() {
-        let mut buffer = [0u8; 4096];
+        let mut buffer = [0u8; PAGE_SIZE];
         let mut page = BasePage::from_buffer(&mut buffer);
         page.initialize_header(1, 0, 0);
 
@@ -412,13 +412,13 @@ mod test {
         assert_eq!(page.free_bytes(), initial_free - entry_len - SLOT_SIZE);
         assert_eq!(page.free_bytes_contig(), contig - entry_len - SLOT_SIZE);
         assert_eq!(page.upper_ptr.get(), PAGE_HEADER_SIZE + SLOT_SIZE);
-        assert_eq!(page.lower_ptr.get(), 4096 as u16 - 1 - entry_len);
+        assert_eq!(page.lower_ptr.get(), PAGE_SIZE as u16 - 1 - entry_len);
         assert_eq!(off as u16, page.lower_ptr.get() + 1);
     }
 
     #[test]
     fn test_readonly_view() {
-        let mut buffer = [0u8; 4096];
+        let mut buffer = [0u8; PAGE_SIZE];
         {
             let mut page = BasePage::from_buffer(&mut buffer);
             page.initialize_header(7, 0, 0);
