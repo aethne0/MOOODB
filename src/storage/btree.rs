@@ -66,11 +66,13 @@ impl Btree {
                 let had_space = page.insert(key, value);
 
                 if !had_space {
+                    /*
                     let right_w_hdl = tx.get_page_alloc()?;
                     let right_page_id = right_w_hdl.get_page_id();
                     page.next_id = right_page_id.into();
                     let right_page =
                         BtreePage::new_with_buffer(right_w_hdl.buf, page_id, right_page_id, 555);
+                    */
                 }
 
                 break;
@@ -143,6 +145,8 @@ impl Iterator for PageStack {
 #[cfg(test)]
 mod test {
 
+    use std::sync::atomic::AtomicUsize;
+
     use crate::sync;
 
     use super::*;
@@ -187,13 +191,19 @@ mod test {
             .unwrap();
         let mgr = Pager::new(64, file);
 
+        eprintln!("");
+        static CTR: AtomicUsize = AtomicUsize::new(0);
+
         sync::thread::scope(|s| {
             for _ in 0..8 {
                 s.spawn(|| {
+                    let id = CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                     let w_tx = mgr.write_tx();
+                    eprintln!("t{} -> 1", id);
 
                     let mut btree = Btree::new(&w_tx).unwrap();
-                    let root_id = btree.root_id();
+                    let root_page_id = btree.root_id();
+                    eprintln!("t{} -> 1 root_page_id {}", id, root_page_id);
                     btree.insert(&w_tx, b"asd", 0xab.into()).unwrap();
                     btree.insert(&w_tx, b"zxc", 0xbc.into()).unwrap();
                     btree.insert(&w_tx, b"rewt", 0xde.into()).unwrap();
@@ -206,8 +216,28 @@ mod test {
                     assert!(res.is_some_and(|val| val.get() == 0xde));
 
                     let w_tx = mgr.write_tx();
+                    eprintln!("t{} -> 2", id);
 
-                    let mut btree = Btree::with_root(root_id);
+                    let mut btree = Btree::with_root(root_page_id);
+                    btree.insert(&w_tx, b"xxx", 0x12.into()).unwrap();
+                    btree.insert(&w_tx, b"zxc", 0x55.into()).unwrap();
+                    btree.insert(&w_tx, b"rewz", 0x77.into()).unwrap();
+
+                    eprintln!("t{} -> 2 root_page_id {}", id, btree.root_id());
+
+                    w_tx.commit(Durability::Flush).unwrap();
+                });
+            }
+        });
+
+        CTR.store(0, std::sync::atomic::Ordering::Relaxed);
+        sync::thread::scope(|s| {
+            for _ in 0..8 {
+                s.spawn(|| {
+                    let id = CTR.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                    let w_tx = mgr.write_tx();
+
+                    let mut btree = Btree::with_root(id as u64 % 2 + 2);
                     btree.insert(&w_tx, b"xxx", 0x12.into()).unwrap();
                     btree.insert(&w_tx, b"zxc", 0x55.into()).unwrap();
                     btree.insert(&w_tx, b"rewz", 0x77.into()).unwrap();
