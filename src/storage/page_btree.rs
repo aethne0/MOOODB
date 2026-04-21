@@ -3,8 +3,9 @@ use std::ops::DerefMut;
 
 use super::page_base::BasePage;
 use super::page_base::RangeExt;
-use super::page_base::U64Entry;
 use super::page_base::SLOT_SIZE;
+use super::page_base::U64Entry;
+use crate::mooo_assert;
 use crate::storage::PAGE_SIZE;
 
 /// A sorted B-tree page storing key-value pairs in ascending key order.
@@ -16,11 +17,11 @@ pub(super) struct BtreePage<Buf> {
 
 impl<'buf> BtreePage<&'buf mut [u8; PAGE_SIZE]> {
     pub(super) fn new_with_buffer(
-        buffer: &'buf mut [u8; PAGE_SIZE], parent: u64, right: u64,
+        buffer: &'buf mut [u8; PAGE_SIZE], parent: u64, page_type: BtreePageType,
     ) -> Self {
         let mut page = Self::from_buffer(buffer);
-        page.prefix.pad = *b"BTREE!!!";
-        page.initialize_header(parent, right);
+        page.initialize_header(parent);
+        page.set_page_type(page_type);
         page
     }
 
@@ -36,21 +37,35 @@ impl<'b> BtreePage<&'b [u8; PAGE_SIZE]> {
 }
 
 // read impl
-const TYPE_LEAF: u16 = 0;
-const TYPE_INNER: u16 = 1;
+const TYPE_INNER: u16 = 0x0001;
+const TYPE_LEAF: u16 = 0x0002;
+// TODO
+#[repr(u16)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum BtreePageType {
+    Inner = 1,
+    Leaf = 2,
+}
 
 impl<Buf: AsRef<[u8]>> BtreePage<Buf> {
     pub(super) fn is_leaf(&self) -> bool {
-        // TODO - use generic page flags field
         self.page_flags.get() == TYPE_LEAF
     }
 
+    pub(super) fn is_inner(&self) -> bool {
+        self.page_flags.get() == TYPE_INNER
+    }
+
+    pub(super) fn get_page_type(&self) -> BtreePageType {
+        if self.page_flags == TYPE_INNER { BtreePageType::Inner } else { BtreePageType::Leaf }
+    }
+
     /// Returns the `(key, value)` pair stored at `slot_index`.
-    fn entry_at_slot(&self, slot_index: u16) -> (&[u8], U64Entry) {
-        assert!(slot_index < self.len());
+    pub(super) fn entry_at_slot(&self, slot_index: u16) -> (&[u8], U64Entry) {
+        mooo_assert!(slot_index < self.len());
 
         let (offset, len) = self.offset_len_from_slot(slot_index);
-        assert!(len >= U64Entry::SIZE_U16);
+        mooo_assert!(len >= U64Entry::SIZE_U16);
         let key_len = len - U64Entry::SIZE_U16;
 
         let raw = self.raw();
@@ -64,7 +79,7 @@ impl<Buf: AsRef<[u8]>> BtreePage<Buf> {
 
     /// Binary searches for `key` and returns a [`SearchResult`] indicating whether it was
     /// found and at which slot, or where it would be inserted to maintain order.
-    fn find_key_slot(&self, key: &[u8]) -> SearchResult {
+    fn find_slot_from_key(&self, key: &[u8]) -> SearchResult {
         let _ = u16::try_from(key.len()).expect("passed key too large");
 
         if self.len() == 0 {
@@ -85,11 +100,7 @@ impl<Buf: AsRef<[u8]>> BtreePage<Buf> {
             }
         }
 
-        if low == self.len() {
-            SearchResult::Right
-        } else {
-            SearchResult::NotFound(low)
-        }
+        if low == self.len() { SearchResult::Right } else { SearchResult::NotFound(low) }
     }
 
     /// Returns an iterator over `(key, value)` pairs in ascending key order.
@@ -99,25 +110,26 @@ impl<Buf: AsRef<[u8]>> BtreePage<Buf> {
 
     /// Returns the value associated with `key`, or `None` if not present.
     pub(super) fn get(&self, key: &[u8]) -> Option<U64Entry> {
-        match self.find_key_slot(key) {
+        match self.find_slot_from_key(key) {
             SearchResult::Found(slot_index) => Some(self.entry_at_slot(slot_index).1),
             _ => None,
         }
     }
 
-    /// TODO rename
-    /// gets first slot that is AT LEAST key (slot_key >= arg_key)
-    /// This corresponds to which child page you should go it in a tree traversal
-    pub(super) fn get_first_slot_ge_key(&self, key: &[u8]) -> Option<U64Entry> {
-        assert!(!self.is_leaf(), "shouldnt be called on leaf node");
-        assert!(self.len() > 0, "inner node shouldnt be empty");
+    /// Returns the child page to follow for `key` during tree traversal.
+    ///
+    /// Finds the last slot whose key does not exceed `key`. Slot 0 is a catch-all for any key
+    /// smaller than slot 1's separator, so inner nodes never need their keys updated during descent.
+    pub(super) fn get_traversal_next_page(&self, key: &[u8]) -> Option<U64Entry> {
+        mooo_assert!(self.is_inner(), "shouldnt be called on leaf node");
+        mooo_assert!(self.len() > 0, "inner node shouldnt be empty");
 
-        match self.find_key_slot(key) {
-            SearchResult::Found(slot_index) | SearchResult::NotFound(slot_index) => {
-                Some(self.entry_at_slot(slot_index).1)
-            }
-            _ => None,
-        }
+        let slot_index = match self.find_slot_from_key(key) {
+            SearchResult::Found(slot_index) => slot_index,
+            SearchResult::NotFound(slot_index) => slot_index.saturating_sub(1),
+            SearchResult::Right => self.len() - 1,
+        };
+        Some(self.entry_at_slot(slot_index).1)
     }
 
     fn has_space(&self, key: &[u8]) -> Result<u16, ()> {
@@ -133,18 +145,20 @@ impl<Buf: AsRef<[u8]>> BtreePage<Buf> {
 // write impl
 
 impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
-    pub(super) fn set_is_leaf(&mut self, is_leaf: bool) {
-        self.page_flags.set(if is_leaf { TYPE_LEAF } else { TYPE_INNER });
-    }
-
-    /// Removes all entries, reclaiming all entry space.
-    pub(super) fn clear(&mut self) {
-        self.clear_entries();
+    pub(super) fn set_page_type(&mut self, page_type: BtreePageType) {
+        self.page_flags.set(match page_type {
+            BtreePageType::Leaf => TYPE_LEAF,
+            BtreePageType::Inner => TYPE_INNER,
+        });
+        self.prefix.dbg_pad = *match page_type {
+            BtreePageType::Leaf => b"btree:lf",
+            BtreePageType::Inner => b"btree:in",
+        };
     }
 
     /// Removes the entry with `key`. Does nothing if the key is not present.
     pub(super) fn delete(&mut self, key: &[u8]) {
-        if let SearchResult::Found(slot_index) = self.find_key_slot(key) {
+        if let SearchResult::Found(slot_index) = self.find_slot_from_key(key) {
             self.delete_slot_entry(slot_index);
         }
     }
@@ -169,7 +183,7 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
 
         let mut should_increment_slot_ptr = true;
         let slot_index = if ordered {
-            match self.find_key_slot(key) {
+            match self.find_slot_from_key(key) {
                 SearchResult::Found(slot_index) => {
                     should_increment_slot_ptr = false;
                     slot_index
@@ -229,6 +243,31 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
             self.insert_unordered(k, v);
         }
     }
+
+    /// Redistributes the latter half of `self`'s entries and puts into `right_page`.
+    /// `right_page` should be empty and already otherwise initialized
+    /// This also performs compaction.
+    pub(super) fn redistribute_into(&mut self, right_page: &mut Self) {
+        let mut cloned_left_raw = [0u8; PAGE_SIZE];
+        cloned_left_raw.copy_from_slice(self.raw());
+        let og_page = BtreePage::from_buffer(&mut cloned_left_raw);
+
+        self.clear_entries();
+        right_page.clear_entries();
+
+        mooo_assert!(og_page.len() >= 2, "huge entries cause this - we need to handle this still");
+        let midpoint = og_page.len() / 2;
+        let left_range = 0..midpoint;
+        let right_range = midpoint..og_page.len();
+
+        for (k, v) in left_range.map(|index| og_page.entry_at_slot(index)) {
+            self.insert_unordered(k, v);
+        }
+
+        for (k, v) in right_range.map(|index| og_page.entry_at_slot(index)) {
+            right_page.insert_unordered(k, v);
+        }
+    }
 }
 
 // deref
@@ -285,4 +324,3 @@ pub(super) enum SearchResult {
     /// The key is greater than all entries; it belongs past the last slot.
     Right,
 }
-

@@ -31,6 +31,7 @@
 #![allow(clippy::doc_markdown)]
 #![allow(clippy::cast_possible_truncation)]
 #![allow(clippy::struct_field_names)]
+#![allow(dead_code)] // TODO
 
 pub mod assert;
 pub mod storage;

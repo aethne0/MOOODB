@@ -18,16 +18,16 @@ use super::PAGE_SIZE;
 use crate::mooo_assert;
 use crate::sync::*;
 
+#[repr(align(4096))]
+struct FrameBuffer(UnsafeCell<[u8; PAGE_SIZE]>);
+const SHARD_CNT: usize = 256;
+const FIRST_TX_ID: u64 = 1;
+
 //  ▄▄▄· ▄▄▄·  ▄▄ • ▄▄▄ .    ▄▄▄▄· ▄• ▄▌·▄▄▄·▄▄▄▄▄▄ .▄▄▄
 // ▐█ ▄█▐█ ▀█ ▐█ ▀ ▪▀▄.▀·    ▐█ ▀█▪█▪██▌▐▄▄·▐▄▄·▀▄.▀·▀▄ █·
 //  ██▀·▄█▀▀█ ▄█ ▀█▄▐▀▀▪▄    ▐█▀▀█▄█▌▐█▌██▪ ██▪ ▐▀▀▪▄▐▀▀▄
 // ▐█▪·•▐█ ▪▐▌▐█▄▪▐█▐█▄▄▌    ██▄▪▐█▐█▄█▌██▌.██▌.▐█▄▄▌▐█•█▌
 // .▀    ▀  ▀ ·▀▀▀▀  ▀▀▀     ·▀▀▀▀  ▀▀▀ ▀▀▀ ▀▀▀  ▀▀▀ .▀  ▀
-
-#[repr(align(4096))]
-struct FrameBuffer(UnsafeCell<[u8; PAGE_SIZE]>);
-const SHARD_CNT: usize = 256;
-const FIRST_TX_ID: u64 = 1;
 
 pub(super) struct Pager {
     file: File,
@@ -44,8 +44,8 @@ pub(super) struct Pager {
 
     tx_id: AtomicU64,
 
-    current:    RwLock<SuperblockHeader>,
-    write_lock: Mutex<()>,
+    curr_superblock: RwLock<SuperblockHeader>,
+    write_tx_lock:   Mutex<()>,
 }
 
 unsafe impl Sync for Pager {}
@@ -55,14 +55,14 @@ impl Pager {
         let temp_header = SuperblockHeader::new_zeroed();
 
         let pgr = Self {
-            file:          file,
-            frames:        (0..count).map(|i| FrameHeader::new(i)).collect(),
-            pages:         (0..count).map(|_| FrameBuffer::zeros()).collect(),
-            shard_dirs:    (0..SHARD_CNT).map(|_| Mutex::new(HashMap::default())).collect(),
-            eviction_hand: 0.into(),
-            tx_id:         FIRST_TX_ID.into(),
-            write_lock:    Mutex::new(()),
-            current:       RwLock::new(temp_header),
+            file:            file,
+            frames:          (0..count).map(|i| FrameHeader::new(i)).collect(),
+            pages:           (0..count).map(|_| FrameBuffer::zeros()).collect(),
+            shard_dirs:      (0..SHARD_CNT).map(|_| Mutex::new(HashMap::default())).collect(),
+            eviction_hand:   0.into(),
+            tx_id:           FIRST_TX_ID.into(),
+            write_tx_lock:   Mutex::new(()),
+            curr_superblock: RwLock::new(temp_header),
         };
 
         let superblock_page_id = 0;
@@ -75,7 +75,7 @@ impl Pager {
 
         let superblock_header = SuperblockHeader {
             prefix:             PagePrefix::new(superblock_page_id, 0, FIRST_TX_ID),
-            version:            1.into(),
+            version:            0x766572_00_0000_0001.into(),
             page_size:          (PAGE_SIZE as u16).into(),
             catalog_head_id:    PAGE_ID_NULL.into(),
             alloc_free_head_id: PAGE_ID_NULL.into(),
@@ -87,7 +87,7 @@ impl Pager {
         pgr.io_write(&mut w_hdl, FIRST_TX_ID).expect("couldnt initialize superblock to disk");
         drop(w_hdl);
 
-        pgr.current.write().unwrap().clone_from(&superblock_header);
+        pgr.curr_superblock.write().unwrap().clone_from(&superblock_header);
         pgr
     }
 
@@ -303,7 +303,7 @@ impl Pager {
     pub(super) fn read_tx<'tx>(&'tx self) -> ReadTxHdl<'tx> {
         let superblock = {
             // we need to hold this guard while we put our value in the registry
-            let curr_guard = self.current.read().expect("todo");
+            let curr_guard = self.curr_superblock.read().expect("todo");
             let current = curr_guard.clone();
 
             let tx_id = current.tx_id.get();
@@ -316,18 +316,22 @@ impl Pager {
     }
 
     #[must_use = "RAII WriteTxHdl releases when dropped"]
-    pub(super) fn write_tx<'tx>(&'tx self) -> WriteTxHdl<'tx> {
-        let lock = self.write_lock.lock().unwrap();
+    pub(super) fn write_tx<'tx>(&'tx self) -> WriteBumpTxHdl<'tx> {
+        let lock = self.write_tx_lock.lock().unwrap();
 
-        let mut superblock = self.current.read().expect("todo").clone();
+        let mut superblock = self.curr_superblock.read().expect("todo").clone();
         let prev_page_id = superblock.page_id.get();
         superblock.tx_id += 1;
         superblock.page_id.set((prev_page_id + 1) % 2);
 
-        WriteTxHdl {
+        WriteBumpTxHdl {
             pager: self,
+            inner: RefCell::new(WriteTxHdlInner {
+                superblock:    superblock,
+                created_pages: HashMap::new(),
+                freed_pages:   vec![],
+            }),
             _lock: lock,
-            inner: RefCell::new(WriteTxHdlInner { superblock, created_pages: HashMap::new() }),
         }
     }
 }
@@ -449,13 +453,15 @@ pub(super) enum Durability {
 
 // ------------ Traits -----------------------------------------------------------------------------
 
-pub(super) trait PgRdr<'tx> {
+pub(super) trait PgrReader<'tx> {
     fn get_page_read(&self, page_id: u64) -> Result<RdHdl<'tx>, PagerErr>;
+    fn get_catalog_root_id(&self) -> u64;
 }
 
-pub(super) trait PgAlloc<'tx> {
+pub(super) trait PgrWriter<'tx> {
     fn get_page_alloc(&self) -> Result<WrHdl<'tx>, PagerErr>;
     fn get_page_write(&self, page_id: u64) -> Result<WrHdl<'tx>, PagerErr>;
+    fn update_catalog_root_id(&self, page_id: u64);
 }
 
 // ------------ ReadTx -----------------------------------------------------------------------------
@@ -471,15 +477,20 @@ impl Drop for ReadTxHdl<'_> {
     }
 }
 
-impl<'tx> PgRdr<'tx> for ReadTxHdl<'tx> {
+impl<'tx> PgrReader<'tx> for ReadTxHdl<'tx> {
     fn get_page_read(&self, page_id: u64) -> Result<RdHdl<'tx>, PagerErr> {
         self.pager.get_page_read(page_id)
+    }
+
+    fn get_catalog_root_id(&self) -> u64 {
+        self.superblock.catalog_head_id.get()
     }
 }
 
 // ------------ WriteTx ----------------------------------------------------------------------------
 
-pub(super) struct WriteTxHdl<'tx> {
+/// A write-tx that uses bump-allocation only
+pub(super) struct WriteBumpTxHdl<'tx> {
     pager: &'tx Pager,
     inner: RefCell<WriteTxHdlInner>,
     _lock: MutexGuard<'tx, ()>,
@@ -488,9 +499,10 @@ pub(super) struct WriteTxHdl<'tx> {
 struct WriteTxHdlInner {
     superblock:    SuperblockHeader,
     created_pages: HashMap<u64, usize>,
+    freed_pages:   Vec<u64>,
 }
 
-impl WriteTxHdl<'_> {
+impl WriteBumpTxHdl<'_> {
     pub(super) fn commit(self, durability: Durability) -> Result<(), PagerErr> {
         let inner = self.inner.borrow_mut();
 
@@ -506,20 +518,24 @@ impl WriteTxHdl<'_> {
         self.pager.io_write(&mut w_hdl, inner.superblock.tx_id.get())?;
 
         // these don't need to be atomic - we are holding _lock anyway
-        *self.pager.current.write().unwrap() = inner.superblock.clone();
+        *self.pager.curr_superblock.write().unwrap() = inner.superblock.clone();
         self.pager.tx_id.store(inner.superblock.tx_id.get(), Ordering::Relaxed);
 
         Ok(())
     }
 }
 
-impl<'tx> PgRdr<'tx> for WriteTxHdl<'tx> {
+impl<'tx> PgrReader<'tx> for WriteBumpTxHdl<'tx> {
     fn get_page_read(&self, page_id: u64) -> Result<RdHdl<'tx>, PagerErr> {
         self.pager.get_page_read(page_id)
     }
+
+    fn get_catalog_root_id(&self) -> u64 {
+        self.inner.borrow().superblock.catalog_head_id.get()
+    }
 }
 
-impl<'tx> PgAlloc<'tx> for WriteTxHdl<'tx> {
+impl<'tx> PgrWriter<'tx> for WriteBumpTxHdl<'tx> {
     /// Bump allocates - also adds page to our dirty-page linked list
     fn get_page_alloc(&self) -> Result<WrHdl<'tx>, PagerErr> {
         let mut inner = self.inner.borrow_mut();
@@ -534,13 +550,21 @@ impl<'tx> PgAlloc<'tx> for WriteTxHdl<'tx> {
     /// page_id)
     fn get_page_write(&self, page_id: u64) -> Result<WrHdl<'tx>, PagerErr> {
         if let Some(&index) = self.inner.borrow().created_pages.get(&page_id) {
+            // this is already a new page per our writetx
             return Ok(self.pager.get_frame_write(index));
         }
 
+        // we need to Copy-on-Write
+        self.inner.borrow_mut().freed_pages.push(page_id);
         let old_r_hdl = self.get_page_read(page_id)?;
         let new_w_hdl = self.get_page_alloc()?;
         new_w_hdl.buf.copy_from_slice(old_r_hdl.buf);
+
         Ok(new_w_hdl)
+    }
+
+    fn update_catalog_root_id(&self, page_id: u64) {
+        self.inner.borrow_mut().superblock.catalog_head_id.set(page_id);
     }
 }
 
@@ -599,6 +623,20 @@ mod thread_local_tx_registry {
 fn copy_superblock_to_page(buf: &mut [u8; PAGE_SIZE], sb_header: &SuperblockHeader) {
     buf.zero();
     sb_header.write_to_prefix(buf).unwrap();
+    mooo_assert!(size_of::<SuperblockHeader>() <= 0x80);
+    if sb_header.page_id == 0 {
+        let msg = b"MOOODB SUPERBLOCK!      ^__^    \
+                    ~                       (00)\\___\
+                    ~                       (__)\\   \
+                    ~                            ||-";
+        buf[0x80..0x80 + msg.len()].copy_from_slice(msg);
+    } else {
+        let msg = b"MOOODB SUPERBLOCK!      ^__^    \
+                    ~                       (oo)\\___\
+                    ~                       (__)\\   \
+                    ~                            ||-";
+        buf[0x80..0x80 + msg.len()].copy_from_slice(msg);
+    }
 }
 
 const fn shard_hash(mut page_id: u64) -> usize {

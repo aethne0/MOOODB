@@ -87,7 +87,7 @@ pub(super) struct PagePrefix {
     pub(super) checksum: big_endian::U64,
     pub(super) page_id:  big_endian::U64,
     pub(super) tx_id:    big_endian::U64,
-    pub(super) pad:      [u8; 8],
+    pub(super) dbg_pad:  [u8; 8],
 }
 const _: () = assert!(size_of::<PagePrefix>() == 32);
 
@@ -97,7 +97,7 @@ impl PagePrefix {
             checksum: checksum.into(),
             page_id:  page_id.into(),
             tx_id:    tx_id.into(),
-            pad:      *b"MOOODB!!",
+            dbg_pad:  *b"superblk",
         }
     }
 }
@@ -135,15 +135,14 @@ where
 pub(super) struct PageHeader {
     pub(super) prefix: PagePrefix,
 
-    pub(super) parent_id: big_endian::U64,
-    pub(super) next_id:   big_endian::U64,
-
-    pub(super) upper_ptr:  big_endian::U16,
-    pub(super) lower_ptr:  big_endian::U16,
-    pub(super) free_bytes: big_endian::U16,
     pub(super) page_flags: big_endian::U16,
+    pub(super) upper_ptr:  big_endian::U16,
+    pub(super) free_bytes: big_endian::U16,
+    pub(super) lower_ptr:  big_endian::U16,
 
-    _pad: [u8; 8],
+    pub(super) parent_id: big_endian::U64,
+
+    _pad: [u8; 16],
 }
 const _: () = assert!(size_of::<PageHeader>() == PAGE_HEADER_SIZE as usize);
 
@@ -284,9 +283,8 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BasePage<Buf> {
         buf[idx..idx + 2].copy_from_slice(&val.to_be_bytes());
     }
 
-    pub(super) fn initialize_header(&mut self, parent: u64, right: u64) {
+    pub(super) fn initialize_header(&mut self, parent: u64) {
         self.parent_id = parent.into();
-        self.next_id = right.into();
         self.clear_entries();
     }
 
@@ -295,6 +293,10 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BasePage<Buf> {
         self.lower_ptr = self.end_of_page().into();
         let free_contig = 1 + self.lower_ptr.get() - self.upper_ptr.get();
         self.free_bytes = free_contig.into();
+
+        // zero page if debug - for readability
+        #[cfg(debug_assertions)]
+        self.raw_mut()[(PAGE_HEADER_SIZE as usize)..].fill(0);
     }
 
     pub(super) fn prepare_insert(&mut self, slot_index: u16, entry_len: u16) -> Option<u16> {
@@ -324,17 +326,23 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BasePage<Buf> {
     /// Does nothing if `slot_index` is out of bounds.
     pub(super) fn delete_slot_entry(&mut self, slot_index: u16) {
         assert!(slot_index < self.len());
-        // offset is unused because we dont touch the actual data (compaction takes care of this)
-        let (_offset, len) = self.offset_len_from_slot(slot_index);
+        let (offset, len) = self.offset_len_from_slot(slot_index);
 
         let slots_range = self.slots_range();
         let start = (slot_index + 1) * SLOT_SIZE;
         let dest = slot_index * SLOT_SIZE;
         self.raw.as_mut()[slots_range].copy_within((start..).into_usizes(), dest as usize);
 
-        self.write_u16(PAGE_HEADER_SIZE + (self.len() - 1) * SLOT_SIZE, 0);
         self.upper_ptr = (self.upper_ptr.get() - SLOT_SIZE).into();
         self.free_bytes = (self.free_bytes.get() + SLOT_SIZE + len).into();
+
+        #[cfg(debug_assertions)]
+        {
+            // zero data if debug
+            self.raw.as_mut()[(offset..offset + len).into_usizes()].fill(0);
+            let stale_slot = PAGE_HEADER_SIZE + self.len() * SLOT_SIZE;
+            self.raw.as_mut()[(stale_slot..stale_slot + SLOT_SIZE).into_usizes()].fill(0);
+        }
     }
 }
 
@@ -373,4 +381,3 @@ impl<'a, B: AsRef<[u8]>> IntoIterator for &'a BasePage<B> {
         self.iter()
     }
 }
-

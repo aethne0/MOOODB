@@ -9,7 +9,9 @@ mod page_btree;
 mod page_superblock;
 mod pager;
 
-use pager::*;
+#[cfg(test)]
+mod test;
 
-const PAGE_SIZE: usize = 4096;
+use pager::*;
+const PAGE_SIZE: usize = 256;
 const PAGE_ID_NULL: u64 = u64::MAX;
