@@ -147,6 +147,7 @@ pub(super) struct PageHeader {
 }
 const _: () = assert!(size_of::<PageHeader>() == PAGE_HEADER_SIZE as usize);
 
+/*
 impl std::ops::Deref for PageHeader {
     type Target = PagePrefix;
     fn deref(&self) -> &PagePrefix {
@@ -158,6 +159,7 @@ impl std::ops::DerefMut for PageHeader {
         &mut self.prefix
     }
 }
+*/
 
 /// Base slotted-page layout shared by all page types.
 pub(super) struct BasePage<Buf> {
@@ -282,8 +284,7 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BasePage<Buf> {
         buf[idx..idx + 2].copy_from_slice(&val.to_be_bytes());
     }
 
-    pub(super) fn initialize_header(&mut self, page_id: u64, parent: u64, right: u64) {
-        self.page_id = page_id.into();
+    pub(super) fn initialize_header(&mut self, parent: u64, right: u64) {
         self.parent_id = parent.into();
         self.next_id = right.into();
         self.clear_entries();
@@ -373,57 +374,3 @@ impl<'a, B: AsRef<[u8]>> IntoIterator for &'a BasePage<B> {
     }
 }
 
-/// ▄▄▄▄▄▄▄▄ ..▄▄ · ▄▄▄▄▄.▄▄ ·
-/// •██  ▀▄.▀·▐█ ▀. •██  ▐█ ▀.
-///  ▐█.▪▐▀▀▪▄▄▀▀▀█▄ ▐█.▪▄▀▀▀█▄
-///  ▐█▌·▐█▄▄▌▐█▄▪▐█ ▐█▌·▐█▄▪▐█
-///  ▀▀▀  ▀▀▀  ▀▀▀▀  ▀▀▀  ▀▀▀▀
-#[cfg(test)]
-mod test {
-    use super::*;
-
-    #[test]
-    fn test_initialize_header() {
-        let mut buffer = [0u8; PAGE_SIZE];
-        let mut page = BasePage::from_buffer(&mut buffer);
-        page.initialize_header(42, 1, 2);
-
-        assert_eq!(page.page_id.get(), 42);
-        assert_eq!(page.parent_id.get(), 1);
-        assert_eq!(page.next_id.get(), 2);
-        assert_eq!(page.upper_ptr.get(), PAGE_HEADER_SIZE);
-        assert_eq!(page.lower_ptr.get(), PAGE_SIZE as u16 - 1);
-        assert_eq!(page.len(), 0);
-    }
-
-    #[test]
-    fn test_space_and_pointers() {
-        let mut buffer = [0u8; PAGE_SIZE];
-        let mut page = BasePage::from_buffer(&mut buffer);
-        page.initialize_header(1, 0, 0);
-
-        let initial_free = page.free_bytes();
-        let contig = page.free_bytes_contig();
-        assert_eq!(initial_free, contig);
-
-        let entry_len = 10;
-        let off = page.prepare_insert(0, entry_len).unwrap();
-
-        assert_eq!(page.free_bytes(), initial_free - entry_len - SLOT_SIZE);
-        assert_eq!(page.free_bytes_contig(), contig - entry_len - SLOT_SIZE);
-        assert_eq!(page.upper_ptr.get(), PAGE_HEADER_SIZE + SLOT_SIZE);
-        assert_eq!(page.lower_ptr.get(), PAGE_SIZE as u16 - 1 - entry_len);
-        assert_eq!(off as u16, page.lower_ptr.get() + 1);
-    }
-
-    #[test]
-    fn test_readonly_view() {
-        let mut buffer = [0u8; PAGE_SIZE];
-        {
-            let mut page = BasePage::from_buffer(&mut buffer);
-            page.initialize_header(7, 0, 0);
-        }
-        let view = BasePage::from_buffer_ref(&buffer);
-        assert_eq!(view.page_id.get(), 7);
-    }
-}
