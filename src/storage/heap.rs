@@ -1,7 +1,6 @@
+use super::PagerErr;
 use super::page_heap::HeapPage;
 use super::pager::*;
-use super::serialization::SerializedU64;
-use super::PagerErr;
 use crate::mooo_assert;
 
 /// It is the responsibility of the caller to update anything that may point to this `root_pgid`

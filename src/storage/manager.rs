@@ -1,13 +1,66 @@
-use crate::mooo_assert;
-
+use super::PageWriter;
+use super::Pager;
+use super::ReadTxHdl;
+use super::WrHdl;
+use super::WriteTxHdlBump;
 use super::pgid_valid;
 use super::serialization::Serialized;
 use super::serialization::SerializedU64;
+use crate::mooo_assert;
+use crate::storage::PGID_NULL;
+use crate::storage::pager::PagerErr;
 
 /// Note: we will keep a page-table btree that translates logical row-ids to physical heap-ids,
 /// whenever a heap page is CoW shadowed we need to also update that page-table btree
 /// holy write amplification!
-pub(super) struct StorageManager{}
+pub(super) struct StorageManager {
+    pager: Pager,
+}
+
+impl StorageManager {
+    #[must_use]
+    pub(super) fn new(pager: Pager) -> Self {
+        Self { pager }
+    }
+
+    #[must_use = "RAII ReadTxHdl releases when dropped"]
+    pub(super) fn read_tx<'tx>(&'tx self) -> ReadTxHdl<'tx> {
+        self.pager.read_tx()
+    }
+
+    #[must_use = "RAII ReadTxHdl releases when dropped"]
+    pub(super) fn write_tx<'tx>(&'tx self) -> WriteTxHdlMgr<'tx> {
+        let bump_tx = self.pager.write_tx();
+        WriteTxHdlMgr { tx: bump_tx }
+    }
+}
+
+pub(super) struct WriteTxHdlMgr<'tx> {
+    /// Inner bump-alloc write tx
+    tx: WriteTxHdlBump<'tx>,
+}
+
+impl<'tx> PageWriter<'tx> for WriteTxHdlMgr<'tx> {
+    fn update_catalog_root_id(&self, pgid: u64) {
+        self.tx.update_catalog_root_id(pgid);
+    }
+
+    fn get_page_alloc(&self) -> Result<WrHdl<'tx>, PagerErr> {
+        let inner = self.tx.inner.borrow_mut();
+        let free_list_pgid = inner.superblock.alloc_free_head_pgid.get();
+        if free_list_pgid != PGID_NULL {
+            todo!()
+        } else {
+            drop(inner);
+            self.tx.get_page_alloc()
+        }
+    }
+
+    fn get_page_write(&self, pgid: u64) -> Result<WrHdl<'tx>, PagerErr> {
+        // must free TODO
+        self.tx.get_page_write(pgid)
+    }
+}
 
 // -------------------------------------------------------------------------------------------------
 // *            Definitions                                                                        *

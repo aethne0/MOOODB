@@ -8,9 +8,6 @@ readme = "README.md"
 license-file = "LICENSE"
 authors = ["yarn"]
 
-[dependencies]
-
 [dev-dependencies]
-rand = "0.10.1"
-tempfile = "3.27.0"
+rand = { version = "0.10.1", features = ["chacha"] }
 

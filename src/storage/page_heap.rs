@@ -1,22 +1,37 @@
 use std::ops::Deref;
 use std::ops::DerefMut;
 
-use super::page_base::*;
 use super::PAGE_SIZE;
+use super::page_base::END_OF_PAGE;
+use super::page_base::PAGE_HEADER_SIZE;
+use super::page_base::PagePrefix;
+use super::page_base::SLOT_SIZE;
+use super::serialization::Serialized;
+use super::serialization::SerializedU16;
+use crate::mooo_assert;
+
+#[repr(C)]
+pub(super) struct HeapPageHeader {
+    pub(super) prefix:     PagePrefix,
+    pub(super) page_flags: SerializedU16,
+    pub(super) upper_ptr:  SerializedU16,
+    pub(super) free_bytes: SerializedU16,
+    pub(super) lower_ptr:  SerializedU16,
+}
+const _: () = mooo_assert!(size_of::<HeapPageHeader>() == PAGE_HEADER_SIZE as usize);
+unsafe impl Serialized for HeapPageHeader {}
 
 pub(super) struct HeapPage<Buf> {
-    core: BasePage<Buf>,
+    raw: Buf,
 }
 
 // constructors
 
 impl<'b> HeapPage<&'b mut [u8; PAGE_SIZE]> {
-    /// Wraps `buffer` as a `PageHeap`. Does not initialize or validate any fields.
     pub(super) const fn from_buffer(buffer: &'b mut [u8; PAGE_SIZE]) -> Self {
-        Self { core: BasePage::from_buffer(buffer) }
+        Self { raw: buffer }
     }
 
-    /// Wraps `buffer` as a `PageHeap` and initializes the page header.
     pub(super) fn new_with_buffer(buffer: &'b mut [u8; PAGE_SIZE]) -> Self {
         let mut page = Self::from_buffer(buffer);
         page.clear_entries();
@@ -27,72 +42,166 @@ impl<'b> HeapPage<&'b mut [u8; PAGE_SIZE]> {
 
 impl<'b> HeapPage<&'b [u8; PAGE_SIZE]> {
     pub(super) const fn from_buffer_ref(buffer: &'b [u8; PAGE_SIZE]) -> Self {
-        Self { core: BasePage::from_buffer_ref(buffer) }
+        Self { raw: buffer }
+    }
+}
+
+// deref to header
+
+impl<Buf: AsRef<[u8]>> Deref for HeapPage<Buf> {
+    type Target = HeapPageHeader;
+
+    fn deref(&self) -> &HeapPageHeader {
+        HeapPageHeader::ref_from_bytes(&self.raw.as_ref()[..PAGE_HEADER_SIZE as usize])
+    }
+}
+
+impl<Buf: AsRef<[u8]> + AsMut<[u8]>> DerefMut for HeapPage<Buf> {
+    fn deref_mut(&mut self) -> &mut HeapPageHeader {
+        HeapPageHeader::mut_from_bytes(&mut self.raw.as_mut()[..PAGE_HEADER_SIZE as usize])
+    }
+}
+
+// read impl
+
+impl<Buf: AsRef<[u8]>> HeapPage<Buf> {
+    fn raw(&self) -> &[u8] {
+        self.raw.as_ref()
+    }
+
+    fn free_bytes_contig(&self) -> u16 {
+        1 + self.lower_ptr.get() - self.upper_ptr.get()
+    }
+
+    fn len(&self) -> u16 {
+        (self.upper_ptr.get() - PAGE_HEADER_SIZE) / SLOT_SIZE
+    }
+
+    fn offset_len_from_slot(&self, slot_index: u16) -> (u16, u16) {
+        let base = (PAGE_HEADER_SIZE + slot_index * SLOT_SIZE) as usize;
+        let raw = self.raw.as_ref();
+        (
+            SerializedU16::ref_from_bytes(&raw[base..]).get(),
+            SerializedU16::ref_from_bytes(&raw[base + size_of::<u16>()..]).get(),
+        )
+    }
+
+    fn val_at_slot(&self, slot_index: u16) -> &[u8] {
+        let (offset, len) = self.offset_len_from_slot(slot_index);
+        &self.raw()[offset as usize..(offset + len) as usize]
+    }
+
+    fn iter(&self) -> SlottedPageIterator<'_, Buf> {
+        SlottedPageIterator { page: self, slot_index: 0 }
+    }
+
+    pub(super) fn get_at_slot(&self, slot_index: u16) -> Option<&[u8]> {
+        if slot_index >= self.len() {
+            return None;
+        }
+        Some(self.val_at_slot(slot_index))
     }
 }
 
 // write impl
-impl<B: AsRef<[u8]> + AsMut<[u8]>> HeapPage<B> {
+
+impl<Buf: AsRef<[u8]> + AsMut<[u8]>> HeapPage<Buf> {
+    fn write_slot(&mut self, slot_index: u16, offset: u16, len: u16) {
+        let base = (PAGE_HEADER_SIZE + slot_index * SLOT_SIZE) as usize;
+        let raw = self.raw.as_mut();
+        SerializedU16::from(offset).write_to_prefix(&mut raw[base..]);
+        SerializedU16::from(len).write_to_prefix(&mut raw[base + size_of::<u16>()..]);
+    }
+
+    fn clear_entries(&mut self) {
+        self.upper_ptr = PAGE_HEADER_SIZE.into();
+        self.lower_ptr = END_OF_PAGE.into();
+        self.free_bytes = (PAGE_SIZE as u16 - PAGE_HEADER_SIZE).into();
+
+        #[cfg(debug_assertions)]
+        self.raw.as_mut()[PAGE_HEADER_SIZE as usize..].fill(0);
+    }
+
+    pub(super) fn delete_slot_entry(&mut self, slot_index: u16) {
+        mooo_assert!(slot_index < self.len());
+        let (offset, len) = self.offset_len_from_slot(slot_index);
+
+        let del = (PAGE_HEADER_SIZE + slot_index * SLOT_SIZE) as usize;
+        let end = (PAGE_HEADER_SIZE + self.len() * SLOT_SIZE) as usize;
+        self.raw.as_mut().copy_within(del + SLOT_SIZE as usize..end, del);
+
+        self.upper_ptr = (self.upper_ptr.get() - SLOT_SIZE).into();
+        self.free_bytes = (self.free_bytes.get() + SLOT_SIZE + len).into();
+
+        #[cfg(debug_assertions)]
+        {
+            self.raw.as_mut()[offset as usize..(offset + len) as usize].fill(0);
+            let stale = (PAGE_HEADER_SIZE + self.len() * SLOT_SIZE) as usize;
+            self.raw.as_mut()[stale..stale + SLOT_SIZE as usize].fill(0);
+        }
+    }
+
     /// Appends `val` to the page and returns its slot index.
     ///
-    /// Triggers compaction automatically if there is enough total free space but
-    /// not enough contiguous space. Returns `None` if the page was full.
-    /// If the page was full no changes were made**
+    /// Triggers compaction automatically if there is not enough contiguous free space.
+    /// Returns `None` if the page is full; no changes are made in that case.
     pub(super) fn append(&mut self, val: &[u8]) -> Option<u16> {
-        // TODO refactor this and btree_page::() to nto duplicate code
         let entry_len = u16::try_from(val.len()).expect("val too long");
-
-        if !self.has_space_entry(entry_len) {
+        if entry_len + SLOT_SIZE > self.free_bytes.get() {
             return None;
         }
-
-        if self.free_bytes_contig() < (entry_len + SLOT_SIZE)
-            && self.free_bytes() >= (entry_len + SLOT_SIZE)
-        {
+        if self.free_bytes_contig() < entry_len + SLOT_SIZE {
             self.compact();
         }
-
         let slot_index = self.len();
-        let offset = self.prepare_insert(slot_index, entry_len)?;
-        self.raw_mut()[(offset..offset + entry_len).into_usizes()].copy_from_slice(val);
-
+        let offset = self.lower_ptr.get() - entry_len + 1;
+        self.write_slot(slot_index, offset, entry_len);
+        self.upper_ptr = (self.upper_ptr.get() + SLOT_SIZE).into();
+        self.lower_ptr = (offset - 1).into();
+        self.free_bytes = (self.free_bytes.get() - SLOT_SIZE - entry_len).into();
+        self.raw.as_mut()[offset as usize..(offset + entry_len) as usize].copy_from_slice(val);
         Some(slot_index)
     }
 
-    /// Defragments the page by rewriting all live entries into a contiguous block,
-    /// making all free space available as a single region.
-    pub(super) fn compact(&mut self) {
-        // hopefully compiler elides this zero-ing
-
-        // TODO figure something else out for this memory eventually
-        // TODO this should just copy into the other buffer, cause were copy on write
-        // infact we can make it so its never called, if we copy by iterating
+    /// Defragments the page by rewriting all live entries into a contiguous block.
+    fn compact(&mut self) {
         let mut cloned_raw = [0u8; PAGE_SIZE];
-
         cloned_raw.copy_from_slice(self.raw());
         let cloned_page = HeapPage::from_buffer(&mut cloned_raw);
-
         self.clear_entries();
-
         for (_, v) in cloned_page.iter() {
             self.append(v);
         }
     }
 }
 
-// deref
+// iterator
 
-impl<B: AsRef<[u8]>> Deref for HeapPage<B> {
-    type Target = BasePage<B>;
+pub(super) struct SlottedPageIterator<'a, Buf: AsRef<[u8]>> {
+    page:       &'a HeapPage<Buf>,
+    slot_index: u16,
+}
 
-    fn deref(&self) -> &Self::Target {
-        &self.core
+impl<'a, B: AsRef<[u8]>> Iterator for SlottedPageIterator<'a, B> {
+    type Item = (u16, &'a [u8]);
+
+    fn next(&mut self) -> Option<Self::Item> {
+        if self.slot_index == self.page.len() {
+            return None;
+        }
+        let slot = self.slot_index;
+        let res = self.page.val_at_slot(slot);
+        self.slot_index += 1;
+        Some((slot, res))
     }
 }
 
-impl<B: AsRef<[u8]> + AsMut<[u8]>> DerefMut for HeapPage<B> {
-    fn deref_mut(&mut self) -> &mut BasePage<B> {
-        &mut self.core
+impl<'a, B: AsRef<[u8]>> IntoIterator for &'a HeapPage<B> {
+    type Item = (u16, &'a [u8]);
+    type IntoIter = SlottedPageIterator<'a, B>;
+
+    fn into_iter(self) -> Self::IntoIter {
+        self.iter()
     }
 }
 
@@ -161,18 +270,18 @@ mod test {
             }
         }
 
-        let free_before = page.free_bytes();
+        let free_before = page.free_bytes.get();
 
         for i in (0..page.len()).step_by(2).rev() {
             page.delete_slot_entry(i as u16);
         }
 
-        assert!(page.free_bytes() > free_before);
-        assert!(page.free_bytes() > page.free_bytes_contig());
+        assert!(page.free_bytes.get() > free_before);
+        assert!(page.free_bytes.get() > page.free_bytes_contig());
 
         page.compact();
 
-        assert_eq!(page.free_bytes(), page.free_bytes_contig());
+        assert_eq!(page.free_bytes.get(), page.free_bytes_contig());
 
         for (i, (_, val)) in page.iter().enumerate() {
             let expected_val = (i * 2 + 1) as u8;
@@ -190,7 +299,7 @@ mod test {
 
         page.clear_entries();
         assert_eq!(page.len(), 0);
-        assert_eq!(page.free_bytes(), PAGE_SIZE as u16 - PAGE_HEADER_SIZE);
+        assert_eq!(page.free_bytes.get(), PAGE_SIZE as u16 - PAGE_HEADER_SIZE);
     }
 
     #[test]

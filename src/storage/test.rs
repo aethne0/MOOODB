@@ -1,15 +1,17 @@
-use std::fs::OpenOptions;
 // ▄▄▄▄▄▄▄▄ ..▄▄ · ▄▄▄▄▄.▄▄ ·
 // •██  ▀▄.▀·▐█ ▀. •██  ▐█ ▀.
 //  ▐█.▪▐▀▀▪▄▄▀▀▀█▄ ▐█.▪▄▀▀▀█▄
 //  ▐█▌·▐█▄▄▌▐█▄▪▐█ ▐█▌·▐█▄▪▐█
 //  ▀▀▀  ▀▀▀  ▀▀▀▀  ▀▀▀  ▀▀▀▀
+use std::env::current_dir;
+use std::fs::File;
+use std::fs::OpenOptions;
 use std::sync::atomic::AtomicUsize;
 
-use rand::rngs::SmallRng;
 use rand::Rng;
 use rand::RngExt;
 use rand::SeedableRng;
+use rand::rngs::ChaCha8Rng;
 
 use super::btree::Btree;
 use super::*;
@@ -28,12 +30,42 @@ fn f_opts() -> OpenOptions {
     opts
 }
 
+fn get_rand() -> ChaCha8Rng {
+    ChaCha8Rng::seed_from_u64(0x000000000_b00b135)
+}
+
+fn rfill(buf: &mut [u8], rng: &mut ChaCha8Rng) {
+    // 0x61 - 0x7a
+    const RANGE: u8 = 0x7a - 0x61;
+    rng.fill_bytes(buf);
+    for b in buf.iter_mut() {
+        *b = (*b % RANGE) + 0x61;
+    }
+}
+
+fn testfile() -> File {
+    let test_name = std::thread::current().name().unwrap_or("unknown").to_string();
+    let mut path = current_dir().unwrap();
+    path.push(".test_dbs");
+    std::fs::create_dir_all(&path).unwrap();
+    path.push(format!("moootest_{}.moo", test_name));
+    eprintln!("{:?}", &path);
+    std::fs::OpenOptions::new()
+        .read(true)
+        .truncate(true)
+        .create(true)
+        .write(true)
+        .open(&path)
+        .unwrap()
+}
+
 #[test]
 fn btree_inserts_single() {
     eprintln!("");
     let file = f_opts().open("/xblk/test/test.moo").unwrap();
     let mgr = Pager::new(64, file);
-    let mut rng = SmallRng::seed_from_u64(0x555);
+
+    let mut rng = get_rand();
 
     // const KEY_SIZE: usize = BTREE_KEY_MAX_LEN;
     const KEY_SIZE: usize = 24;
@@ -48,7 +80,7 @@ fn btree_inserts_single() {
 
         for _ in 0..INSERTS_PER_TX_INIT {
             let mut key = [0u8; KEY_SIZE];
-            rng.fill_bytes(&mut key);
+            rfill(&mut key, &mut rng);
             let val: u64 = rng.random::<u64>() | VAL_MASK;
             btree.insert(&w_tx, &key, val).unwrap();
         }
@@ -63,7 +95,7 @@ fn btree_inserts_single() {
 
         for _ in 0..INSERTS_PER_TX {
             let mut key = [0u8; KEY_SIZE];
-            rng.fill_bytes(&mut key);
+            rfill(&mut key, &mut rng);
             let val: u64 = rng.random::<u64>() | VAL_MASK;
             btree.insert(&w_tx, &key, val).unwrap();
         }
@@ -78,7 +110,7 @@ fn btree_deletes_single() {
     eprintln!("");
     let file = f_opts().open("/xblk/test/test.moo").unwrap();
     let mgr = Pager::new(64, file);
-    let mut rng = SmallRng::seed_from_u64(0x444);
+    let mut rng = get_rand();
 
     // const KEY_SIZE: usize = BTREE_KEY_MAX_LEN;
     const KEY_SIZE: usize = 24;
@@ -95,7 +127,7 @@ fn btree_deletes_single() {
 
         for _ in 0..INSERTS_PER_TX_INIT {
             let mut key = [0u8; KEY_SIZE];
-            rng.fill_bytes(&mut key);
+            rfill(&mut key, &mut rng);
             keys.push(key.clone());
             let val: u64 = rng.random::<u64>() | VAL_MASK;
             btree.insert(&w_tx, &key, val).unwrap();
@@ -148,7 +180,8 @@ fn btree_deletes_single() {
 #[test]
 fn btree_inserts_threads() {
     eprintln!("");
-    let file = tempfile::tempfile().unwrap();
+    let mut rng = get_rand();
+    let file = testfile();
     let mgr = Pager::new(64, file);
 
     static CTR: AtomicUsize = AtomicUsize::new(0);
@@ -206,4 +239,3 @@ fn btree_inserts_threads() {
         }
     });
 }
-

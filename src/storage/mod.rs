@@ -21,13 +21,27 @@ use crate::mooo_assert;
 pub(crate) use page_btree::BTREE_KEY_MAX_LEN;
 use pager::*;
 
-const PAGE_SIZE: usize = 256;
-const PGID_NULL: u64 = u64::MAX;
+/// PAGE_SIZE maybe be inclusively from 256-32KiB, and must be a power of two
+const PAGE_SIZE: usize = 0x100;
+const _: () = mooo_assert!(
+    false
+        || PAGE_SIZE == 0x100
+        || PAGE_SIZE == 0x200
+        || PAGE_SIZE == 0x400
+        || PAGE_SIZE == 0x800
+        || PAGE_SIZE == 0x1000
+        || PAGE_SIZE == 0x2000
+        || PAGE_SIZE == 0x4000
+        || PAGE_SIZE == 0x8000
+);
 
+const PGID_NULL: u64 = u64::MAX;
 const fn pgid_valid(pgid: u64) -> bool {
     const _PGID_MAX: u64 = (1 << 48) - 1;
     pgid <= _PGID_MAX
 }
+
+// i dont understand any of this
 
 /// MurmurHash3
 const fn hash_u64_modulo(mut pgid: u64, modulo: usize) -> usize {

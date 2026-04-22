@@ -5,14 +5,14 @@ use std::fs::File;
 use std::ops::AddAssign;
 use std::os::unix::fs::FileExt;
 
+use super::PAGE_SIZE;
+use super::PGID_NULL;
 use super::compute_checksum;
 use super::hash_u64_modulo;
 use super::page_base::PagePrefix;
 use super::page_superblock::*;
 use super::pgid_valid;
 use super::serialization::*;
-use super::PAGE_SIZE;
-use super::PGID_NULL;
 use crate::mooo_assert;
 use crate::sync::*;
 
@@ -20,20 +20,15 @@ const SHARD_CNT: usize = 256;
 const FIRST_TX_ID: u64 = 1;
 
 pub(super) struct Pager {
-    file: File,
-
-    frames: Box<[FrameHeader]>,
-    pages:  Box<[FrameBuffer]>,
-
+    file:            File,
+    frames:          Box<[FrameHeader]>,
+    pages:           Box<[FrameBuffer]>,
     // these are Mutexs instead of RwLocks because we often have to take a read-lock, then drop it,
     // then try to take a writelock, then double check - because of sharding it is probably faster
     // to just have it be a mutex
-    shard_dirs: Box<[Mutex<HashMap<u64, usize>>]>,
-
-    eviction_hand: AtomicUsize,
-
-    tx_id: AtomicU64,
-
+    shard_dirs:      Box<[Mutex<HashMap<u64, usize>>]>,
+    eviction_hand:   AtomicUsize,
+    tx_id:           AtomicU64,
     curr_superblock: RwLock<SuperblockHeader>,
     write_tx_lock:   Mutex<()>,
 }
@@ -359,7 +354,7 @@ impl Pager {
     }
 
     #[must_use = "RAII WriteTxHdl releases when dropped"]
-    pub(super) fn write_tx<'tx>(&'tx self) -> WriteBumpTxHdl<'tx> {
+    pub(super) fn write_tx<'tx>(&'tx self) -> WriteTxHdlBump<'tx> {
         let lock = self.write_tx_lock.lock().unwrap();
 
         let mut superblock = self.curr_superblock.read().expect("todo").clone();
@@ -367,7 +362,7 @@ impl Pager {
         superblock.txid += 1;
         superblock.pgid.set((prev_pgid + 1) % 2);
 
-        WriteBumpTxHdl {
+        WriteTxHdlBump {
             pager: self,
             inner: RefCell::new(WriteTxHdlInner {
                 superblock:    superblock,
@@ -515,7 +510,6 @@ pub(super) trait PageWriter<'tx> {
     /// Note: it is the implementors job to set the `pgid` of this handed our WrHdl
     fn get_page_write(&self, pgid: u64) -> Result<WrHdl<'tx>, PagerErr>;
     fn update_catalog_root_id(&self, pgid: u64);
-    fn free_page(&self, pgid: u64) -> Result<(), PagerErr>;
 }
 
 // ------------ ReadTx -----------------------------------------------------------------------------
@@ -544,18 +538,18 @@ impl<'tx> PageReader<'tx> for ReadTxHdl<'tx> {
 // ------------ WriteTx ----------------------------------------------------------------------------
 
 /// A write-tx that uses bump-allocation only
-pub(super) struct WriteBumpTxHdl<'tx> {
-    pager: &'tx Pager,
-    inner: RefCell<WriteTxHdlInner>,
-    _lock: MutexGuard<'tx, ()>,
+pub(super) struct WriteTxHdlBump<'tx> {
+    pager:            &'tx Pager,
+    pub(super) inner: RefCell<WriteTxHdlInner>,
+    _lock:            MutexGuard<'tx, ()>,
 }
 
-struct WriteTxHdlInner {
-    superblock:    SuperblockHeader,
-    created_pages: HashMap<u64, usize>,
+pub(super) struct WriteTxHdlInner {
+    pub(super) superblock:    SuperblockHeader,
+    pub(super) created_pages: HashMap<u64, usize>,
 }
 
-impl WriteBumpTxHdl<'_> {
+impl WriteTxHdlBump<'_> {
     pub(super) fn commit(self, durability: Durability) -> Result<(), PagerErr> {
         let inner = self.inner.borrow_mut();
 
@@ -580,7 +574,7 @@ impl WriteBumpTxHdl<'_> {
     }
 }
 
-impl<'tx> PageReader<'tx> for WriteBumpTxHdl<'tx> {
+impl<'tx> PageReader<'tx> for WriteTxHdlBump<'tx> {
     fn get_page_read(&self, pgid: u64) -> Result<RdHdl<'tx>, PagerErr> {
         self.pager.get_page_read(pgid)
     }
@@ -590,7 +584,11 @@ impl<'tx> PageReader<'tx> for WriteBumpTxHdl<'tx> {
     }
 }
 
-impl<'tx> PageWriter<'tx> for WriteBumpTxHdl<'tx> {
+impl<'tx> PageWriter<'tx> for WriteTxHdlBump<'tx> {
+    fn update_catalog_root_id(&self, pgid: u64) {
+        self.inner.borrow_mut().superblock.catalog_head_pgid.set(pgid);
+    }
+
     /// Bump allocates - also adds page to our dirty-page linked list
     fn get_page_alloc(&self) -> Result<WrHdl<'tx>, PagerErr> {
         let mut inner = self.inner.borrow_mut();
@@ -615,16 +613,6 @@ impl<'tx> PageWriter<'tx> for WriteBumpTxHdl<'tx> {
         new_whdl.buf.copy_from_slice(old_rhdl.buf);
 
         Ok(new_whdl)
-    }
-
-    fn update_catalog_root_id(&self, pgid: u64) {
-        self.inner.borrow_mut().superblock.catalog_head_pgid.set(pgid);
-    }
-
-    fn free_page(&self, _pgid: u64) -> Result<(), PagerErr> {
-        // TODO actually this should probably be implicitly called by get_page_write
-        // no-op
-        Ok(())
     }
 }
 

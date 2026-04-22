@@ -1,23 +1,36 @@
 use std::ops::Deref;
 use std::ops::DerefMut;
 
-use super::page_base::BasePage;
-use super::page_base::RangeExt;
+use super::PAGE_SIZE;
+use super::page_base::END_OF_PAGE;
 use super::page_base::PAGE_HEADER_SIZE;
+use super::page_base::PagePrefix;
 use super::page_base::SLOT_SIZE;
 use super::serialization::Serialized;
+use super::serialization::SerializedU16;
 use super::serialization::SerializedU64;
 use crate::mooo_assert;
-use crate::storage::PAGE_SIZE;
 
 // This line should give us a compile error if we set page-size too low
-pub(crate) const BTREE_KEY_MAX_LEN: usize =
-    ((PAGE_SIZE - PAGE_HEADER_SIZE as usize) / 2) - (SLOT_SIZE as usize) - size_of::<SerializedU64>();
+pub(crate) const BTREE_KEY_MAX_LEN: usize = ((PAGE_SIZE - PAGE_HEADER_SIZE as usize) / 2)
+    - (SLOT_SIZE as usize)
+    - size_of::<SerializedU64>();
 const BTREE_PAGE_USABLE_SPACE: u16 = PAGE_SIZE as u16 - PAGE_HEADER_SIZE;
+
+#[repr(C)]
+pub(super) struct BtreePageHeader {
+    pub(super) prefix:     PagePrefix,
+    pub(super) page_type:  SerializedU16,
+    pub(super) upper_ptr:  SerializedU16,
+    pub(super) free_bytes: SerializedU16,
+    pub(super) lower_ptr:  SerializedU16,
+}
+const _: () = mooo_assert!(size_of::<BtreePageHeader>() == PAGE_HEADER_SIZE as usize);
+unsafe impl Serialized for BtreePageHeader {}
 
 /// A sorted B-tree page storing key-value pairs in ascending key order.
 pub(super) struct BtreePage<Buf> {
-    core: BasePage<Buf>,
+    raw: Buf,
 }
 
 // constructors
@@ -33,20 +46,34 @@ impl<'buf> BtreePage<&'buf mut [u8; PAGE_SIZE]> {
     }
 
     pub(super) const fn from_buffer(buffer: &'buf mut [u8; PAGE_SIZE]) -> Self {
-        Self { core: BasePage::from_buffer(buffer) }
+        Self { raw: buffer }
     }
 }
 
 impl<'b> BtreePage<&'b [u8; PAGE_SIZE]> {
     pub(super) const fn from_buffer_ref(buffer: &'b [u8; PAGE_SIZE]) -> Self {
-        Self { core: BasePage::from_buffer_ref(buffer) }
+        Self { raw: buffer }
+    }
+}
+
+// deref to header
+
+impl<Buf: AsRef<[u8]>> Deref for BtreePage<Buf> {
+    type Target = BtreePageHeader;
+
+    fn deref(&self) -> &BtreePageHeader {
+        BtreePageHeader::ref_from_bytes(&self.raw.as_ref()[..PAGE_HEADER_SIZE as usize])
+    }
+}
+
+impl<Buf: AsRef<[u8]> + AsMut<[u8]>> DerefMut for BtreePage<Buf> {
+    fn deref_mut(&mut self) -> &mut BtreePageHeader {
+        BtreePageHeader::mut_from_bytes(&mut self.raw.as_mut()[..PAGE_HEADER_SIZE as usize])
     }
 }
 
 // read impl
-const TYPE_INNER: u16 = 0x0001;
-const TYPE_LEAF: u16 = 0x0002;
-// TODO
+
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) enum BtreePageType {
@@ -55,16 +82,41 @@ pub(super) enum BtreePageType {
 }
 
 impl<Buf: AsRef<[u8]>> BtreePage<Buf> {
+    fn raw(&self) -> &[u8] {
+        self.raw.as_ref()
+    }
+
+    fn free_bytes_contig(&self) -> u16 {
+        1 + self.lower_ptr.get() - self.upper_ptr.get()
+    }
+
+    fn free_bytes(&self) -> u16 {
+        self.free_bytes.get()
+    }
+
+    pub(super) fn len(&self) -> u16 {
+        (self.upper_ptr.get() - PAGE_HEADER_SIZE) / SLOT_SIZE
+    }
+
+    fn offset_len_from_slot(&self, slot_index: u16) -> (u16, u16) {
+        let base = (PAGE_HEADER_SIZE + slot_index * SLOT_SIZE) as usize;
+        let raw = self.raw.as_ref();
+        (
+            SerializedU16::ref_from_bytes(&raw[base..]).get(),
+            SerializedU16::ref_from_bytes(&raw[base + size_of::<u16>()..]).get(),
+        )
+    }
+
     pub(super) fn is_leaf(&self) -> bool {
-        self.page_flags.get() == TYPE_LEAF
+        self.page_type.get() == BtreePageType::Leaf as u16
     }
 
     pub(super) fn is_inner(&self) -> bool {
-        self.page_flags.get() == TYPE_INNER
+        self.page_type.get() == BtreePageType::Inner as u16
     }
 
     pub(super) fn get_page_type(&self) -> BtreePageType {
-        if self.page_flags.get() == TYPE_INNER {
+        if self.page_type.get() == BtreePageType::Inner as u16 {
             BtreePageType::Inner
         } else {
             BtreePageType::Leaf
@@ -75,7 +127,7 @@ impl<Buf: AsRef<[u8]>> BtreePage<Buf> {
         (BTREE_PAGE_USABLE_SPACE - self.free_bytes_contig()) >= BTREE_PAGE_USABLE_SPACE / 2
     }
 
-    ///     Returns the `(key, value)` pair stored at `slot_index`.
+    /// Returns the `(key, value)` pair stored at `slot_index`.
     pub(super) fn entry_at_slot(&self, slot_index: u16) -> (&[u8], SerializedU64) {
         mooo_assert!(slot_index < self.len());
 
@@ -86,9 +138,9 @@ impl<Buf: AsRef<[u8]>> BtreePage<Buf> {
 
         let raw = self.raw();
         (
-            &raw[(offset..offset + key_len).into_usizes()],
+            &raw[offset as usize..(offset + key_len) as usize],
             SerializedU64::read_from_bytes(
-                &raw[(offset + key_len..offset + key_len + val_size).into_usizes()],
+                &raw[(offset + key_len) as usize..(offset + key_len + val_size) as usize],
             ),
         )
     }
@@ -116,11 +168,7 @@ impl<Buf: AsRef<[u8]>> BtreePage<Buf> {
             }
         }
 
-        if low == self.len() {
-            SearchResult::Right
-        } else {
-            SearchResult::NotFound(low)
-        }
+        if low == self.len() { SearchResult::Right } else { SearchResult::NotFound(low) }
     }
 
     /// Returns an iterator over `(key, value)` pairs in ascending key order.
@@ -155,7 +203,7 @@ impl<Buf: AsRef<[u8]>> BtreePage<Buf> {
     fn has_space(&self, key: &[u8]) -> Result<u16, ()> {
         let entry_len =
             u16::try_from(key.len() + size_of::<SerializedU64>()).expect("entry too big for u16");
-        if !self.has_space_entry(entry_len) {
+        if entry_len + SLOT_SIZE > self.free_bytes.get() {
             return Err(());
         }
         Ok(entry_len)
@@ -165,11 +213,66 @@ impl<Buf: AsRef<[u8]>> BtreePage<Buf> {
 // write impl
 
 impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
+    fn write_slot(&mut self, slot_index: u16, offset: u16, len: u16) {
+        let base = (PAGE_HEADER_SIZE + slot_index * SLOT_SIZE) as usize;
+        let raw = self.raw.as_mut();
+        SerializedU16::from(offset).write_to_prefix(&mut raw[base..]);
+        SerializedU16::from(len).write_to_prefix(&mut raw[base + size_of::<u16>()..]);
+    }
+
+    fn clear_entries(&mut self) {
+        self.upper_ptr = PAGE_HEADER_SIZE.into();
+        self.lower_ptr = END_OF_PAGE.into();
+        self.free_bytes = BTREE_PAGE_USABLE_SPACE.into();
+
+        #[cfg(debug_assertions)]
+        self.raw.as_mut()[PAGE_HEADER_SIZE as usize..].fill(0);
+    }
+
+    fn prepare_insert(&mut self, slot_index: u16, entry_len: u16) -> Option<u16> {
+        if entry_len + SLOT_SIZE > self.free_bytes.get() {
+            return None;
+        }
+
+        let lower = self.lower_ptr.get();
+        let offset = lower - entry_len + 1;
+
+        if slot_index < self.len() {
+            let start = (PAGE_HEADER_SIZE + slot_index * SLOT_SIZE) as usize;
+            let end = (PAGE_HEADER_SIZE + self.len() * SLOT_SIZE) as usize;
+            let dest = start + SLOT_SIZE as usize;
+            self.raw.as_mut().copy_within(start..end, dest);
+        }
+
+        self.write_slot(slot_index, offset, entry_len);
+        self.upper_ptr = (self.upper_ptr.get() + SLOT_SIZE).into();
+        self.lower_ptr = (lower - entry_len).into();
+        self.free_bytes = (self.free_bytes.get() - SLOT_SIZE - entry_len).into();
+
+        Some(offset)
+    }
+
+    fn delete_slot_entry(&mut self, slot_index: u16) {
+        assert!(slot_index < self.len());
+        let (offset, len) = self.offset_len_from_slot(slot_index);
+
+        let del = (PAGE_HEADER_SIZE + slot_index * SLOT_SIZE) as usize;
+        let end = (PAGE_HEADER_SIZE + self.len() * SLOT_SIZE) as usize;
+        self.raw.as_mut().copy_within(del + SLOT_SIZE as usize..end, del);
+
+        self.upper_ptr = (self.upper_ptr.get() - SLOT_SIZE).into();
+        self.free_bytes = (self.free_bytes.get() + SLOT_SIZE + len).into();
+
+        #[cfg(debug_assertions)]
+        {
+            self.raw.as_mut()[offset as usize..(offset + len) as usize].fill(0);
+            let stale = (PAGE_HEADER_SIZE + self.len() * SLOT_SIZE) as usize;
+            self.raw.as_mut()[stale..stale + SLOT_SIZE as usize].fill(0);
+        }
+    }
+
     pub(super) fn set_page_type(&mut self, page_type: BtreePageType) {
-        self.page_flags.set(match page_type {
-            BtreePageType::Leaf => TYPE_LEAF,
-            BtreePageType::Inner => TYPE_INNER,
-        });
+        self.page_type.set(page_type as u16);
         self.prefix.dbg_pad = *match page_type {
             BtreePageType::Leaf => b"BtLf",
             BtreePageType::Inner => b"BtIn",
@@ -186,12 +289,10 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
     pub(super) fn overwrite_value_with_slot_index(&mut self, slot_index: u16, val: SerializedU64) {
         let (offset, len) = self.offset_len_from_slot(slot_index);
         let start = offset as usize + len as usize - size_of::<SerializedU64>();
-        self.raw_mut()[start..start + size_of::<SerializedU64>()].copy_from_slice(val.as_bytes());
+        self.raw.as_mut()[start..start + size_of::<SerializedU64>()]
+            .copy_from_slice(val.as_bytes());
     }
 
-    /// Core insert path. When `ordered` is `true`, uses binary search to find the correct
-    /// position and handles in-place update if the key already exists. When `false`,
-    /// appends to the end of the slot array without a search (caller must ensure order).
     fn insert_internal(&mut self, key: &[u8], val: SerializedU64, ordered: bool) -> bool {
         mooo_assert!(
             key.len() <= BTREE_KEY_MAX_LEN,
@@ -201,7 +302,6 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
             key.len()
         );
 
-        // TODO refactor this and heap_page::append() to nto duplicate code
         let key_len = u16::try_from(key.len()).expect("key too large for u16");
 
         let entry_len = match self.has_space(key) {
@@ -209,9 +309,7 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
             Ok(entry_len) => entry_len,
         };
 
-        if self.free_bytes_contig() < (entry_len + SLOT_SIZE)
-            && self.free_bytes() >= (entry_len + SLOT_SIZE)
-        {
+        if self.free_bytes_contig() < entry_len + SLOT_SIZE {
             self.compact();
         }
 
@@ -235,21 +333,16 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
                 None => return false,
             }
         } else {
-            if !self.has_space_entry(entry_len) {
-                return false;
-            }
-            let lower = self.lower_ptr.get();
-            let free = self.free_bytes.get();
-            let off = lower - entry_len + 1;
+            let off = self.lower_ptr.get() - entry_len + 1;
             self.write_slot(slot_index, off, entry_len);
-            self.lower_ptr = (lower - entry_len).into();
-            self.free_bytes = (free - entry_len).into();
+            self.lower_ptr = (off - 1).into();
+            self.free_bytes = (self.free_bytes.get() - entry_len).into();
             off
         };
 
-        self.raw_mut()[(offset..offset + key_len).into_usizes()].copy_from_slice(key);
+        self.raw.as_mut()[offset as usize..(offset + key_len) as usize].copy_from_slice(key);
         let val_size = size_of::<SerializedU64>() as u16;
-        self.raw_mut()[(offset + key_len..offset + key_len + val_size).into_usizes()]
+        self.raw.as_mut()[(offset + key_len) as usize..(offset + key_len + val_size) as usize]
             .copy_from_slice(val.as_bytes());
         true
     }
@@ -260,29 +353,23 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
     }
 
     /// Appends `(key, val)` to the end of the slot array without a binary search.
-    /// **Breaks the sort invariant** unless the caller guarantees the entry belongs at the end.
+    /// Note: Breaks the sort invariant unless the caller guarantees the entry belongs at the end.
     pub(super) fn insert_unordered(&mut self, key: &[u8], val: SerializedU64) -> bool {
         self.insert_internal(key, val, false)
     }
 
-    /// Defragments the page by rewriting all live entries into a contiguous block. Sort order is preserved.
-    pub(super) fn compact(&mut self) {
+    fn compact(&mut self) {
         let mut cloned_raw = [0u8; PAGE_SIZE];
-
         cloned_raw.copy_from_slice(self.raw());
         let cloned_page = BtreePage::from_buffer(&mut cloned_raw);
-
         self.clear_entries();
-
         for (k, v) in cloned_page.iter() {
             self.insert_unordered(k, v);
         }
     }
 
-    /// Right page should be newly initialized! Or had `clear_entries` called at least.
-    /// Redistributes the latter half of `self`'s entries and puts into `right_page`.
-    /// `right_page` should be empty and already otherwise initialized
-    /// This also performs compaction.
+    /// Moves the upper half of entries into `right_page`, which must be empty.
+    /// Compacts both sides.
     pub(super) fn redistribute_into(&mut self, right_page: &mut Self) {
         mooo_assert!(right_page.len() == 0);
 
@@ -292,32 +379,13 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
         self.clear_entries();
 
         let midpoint = og_page.len() / 2;
-        let left_range = 0..midpoint;
-        let right_range = midpoint..og_page.len();
 
-        for (k, v) in left_range.map(|index| og_page.entry_at_slot(index)) {
+        for (k, v) in (0..midpoint).map(|i| og_page.entry_at_slot(i)) {
             self.insert_unordered(k, v);
         }
-
-        for (k, v) in right_range.map(|index| og_page.entry_at_slot(index)) {
+        for (k, v) in (midpoint..og_page.len()).map(|i| og_page.entry_at_slot(i)) {
             right_page.insert_unordered(k, v);
         }
-    }
-}
-
-// deref
-
-impl<Buf: AsRef<[u8]>> Deref for BtreePage<Buf> {
-    type Target = BasePage<Buf>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.core
-    }
-}
-
-impl<Buf: AsRef<[u8]> + AsMut<[u8]>> DerefMut for BtreePage<Buf> {
-    fn deref_mut(&mut self) -> &mut BasePage<Buf> {
-        &mut self.core
     }
 }
 
