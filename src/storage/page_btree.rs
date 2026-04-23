@@ -1,14 +1,8 @@
 use std::ops::Deref;
 use std::ops::DerefMut;
 
+use super::serialization::*;
 use super::PAGE_SIZE;
-use super::page_base::END_OF_PAGE;
-use super::page_base::PAGE_HEADER_SIZE;
-use super::page_base::PagePrefix;
-use super::page_base::SLOT_SIZE;
-use super::serialization::Serialized;
-use super::serialization::SerializedU16;
-use super::serialization::SerializedU64;
 use crate::mooo_assert;
 
 // This line should give us a compile error if we set page-size too low
@@ -168,7 +162,11 @@ impl<Buf: AsRef<[u8]>> BtreePage<Buf> {
             }
         }
 
-        if low == self.len() { SearchResult::Right } else { SearchResult::NotFound(low) }
+        if low == self.len() {
+            SearchResult::Right
+        } else {
+            SearchResult::NotFound(low)
+        }
     }
 
     /// Returns an iterator over `(key, value)` pairs in ascending key order.
@@ -273,7 +271,7 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
 
     pub(super) fn set_page_type(&mut self, page_type: BtreePageType) {
         self.page_type.set(page_type as u16);
-        self.prefix.dbg_pad = *match page_type {
+        self.prefix.pgtype = *match page_type {
             BtreePageType::Leaf => b"BtLf",
             BtreePageType::Inner => b"BtIn",
         };

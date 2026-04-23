@@ -1,13 +1,8 @@
 use std::ops::Deref;
 use std::ops::DerefMut;
 
+use super::serialization::*;
 use super::PAGE_SIZE;
-use super::page_base::END_OF_PAGE;
-use super::page_base::PAGE_HEADER_SIZE;
-use super::page_base::PagePrefix;
-use super::page_base::SLOT_SIZE;
-use super::serialization::Serialized;
-use super::serialization::SerializedU16;
 use crate::mooo_assert;
 
 #[repr(C)]
@@ -35,7 +30,7 @@ impl<'b> HeapPage<&'b mut [u8; PAGE_SIZE]> {
     pub(super) fn new_with_buffer(buffer: &'b mut [u8; PAGE_SIZE]) -> Self {
         let mut page = Self::from_buffer(buffer);
         page.clear_entries();
-        page.prefix.dbg_pad = *b"HEAP";
+        page.prefix.pgtype = *b"HEAP";
         page
     }
 }

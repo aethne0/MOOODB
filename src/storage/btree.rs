@@ -3,13 +3,13 @@ use std::cell::RefCell;
 use std::cell::RefMut;
 use std::mem::MaybeUninit;
 
-use super::PagerErr;
-use super::page_base::SLOT_IDX_NULL;
 use super::page_btree::BtreePage;
-use super::pager::*;
-use super::serialization::SerializedU64;
+use super::serialization::*;
+use super::storage_manager::*;
+use super::PagerErr;
 use crate::mooo_assert;
 use crate::storage::page_btree::BtreePageType;
+use crate::storage::BTREE_KEY_MAX_LEN;
 
 // TODO page leaks on early return - maybe we should call commit or something on CoW shadowed pages
 // er wait no i dont think it matters... cause we will just recover the old superblock
@@ -30,7 +30,7 @@ impl Btree {
 
     #[must_use]
     pub(crate) fn new<'tx, R: PageReader<'tx> + PageWriter<'tx>>(
-        tx: &R,
+        tx: &mut R,
     ) -> Result<Btree, PagerErr> {
         let whdl = tx.get_page_alloc()?;
         let pgid = whdl.get_pgid();
@@ -46,8 +46,8 @@ impl Btree {
 
     fn traverse<'tx, R: PageReader<'tx>>(
         &mut self, tx: &R, key: &[u8],
-    ) -> Result<TraversalRead<'tx>, PagerErr> {
-        let mut traversal = TraversalRead::new();
+    ) -> Result<Traversal<RdHdl<'tx>>, PagerErr> {
+        let mut traversal = Traversal::<RdHdl<'_>>::new();
         let mut next_pgid = self.root_pgid;
 
         loop {
@@ -72,9 +72,9 @@ impl Btree {
     }
 
     fn traverse_cow<'tx, R: PageReader<'tx> + PageWriter<'tx>>(
-        &mut self, tx: &R, key: &[u8],
-    ) -> Result<TraversalWrite<'tx>, PagerErr> {
-        let mut traversal = TraversalWrite::new();
+        &mut self, tx: &mut R, key: &[u8],
+    ) -> Result<Traversal<WrHdl<'tx>>, PagerErr> {
+        let mut traversal = Traversal::<WrHdl<'_>>::new();
         let mut next_pgid = self.root_pgid;
 
         loop {
@@ -166,7 +166,7 @@ impl Btree {
     // ------------ Insert -------------------------------------------------------------------------
 
     pub(crate) fn insert<'tx, R: PageReader<'tx> + PageWriter<'tx>>(
-        &mut self, tx: &R, key: &[u8], val: impl Into<SerializedU64>,
+        &mut self, tx: &mut R, key: &[u8], val: impl Into<SerializedU64>,
     ) -> Result<(), PagerErr> {
         let val = val.into();
 
@@ -228,7 +228,7 @@ impl Btree {
     // ------------ Delete -------------------------------------------------------------------------
 
     pub(crate) fn delete<'tx, R: PageReader<'tx> + PageWriter<'tx>>(
-        &mut self, tx: &R, key: &[u8],
+        &mut self, tx: &mut R, key: &[u8],
     ) -> Result<(), PagerErr> {
         // TODO
         let traversal = self.traverse_cow(tx, key)?;
@@ -251,6 +251,172 @@ impl Btree {
         }
 
         todo!()
+    }
+
+    // ---------------------------------------------------------------------------------------------
+    // *            Freelist Methods                                                               *
+    // ---------------------------------------------------------------------------------------------
+
+    // ------------ Pop min leq --------------------------------------------------------------------
+
+    /// Removes and returns the minimum entry if its key is <= `bound`, otherwise returns `None`.
+    /// TODO this is CoWing even if we dont make a change,
+    pub(crate) fn pop_min_lt<'tx, R: PageReader<'tx> + PageWriter<'tx>>(
+        &mut self, tx: &mut R, bound: &[u8],
+    ) -> Result<Option<SerializedU64>, PagerErr> {
+        let mut traversal = Traversal::<WrHdl<'_>>::new();
+        let mut next_pgid = self.root_pgid;
+
+        loop {
+            let whdl = tx.get_page_write(next_pgid)?;
+
+            if traversal.len() > 0 {
+                let (mut parent_whdl, slot_idx) = traversal.last_mut();
+                let mut parent_page = BtreePage::from_buffer(parent_whdl.buf);
+                parent_page.overwrite_value_with_slot_index(slot_idx, whdl.get_pgid().into());
+            }
+
+            let curr_page = BtreePage::from_buffer(whdl.buf);
+
+            match curr_page.get_page_type() {
+                BtreePageType::Inner => {
+                    if curr_page.len() == 0 {
+                        return Ok(None);
+                    }
+                    next_pgid = curr_page.entry_at_slot(0).1.get();
+                    traversal.push((whdl, 0));
+                }
+                BtreePageType::Leaf => {
+                    traversal.push((whdl, SLOT_IDX_NULL));
+                    break;
+                }
+            }
+        }
+
+        let mut key = [0u8; BTREE_KEY_MAX_LEN];
+        let (keylen, val) = {
+            let (mut leaf, _) = traversal.last_mut();
+            let curr_page = BtreePage::from_buffer(leaf.buf);
+            if curr_page.len() == 0 {
+                return Ok(None);
+            }
+            let (k, v) = curr_page.entry_at_slot(0);
+            if k >= bound {
+                return Ok(None);
+            }
+            key[..k.len()].copy_from_slice(k);
+            (k.len(), v)
+        };
+
+        {
+            let (mut leaf, _) = traversal.last_mut();
+            let mut curr_page = BtreePage::from_buffer(leaf.buf);
+            curr_page.delete(&key[..keylen]);
+        }
+
+        self.root_pgid = traversal.index_ref(0).0.get_pgid();
+        Ok(Some(val))
+    }
+}
+
+// -------------------------------------------------------------------------------------------------
+// *            Cursor - TODO just rewrite this lul                                                *
+// -------------------------------------------------------------------------------------------------
+
+pub(crate) struct FreelistCursor<'tx> {
+    stack: Traversal<RdHdl<'tx>>,
+    leaf:  Option<(RdHdl<'tx>, u16)>,
+}
+
+impl<'tx> FreelistCursor<'tx> {
+    pub(crate) fn new<R: PageReader<'tx>>(tx: &R, root_pgid: u64) -> Result<Self, PagerErr> {
+        let mut cursor = Self { stack: Traversal::new(), leaf: None };
+        cursor.descend_leftmost(tx, root_pgid)?;
+        Ok(cursor)
+    }
+
+    fn descend_leftmost<R: PageReader<'tx>>(
+        &mut self, tx: &R, mut pgid: u64,
+    ) -> Result<(), PagerErr> {
+        loop {
+            let rhdl = tx.get_page_read(pgid)?;
+            let (page_type, next_pgid_opt) = {
+                let page = BtreePage::from_buffer_ref(rhdl.buf);
+                let pt = page.get_page_type();
+                let np = if matches!(pt, BtreePageType::Inner) && page.len() > 0 {
+                    Some(page.entry_at_slot(0).1.get())
+                } else {
+                    None
+                };
+                (pt, np)
+            };
+            match page_type {
+                BtreePageType::Inner => match next_pgid_opt {
+                    Some(np) => {
+                        pgid = np;
+                        self.stack.push((rhdl, 0));
+                    }
+                    None => return Ok(()),
+                },
+                BtreePageType::Leaf => {
+                    self.leaf = Some((rhdl, 0));
+                    return Ok(());
+                }
+            }
+        }
+    }
+
+    pub(crate) fn next<R: PageReader<'tx>>(
+        &mut self, tx: &R,
+    ) -> Result<Option<FreeEntry>, PagerErr> {
+        loop {
+            let maybe_val = match self.leaf {
+                Some((ref rhdl, slot)) => {
+                    // TODO HACK
+                    let page = BtreePage::from_buffer_ref(rhdl.buf);
+                    if slot < page.len() {
+                        let key = page.entry_at_slot(slot).0;
+                        let free_entry = FreeEntry::read_from_bytes(key);
+                        Some(free_entry)
+                    } else {
+                        None
+                    }
+                }
+                None => None,
+            };
+
+            if let Some(val) = maybe_val {
+                self.leaf.as_mut().unwrap().1 += 1;
+                return Ok(Some(val));
+            }
+
+            self.leaf = None;
+
+            // Walk up the stack to find the next unvisited child, popping exhausted levels.
+            let next_pgid = loop {
+                if self.stack.len() == 0 {
+                    return Ok(None);
+                }
+                let (next_slot, pgid_opt) = {
+                    let (ref rhdl, slot) = self.stack.last_ref();
+                    let page = BtreePage::from_buffer_ref(rhdl.buf);
+                    let ns = slot + 1;
+                    if ns < page.len() {
+                        (ns, Some(page.entry_at_slot(ns).1.get()))
+                    } else {
+                        (ns, None)
+                    }
+                };
+                if let Some(pgid) = pgid_opt {
+                    *self.stack.last_slot_mut() = next_slot;
+                    break pgid;
+                } else {
+                    self.stack.pop();
+                }
+            };
+
+            self.descend_leftmost(tx, next_pgid)?;
+        }
     }
 }
 
@@ -294,16 +460,14 @@ fn redistribute_with_child_ptr(
 
 // ------------ Page traversal list ----------------------------------------------------------------
 
-type TraversalWrite<'a> = _Traversal<WrHdl<'a>>;
-type TraversalRead<'a> = _Traversal<RdHdl<'a>>;
-
-const STACK_SIZE: usize = 48;
-struct _Traversal<T> {
+// const STACK_SIZE: usize = 48;
+const STACK_SIZE: usize = 8;
+struct Traversal<T> {
     head: usize,
     arr:  [MaybeUninit<(RefCell<T>, u16)>; STACK_SIZE],
 }
 
-impl<T> _Traversal<T> {
+impl<T> Traversal<T> {
     fn new() -> Self {
         Self { arr: [const { MaybeUninit::uninit() }; STACK_SIZE], head: 0 }
     }
@@ -338,9 +502,21 @@ impl<T> _Traversal<T> {
     fn len(&self) -> usize {
         self.head
     }
+
+    fn pop(&mut self) -> (T, u16) {
+        mooo_assert!(self.head > 0);
+        self.head -= 1;
+        let entry = unsafe { self.arr[self.head].assume_init_read() };
+        (entry.0.into_inner(), entry.1)
+    }
+
+    fn last_slot_mut(&mut self) -> &mut u16 {
+        mooo_assert!(self.head > 0);
+        &mut unsafe { self.arr[self.head - 1].assume_init_mut() }.1
+    }
 }
 
-impl<T> Drop for _Traversal<T> {
+impl<T> Drop for Traversal<T> {
     fn drop(&mut self) {
         for i in 0..self.len() {
             unsafe { self.arr[i].assume_init_drop() };

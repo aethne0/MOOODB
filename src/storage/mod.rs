@@ -3,23 +3,20 @@
 //! ▄▀▀▀█▄ ▐█.▪ ▄█▀▄ ▐▀▀▄ ▄█▀▀█ ▄█ ▀█▄▐▀▀▪▄
 //! ▐█▄▪▐█ ▐█▌·▐█▌.▐▌▐█•█▌▐█ ▪▐▌▐█▄▪▐█▐█▄▄▌
 //!  ▀▀▀▀  ▀▀▀  ▀█▄▀▪.▀  ▀ ▀  ▀ ·▀▀▀▀  ▀▀▀
-mod page_base;
+mod btree;
+mod heap;
 mod page_btree;
 mod page_heap;
 mod page_superblock;
 mod serialization;
-
-mod btree;
-mod heap;
-mod manager;
-mod pager;
+mod storage_manager;
 
 #[cfg(test)]
 mod test;
 
 use crate::mooo_assert;
 pub(crate) use page_btree::BTREE_KEY_MAX_LEN;
-use pager::*;
+pub(crate) use storage_manager::*;
 
 /// PAGE_SIZE maybe be inclusively from 256-32KiB, and must be a power of two
 const PAGE_SIZE: usize = 0x100;

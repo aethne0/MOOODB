@@ -37,6 +37,24 @@ pub mod assert;
 pub mod storage;
 pub mod sync;
 
-// TODO
-// 1. in page-base we are using read_u16 etc - we should be using our serialized types
-// 2. metrics: rare frog event counter
+// TODO we need some way mark claimed pages as de-claimed, if we end up aborting something
+// see: Btree::pop_min_lt
+//
+// TODO move pageid back to after checksum
+//
+// TODO the freelist always bumpallocates, so we are leaking 1 page per tx
+// this is quite tricky - could we have two freelists, one for each superblock?
+// and we use one but append to the other...
+// The problem right now is that we cant do btree operations on the freelist while also
+// using the freelist allocator, cause we get page conflicts
+//
+// i think we need to keep a cursor on the OLD freelist root, and use that cursor to traverse as we
+// free pages and use them for the NEW freelist root - i think this should work, all the previous
+// freelist pages will be readonly
+//
+// TODO btree has large stack allocations
+//
+// TODO lazy doesnt work (need to write out dirty frames before evicting)
+//
+// TODO at high numbers of TXs we get some frame conflict error when we have a
+// smaller pager size (frame count)

@@ -1,6 +1,6 @@
-use super::PagerErr;
 use super::page_heap::HeapPage;
-use super::pager::*;
+use super::storage_manager::*;
+use super::PagerErr;
 use crate::mooo_assert;
 
 /// It is the responsibility of the caller to update anything that may point to this `root_pgid`
@@ -17,7 +17,9 @@ impl Heap {
     }
 
     #[must_use]
-    pub(crate) fn new<'tx, R: PageReader<'tx> + PageWriter<'tx>>(tx: &R) -> Result<Heap, PagerErr> {
+    pub(crate) fn new<'tx, R: PageReader<'tx> + PageWriter<'tx>>(
+        tx: &mut R,
+    ) -> Result<Heap, PagerErr> {
         let whdl = tx.get_page_alloc()?;
         let pgid = whdl.get_pgid();
         HeapPage::new_with_buffer(whdl.buf);
@@ -47,7 +49,7 @@ impl Heap {
     // ------------ Insert -------------------------------------------------------------------------
 
     pub(crate) fn insert<'tx, R: PageReader<'tx> + PageWriter<'tx>>(
-        &mut self, tx: &R, val: &[u8],
+        &mut self, tx: &mut R, val: &[u8],
     ) -> Result<Option<u16>, PagerErr> {
         let whdl = tx.get_page_write(self.pgid)?;
         // todo page leak - see comment at top of btree.rs
@@ -61,7 +63,7 @@ impl Heap {
     // ------------ Delete -------------------------------------------------------------------------
 
     pub(crate) fn delete<'tx, R: PageReader<'tx> + PageWriter<'tx>>(
-        &mut self, tx: &R, slot_idx: u16,
+        &mut self, tx: &mut R, slot_idx: u16,
     ) -> Result<(), PagerErr> {
         let whdl = tx.get_page_write(self.pgid)?;
         // todo page leak - see comment at top of btree.rs

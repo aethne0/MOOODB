@@ -1,6 +1,118 @@
+use std::mem::offset_of;
 use std::ops::AddAssign;
 
+use super::pgid_valid;
+use super::PAGE_SIZE;
 use crate::mooo_assert;
+
+// ------------ Common Page Header Prefix ----------------------------------------------------------
+
+pub(super) const PAGE_HEADER_SIZE: u16 = 0x20;
+pub(super) const SLOT_SIZE: u16 = 2 * size_of::<u16>() as u16;
+pub(super) const SLOT_IDX_NULL: u16 = u16::MAX;
+pub(super) const END_OF_PAGE: u16 = PAGE_SIZE as u16 - 1;
+
+/// The first 24 bytes of every page on disk, regardless of page type.
+///
+/// Layout (all big-endian):
+/// ```text
+/// offset  0 | checksum   u32
+/// offset  4 | dbg_pad    [u8;4]
+/// offset  8 | txid       u64
+/// offset 16 | pgid       u64
+/// ```
+#[derive(Clone)]
+#[repr(C)]
+pub(super) struct PagePrefix {
+    pub(super) pgid:     SerializedU64,
+    pub(super) checksum: SerializedU32,
+    pub(super) pgtype:   [u8; 4],
+    pub(super) txid:     SerializedU64,
+}
+unsafe impl Serialized for PagePrefix {}
+
+/// Where to start checksumming, we want to compute checksum using only the bytes AFTER the
+/// checksum, or else writing the checksum itself will invalidate itself.
+pub(super) const CHECKSUM_START_OFFSET: usize = offset_of!(PagePrefix, pgtype);
+
+impl PagePrefix {
+    pub(super) fn new(pgid: u64, checksum: u32, tx_id: u64) -> Self {
+        Self {
+            checksum: checksum.into(),
+            pgtype:   *b"SUPA",
+            pgid:     pgid.into(),
+            txid:     tx_id.into(),
+        }
+    }
+}
+
+// ------------ FreeEntry --------------------------------------------------------------------------
+
+#[derive(Clone, Copy)]
+#[repr(C)]
+pub(super) struct FreeEntry {
+    pub(super) txid: SerializedU64,
+    pub(super) pgid: SerializedU64,
+}
+
+impl FreeEntry {
+    pub(super) fn new(txid: impl Into<SerializedU64>, pgid: impl Into<SerializedU64>) -> Self {
+        Self { txid: txid.into(), pgid: pgid.into() }
+    }
+
+    pub(super) fn txid_bound(txid: impl Into<SerializedU64>) -> Self {
+        Self { txid: txid.into(), pgid: 0.into() }
+    }
+}
+unsafe impl Serialized for FreeEntry {}
+
+// ------------ HeapPtr ----------------------------------------------------------------------------
+
+/// most-significant 48 bits are pgid, lower are slot
+#[derive(Clone, Copy, PartialEq, Eq)]
+#[repr(C)]
+pub(super) struct HeapPtr(SerializedU64);
+impl HeapPtr {
+    pub(super) fn new(pgid: u64, slot_idx: u16) -> Self {
+        mooo_assert!(pgid_valid(pgid));
+        let val = (pgid << 16) | (slot_idx as u64);
+        Self(val.into())
+    }
+
+    pub(super) fn set_pgid(&mut self, pgid: u64) {
+        mooo_assert!(pgid_valid(pgid));
+        self.0 = ((pgid << 16) | (self.0.get() & 0xffff)).into();
+    }
+
+    pub(super) fn set_slot(&mut self, slot_idx: u16) {
+        self.0 = ((self.0.get() & 0xffff_ffff_ffff_0000) | (slot_idx as u64)).into();
+    }
+
+    pub(super) fn pgid(&self) -> u64 {
+        (self.0.get() & 0xffff_ffff_ffff_0000) >> 16
+    }
+
+    pub(super) fn slot(&self) -> u16 {
+        (self.0.get() & 0xffff) as u16
+    }
+}
+unsafe impl Serialized for HeapPtr {}
+impl From<SerializedU64> for HeapPtr {
+    fn from(value: SerializedU64) -> Self {
+        HeapPtr(value)
+    }
+}
+impl Into<SerializedU64> for HeapPtr {
+    fn into(self) -> SerializedU64 {
+        self.0
+    }
+}
+
+// ▪   ▐ ▄ ▄▄▄▄▄▄▄▄ . ▄▄ • ▄▄▄ .▄▄▄
+// ██ •█▌▐█•██  ▀▄.▀·▐█ ▀ ▪▀▄.▀·▀▄ █·
+// ▐█·▐█▐▐▌ ▐█.▪▐▀▀▪▄▄█ ▀█▄▐▀▀▪▄▐▀▀▄
+// ▐█▌██▐█▌ ▐█▌·▐█▄▄▌▐█▄▪▐█▐█▄▄▌▐█•█▌   Serialized Integer Types
+// ▀▀▀▀▀ █▪ ▀▀▀  ▀▀▀ ·▀▀▀▀  ▀▀▀ .▀  ▀
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(transparent)]
@@ -112,6 +224,8 @@ impl From<u16> for SerializedU16 {
         Self(v.to_be_bytes())
     }
 }
+
+// ------------ Common Serialized Integer Trait ----------------------------------------------------
 
 /// A type that is serializable, and resides on disk, or chaced pages, or network packet, in
 /// serialized form.
