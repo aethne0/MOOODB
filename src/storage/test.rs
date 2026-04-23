@@ -8,10 +8,10 @@ use std::fs::File;
 use std::fs::OpenOptions;
 use std::sync::atomic::AtomicUsize;
 
+use rand::rngs::ChaCha8Rng;
 use rand::Rng;
 use rand::RngExt;
 use rand::SeedableRng;
-use rand::rngs::ChaCha8Rng;
 
 use super::btree::Btree;
 use super::*;
@@ -62,8 +62,7 @@ fn testfile() -> File {
 #[test]
 fn btree_inserts_single() {
     eprintln!("");
-    let file = f_opts().open("/xblk/test/test.moo").unwrap();
-    let mgr = Pager::new(64, file);
+    let mgr = Pager::new(64, testfile());
 
     let mut rng = get_rand();
 
@@ -108,8 +107,7 @@ fn btree_inserts_single() {
 #[test]
 fn btree_deletes_single() {
     eprintln!("");
-    let file = f_opts().open("/xblk/test/test.moo").unwrap();
-    let mgr = Pager::new(64, file);
+    let mgr = Pager::new(64, testfile());
     let mut rng = get_rand();
 
     // const KEY_SIZE: usize = BTREE_KEY_MAX_LEN;
@@ -180,7 +178,6 @@ fn btree_deletes_single() {
 #[test]
 fn btree_inserts_threads() {
     eprintln!("");
-    let mut rng = get_rand();
     let file = testfile();
     let mgr = Pager::new(64, file);
 

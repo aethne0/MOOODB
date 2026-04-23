@@ -5,14 +5,14 @@ use std::fs::File;
 use std::ops::AddAssign;
 use std::os::unix::fs::FileExt;
 
-use super::PAGE_SIZE;
-use super::PGID_NULL;
 use super::compute_checksum;
 use super::hash_u64_modulo;
 use super::page_base::PagePrefix;
 use super::page_superblock::*;
 use super::pgid_valid;
 use super::serialization::*;
+use super::PAGE_SIZE;
+use super::PGID_NULL;
 use crate::mooo_assert;
 use crate::sync::*;
 
