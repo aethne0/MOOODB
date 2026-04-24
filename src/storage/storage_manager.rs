@@ -239,9 +239,6 @@ impl Pager {
                     .unwrap();
 
                 if frame_usage_ctr == 0 {
-                    if frame.dirty.load(Ordering::Relaxed) {
-                        mooo_assert!(false, "todo");
-                    }
                     return frame_idx;
                 }
             }
@@ -288,13 +285,33 @@ impl Pager {
                     let mut loading_guard = whdl.frame.loading.write().unwrap();
                     let frame_pgid = std::mem::replace(&mut *loading_guard, pgid);
 
+                    // TODO we should drop this and retake it - we are spinning looking for an
+                    // eviction candidate while holding the lock
+                    // (It is "correct" for now though)
                     dir.insert(pgid, whdl.frame.index);
                     drop(dir);
 
+                    // frame is dirty so we have to write out
+                    // we do this while the frame is still in the old dir, because if we remove it
+                    // before hand the following race can happen
+                    //
+                    // 1. we (thread A) remove it from dir
+                    // 2. thread B wants the page, looks in dir, doesnt find it
+                    // 3. thread B tries to load off disk
+                    // -> We havent written it out yet though, so theyll load non-existent/stale data.
+                    //
+                    // We need thread B to wait on our loading lock instead, and then see the frame
+                    // has been evicted, and THEN load it in (because well then have written it out)
+                    if whdl.frame.dirty.load(Ordering::Relaxed) {
+                        whdl.pgid = frame_pgid;
+                        self.io_write(&mut whdl)?;
+                        whdl.pgid = pgid;
+                    }
+
                     // remove from old dir if needed
-                    // It is ok if threads find this page before we do this, because we are holding the
-                    // loading lock, and once we release it they will see the new (to them unexpected)
-                    // pgid and they'll retry
+                    // It is ok if threads find this page before we do this, because we are holding
+                    // the loading lock, and once we release it they will see the new (to them
+                    // unexpected) pgid and they'll retry
                     let mut old_dir =
                         self.shard_dirs[hash_u64_modulo(frame_pgid, SHARD_CNT)].lock().unwrap();
                     old_dir.remove(&frame_pgid);
@@ -340,6 +357,12 @@ impl Pager {
 
                 dir.insert(pgid, whdl.frame.index);
                 drop(dir);
+
+                if whdl.frame.dirty.load(Ordering::Relaxed) {
+                    whdl.pgid = frame_pgid;
+                    self.io_write(&mut whdl)?;
+                    whdl.pgid = pgid;
+                }
 
                 let mut old_dir =
                     self.shard_dirs[hash_u64_modulo(frame_pgid, SHARD_CNT)].lock().unwrap();
