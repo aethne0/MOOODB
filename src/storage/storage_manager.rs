@@ -751,9 +751,9 @@ impl<'tx> WriteTx<'tx> {
             self.pager.fsync()?;
         }
 
-        // these don't need to be atomic - we are holding _lock anyway
-        *self.pager.curr_superblock.write().unwrap() = self.superblock.clone();
+        // TODO txid should be set long befre this because pin methods use it maybe?
         self.pager.tx_id.store(self.superblock.txid.get(), Ordering::Relaxed);
+        *self.pager.curr_superblock.write().unwrap() = self.superblock.clone();
 
         Ok(())
     }
