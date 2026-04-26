@@ -68,9 +68,9 @@ fn freelist() {
     // const KEY_SIZE: usize = BTREE_KEY_MAX_LEN;
     const KEY_SIZE: usize = 24;
     const VAL_MASK: u64 = 0xffff_0000_0000_ffff;
-    const TX_CNT: usize = 5;
-    const INSERTS_PER_TX_INIT: usize = 1;
-    const INSERTS_PER_TX: usize = 1;
+    const TX_CNT: usize = 10;
+    const INSERTS_PER_TX_INIT: usize = 3;
+    const INSERTS_PER_TX: usize = 3;
 
     let dur = Durability::Flush;
 

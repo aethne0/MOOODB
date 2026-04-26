@@ -3,6 +3,7 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::ops::AddAssign;
 use std::os::unix::fs::FileExt;
+use std::sync::atomic::AtomicU8;
 
 use super::compute_checksum;
 use super::hash_u64_modulo;
@@ -175,7 +176,7 @@ impl Pager {
     #[must_use = "must handle error"]
     fn io_write(&self, whdl: &mut WrHdl<'_>) -> Result<(), PagerErr> {
         mooo_assert!(
-            whdl.frame.dirty.load(Ordering::Relaxed),
+            whdl.frame.state.load(Ordering::Acquire) == FRAME_DIRTY,
             "should not be calling io_write on non-dirty frame"
         );
 
@@ -187,7 +188,7 @@ impl Pager {
             .map_err(|e| PagerErr::Io(e.kind()))
         {
             Ok(_) => {
-                whdl.frame.dirty.store(false, Ordering::Relaxed);
+                whdl.frame.state.store(FRAME_EVICTABLE, Ordering::Release);
                 Ok(())
             }
             Err(err) => Err(err),
@@ -225,8 +226,18 @@ impl Pager {
         let mut checked_count = 0; // for spin hint heuristics
 
         loop {
+            if checked_count == self.frames.len() {
+                std::hint::spin_loop();
+                checked_count = 0;
+            }
+            checked_count += 1;
+
             let frame_idx = self.eviction_hand.fetch_add(1, Ordering::Relaxed) % self.frames.len();
             let frame = &self.frames[frame_idx];
+
+            if frame.state.load(Ordering::Acquire) == FRAME_IN_TX {
+                continue;
+            }
 
             // This could be Relaxed (maybe) but it might result in more aborts once we take the
             // lock later? Would need testing really. Either is "correct" because we recheck later.
@@ -241,12 +252,6 @@ impl Pager {
                 if frame_usage_ctr == 0 {
                     return frame_idx;
                 }
-            }
-
-            checked_count += 1;
-            if checked_count == self.frames.len() {
-                std::hint::spin_loop();
-                checked_count = 0;
             }
         }
     }
@@ -273,8 +278,7 @@ impl Pager {
                         let free_frame_index = self.scan_for_eviction_candidate();
                         match self.try_pin_write(free_frame_index) {
                             None => continue,
-                            Some(mut whdl) => {
-                                whdl.pgid = pgid;
+                            Some(whdl) => {
                                 break whdl;
                             }
                         }
@@ -302,11 +306,12 @@ impl Pager {
                     //
                     // We need thread B to wait on our loading lock instead, and then see the frame
                     // has been evicted, and THEN load it in (because well then have written it out)
-                    if whdl.frame.dirty.load(Ordering::Relaxed) {
-                        whdl.pgid = frame_pgid;
+                    if whdl.frame.state.load(Ordering::Acquire) == FRAME_DIRTY {
+                        whdl.pgid = frame_pgid; // TODO i dont think we need to do this
                         self.io_write(&mut whdl)?;
-                        whdl.pgid = pgid;
                     }
+
+                    whdl.pgid = pgid;
 
                     // remove from old dir if needed
                     // It is ok if threads find this page before we do this, because we are holding
@@ -338,6 +343,7 @@ impl Pager {
             Some(&frame_index) => {
                 let mut whdl = self.pin_write(frame_index);
                 whdl.pgid = pgid;
+                whdl.frame.state.store(FRAME_IN_TX, Ordering::Release);
                 return Ok(whdl);
             }
             None => {
@@ -345,8 +351,7 @@ impl Pager {
                     let free_frame_index = self.scan_for_eviction_candidate();
                     match self.try_pin_write(free_frame_index) {
                         None => continue,
-                        Some(mut whdl) => {
-                            whdl.pgid = pgid;
+                        Some(whdl) => {
                             break whdl;
                         }
                     }
@@ -354,15 +359,19 @@ impl Pager {
 
                 let mut loading_guard = whdl.frame.loading.write().unwrap();
                 let frame_pgid = std::mem::replace(&mut *loading_guard, pgid);
+                // we do this here but not `get_frame_write_index` because `get_frame_write_index`
+                // should only be called on frames/pages already "created" by our tx.
+                whdl.frame.state.store(FRAME_IN_TX, Ordering::Release);
 
                 dir.insert(pgid, whdl.frame.index);
                 drop(dir);
 
-                if whdl.frame.dirty.load(Ordering::Relaxed) {
-                    whdl.pgid = frame_pgid;
+                if whdl.frame.state.load(Ordering::Acquire) == FRAME_DIRTY {
+                    whdl.pgid = frame_pgid; // TODO i dont think we need to do this
                     self.io_write(&mut whdl)?;
-                    whdl.pgid = pgid;
                 }
+
+                whdl.pgid = pgid;
 
                 let mut old_dir =
                     self.shard_dirs[hash_u64_modulo(frame_pgid, SHARD_CNT)].lock().unwrap();
@@ -375,7 +384,7 @@ impl Pager {
     }
 
     #[must_use = "RAII WrHdl releases when dropped"]
-    fn get_frame_right_idx(&self, frame_index: usize) -> WrHdl<'_> {
+    fn get_frame_write_index(&self, frame_index: usize) -> WrHdl<'_> {
         let mut whdl = self.try_pin_write(frame_index).expect("must be uncontested");
         whdl.pgid = *self.frames[frame_index].loading.read().unwrap(); // this could be better
         whdl
@@ -421,7 +430,7 @@ impl Pager {
             read_tx: read_tx,
             pager: self,
             superblock: superblock,
-            created_pages: HashMap::new(),
+            written_pages: HashMap::new(),
             freed_pages: vec![],
             unfreed_pages: vec![],
             _writer_tx_lock: lock,
@@ -442,6 +451,10 @@ impl FrameBuffer {
     }
 }
 
+const FRAME_EVICTABLE: u8 = 0;
+const FRAME_IN_TX: u8 = 1;
+const FRAME_DIRTY: u8 = 2;
+
 #[repr(align(64))]
 struct FrameHeader {
     index:   usize,
@@ -449,7 +462,7 @@ struct FrameHeader {
     pins:    AtomicI64,
     usage:   AtomicU64,
     loading: RwLock<u64>,
-    dirty:   AtomicBool,
+    state:   AtomicU8,
 }
 
 impl FrameHeader {
@@ -458,7 +471,7 @@ impl FrameHeader {
             index:   index,
             pins:    0.into(),
             usage:   0.into(),
-            dirty:   false.into(),
+            state:   0.into(),
             loading: RwLock::new(PGID_NULL), // TODO might not be using this value anymore
         }
     }
@@ -500,8 +513,8 @@ impl<'pager> WrHdl<'pager> {
         mooo_assert!(pgid_valid(self.pgid));
         mooo_assert!(txid != NULL_HIGH_TXID);
 
-        let was_dirty = self.frame.dirty.swap(true, Ordering::Relaxed);
-        mooo_assert!(!was_dirty);
+        let prev_frame_state = self.frame.state.swap(FRAME_DIRTY, Ordering::AcqRel);
+        mooo_assert!(prev_frame_state == FRAME_IN_TX);
 
         let header = PagePrefix::mut_from_prefix(self.buf);
         header.pgid.set(self.pgid);
@@ -668,7 +681,7 @@ pub(super) struct WriteTx<'tx> {
     read_tx:         ReadTx<'tx>,
     pager:           &'tx Pager,
     superblock:      SuperblockHeader,
-    created_pages:   HashMap<u64, usize>,
+    written_pages:   HashMap<u64, usize>,
     freed_pages:     Vec<u64>,
     unfreed_pages:   Vec<FreeEntry>,
     _writer_tx_lock: MutexGuard<'tx, ()>,
@@ -726,11 +739,8 @@ impl<'tx> WriteTx<'tx> {
         }
 
         // write "created" pages (written to pages)
-        for &frame_index in self.created_pages.values() {
-            let mut whdl = self.pager.get_frame_right_idx(frame_index);
-            // TODO durability
-            // TODO we need a version of this that will update pgid and tx_id and stuff without
-            // actually writing (because pageprefix currently is just set by io_write)
+        for &frame_index in self.written_pages.values() {
+            let mut whdl = self.pager.get_frame_write_index(frame_index);
             whdl.mark_dirty(self.superblock.txid.get());
             if should_write {
                 self.pager.io_write(&mut whdl)?;
@@ -801,16 +811,16 @@ impl<'alloc, 'tx: 'alloc> PageWriter<'tx> for BumpAlloc<'alloc, 'tx> {
         let pgid = self.tx.superblock.alloc_bump_next_pgid.get();
         self.tx.superblock.alloc_bump_next_pgid.add_assign(1);
         let whdl = self.tx.pager.get_frame_write_pgid(pgid)?;
-        self.tx.created_pages.insert(pgid, whdl.get_frame_index());
+        self.tx.written_pages.insert(pgid, whdl.get_frame_index());
         Ok(whdl)
     }
 
     /// should return a writeable new page, or a writeable copy of an existing page (depending on
     /// pgid)
     fn get_page_write<'op>(&'op mut self, pgid: u64) -> Result<WrHdl<'tx>, PagerErr> {
-        if let Some(&index) = self.tx.created_pages.get(&pgid) {
+        if let Some(&index) = self.tx.written_pages.get(&pgid) {
             // this is already a new page per our writetx
-            return Ok(self.tx.pager.get_frame_right_idx(index));
+            return Ok(self.tx.pager.get_frame_write_index(index));
         }
 
         // we need to Copy-on-Write
@@ -850,7 +860,7 @@ impl<'alloc, 'tx: 'alloc> PageWriter<'tx> for FreelistAlloc<'alloc, 'tx> {
                     self.tx.unfreed_pages.push(free_entry);
                     let pgid = free_entry.pgid.get();
                     let whdl = self.tx.pager.get_frame_write_pgid(pgid)?;
-                    self.tx.created_pages.insert(pgid, whdl.get_frame_index());
+                    self.tx.written_pages.insert(pgid, whdl.get_frame_index());
                     return Ok(whdl);
                 }
             }
@@ -862,16 +872,16 @@ impl<'alloc, 'tx: 'alloc> PageWriter<'tx> for FreelistAlloc<'alloc, 'tx> {
         let pgid = self.tx.superblock.alloc_bump_next_pgid.get();
         self.tx.superblock.alloc_bump_next_pgid.add_assign(1);
         let whdl = self.tx.pager.get_frame_write_pgid(pgid)?;
-        self.tx.created_pages.insert(pgid, whdl.get_frame_index());
+        self.tx.written_pages.insert(pgid, whdl.get_frame_index());
         Ok(whdl)
     }
 
     /// should return a writeable new page, or a writeable copy of an existing page (depending on
     /// pgid)
     fn get_page_write<'op>(&'op mut self, pgid: u64) -> Result<WrHdl<'tx>, PagerErr> {
-        if let Some(&index) = self.tx.created_pages.get(&pgid) {
+        if let Some(&index) = self.tx.written_pages.get(&pgid) {
             // this is already a new page per our writetx
-            return Ok(self.tx.pager.get_frame_right_idx(index));
+            return Ok(self.tx.pager.get_frame_write_index(index));
         }
 
         // we need to Copy-on-Write
