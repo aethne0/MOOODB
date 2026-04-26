@@ -131,7 +131,7 @@ impl Pager {
     fn try_pin_read(&self, index: usize, expected_pgid: u64) -> Option<RdHdl<'_>> {
         let frame = &self.frames[index];
 
-        if *frame.pgid.read().unwrap() != expected_pgid {
+        if *frame.pgid_latch.read().unwrap() != expected_pgid {
             // This was evicted between the time we got it from the dir and the time we got a
             // read-lock - caller will have to retry
             return None;
@@ -284,7 +284,7 @@ impl Pager {
 
                     // this can be contested, because someone may have found this frame in the dir,
                     // and is calling `pin_read` and checking the pgid
-                    let mut frame_pgid_guard = whdl.frame.pgid.write().unwrap();
+                    let mut frame_pgid_guard = whdl.frame.pgid_latch.write().unwrap();
                     let frame_pgid = std::mem::replace(&mut *frame_pgid_guard, pgid);
 
                     // TODO we should drop this and retake it - we are spinning looking for an
@@ -351,7 +351,7 @@ impl Pager {
                     }
                 };
 
-                let mut loading_guard = whdl.frame.pgid.write().unwrap();
+                let mut loading_guard = whdl.frame.pgid_latch.write().unwrap();
                 let frame_old_pgid = std::mem::replace(&mut *loading_guard, pgid);
                 // we do this here but not `get_frame_write_index` because `get_frame_write_index`
                 // should only be called on frames/pages already "created" by our tx.
@@ -447,11 +447,11 @@ const FRAME_DIRTY: u64 = 2;
 
 // #[repr(align(64))]
 struct FrameHeader {
-    index: usize,
+    index:      usize,
     /// Negative is write, positive is read - write is exclusive
-    pins:  AtomicI64,
-    usage: AtomicU64,
-    state: AtomicU64,
+    pins:       AtomicI64, // TODO we could merge this with `pgid_latch` i think
+    usage:      AtomicU64,
+    state:      AtomicU64,
     /// This doubles as a loading barrier - threads that want to read this page will attempt to take
     /// a readlock on this field, and writers will take a writelock, therefore readers will block
     /// until a reader has atomically (re-)populated the page and updated inner pgid.
@@ -460,17 +460,17 @@ struct FrameHeader {
     /// which means cache invalidation - this likely could be more optimized using a custom lock but
     /// its not worthwhile because were already incrementing pin+usage which reside in the same
     /// cacheline.
-    pgid:  RwLock<u64>,
+    pgid_latch: RwLock<u64>,
 }
 
 impl FrameHeader {
     fn new(index: usize) -> Self {
         Self {
-            index: index,
-            pins:  0.into(),
-            usage: 0.into(),
-            state: 0.into(),
-            pgid:  RwLock::new(PGID_NULL),
+            index:      index,
+            pins:       0.into(),
+            usage:      0.into(),
+            state:      0.into(),
+            pgid_latch: RwLock::new(PGID_NULL),
         }
     }
 }
@@ -492,7 +492,7 @@ impl<'pager> WrHdl<'pager> {
     }
 
     pub(super) fn get_pgid(&self) -> u64 {
-        let pgid = *self.frame.pgid.read().unwrap();
+        let pgid = *self.frame.pgid_latch.read().unwrap();
         mooo_assert!(pgid_valid(pgid));
         pgid
     }
@@ -677,19 +677,20 @@ pub(super) trait PageWriter<'tx> {
 
 /// A write-tx that uses bump-allocation only
 pub(super) struct WriteTx<'tx> {
-    // TODO maybe we dont need this
-    read_tx:         ReadTx<'tx>,
     pager:           &'tx Pager,
     superblock:      SuperblockHeader,
-    // TODO this should be a LL of frames maybe? - ah no cause we check it... hmm
-    written_pages:   HashMap<u64, usize>,
-    // TODO maybe this can b a LL
-    freed_pages:     Vec<u64>,
-    // TODO not sure
-    unfreed_pages:   Vec<FreeEntry>,
-    // TODO Surely we can do something better
-    freelist_crs:    Option<FreelistCursor<'tx>>, // Hmm...
     _writer_tx_lock: MutexGuard<'tx, ()>,
+    // TODO It would be nice to get rid of all these allocations
+    // - `written_pages` is tricky because we *are* using it for O(1) lookups
+    // - `freed_pages` is tricky, we could use a LL but the frames may get evicted so no
+    // - `unfreed_pages` could be an LL, because the frames WILL stay resident, but its complexity
+    written_pages:   HashMap<u64, usize>,
+    freed_pages:     Vec<u64>,
+    unfreed_pages:   Vec<FreeEntry>,
+    // TODO maybe we dont need this - this is only used for `freelist_crs` cause of some borrow
+    // thing. We can probably do something better for `freelist_crs` in general, anyway.
+    read_tx:         ReadTx<'tx>,
+    freelist_crs:    Option<FreelistCursor<'tx>>, // Hmm...
 }
 
 impl<'tx> WriteTx<'tx> {
