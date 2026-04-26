@@ -4,6 +4,7 @@
 //! ▐█▄▪▐█ ▐█▌·▐█▌.▐▌▐█•█▌▐█ ▪▐▌▐█▄▪▐█▐█▄▄▌
 //!  ▀▀▀▀  ▀▀▀  ▀█▄▀▪.▀  ▀ ▀  ▀ ·▀▀▀▀  ▀▀▀
 mod btree;
+mod frame_latch;
 mod heap;
 mod page_btree;
 mod page_heap;

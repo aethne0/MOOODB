@@ -12,3 +12,6 @@ authors = ["aethne0"]
 [dev-dependencies]
 rand = { version = "0.10.1", features = ["chacha"] }
 
+[dependencies]
+parking_lot = "0.12.5"
+

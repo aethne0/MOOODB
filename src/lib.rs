@@ -35,8 +35,7 @@
 #![allow(dead_code)]
 
 pub mod assert;
-pub mod storage;
-pub mod sync;
+pub mod backend;
 
 // TODO we need some way mark claimed pages as de-claimed, if we end up aborting something
 // see: Btree::pop_min_lt
