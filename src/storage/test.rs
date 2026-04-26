@@ -6,6 +6,9 @@
 use std::env::current_dir;
 use std::fs::File;
 use std::fs::OpenOptions;
+use std::hint::black_box;
+use std::sync::atomic::AtomicU8;
+use std::sync::atomic::AtomicUsize;
 
 use rand::rngs::ChaCha8Rng;
 use rand::Rng;
@@ -61,52 +64,84 @@ fn testfile() -> File {
 #[test]
 fn freelist() {
     eprintln!("");
-    let mgr = Pager::new(1024, testfile());
+    const SIZE: usize = 64 * 1024 * 1024;
+    const FRAME_CNT: usize = SIZE / PAGE_SIZE;
+    let mgr = Pager::new(FRAME_CNT, testfile());
 
     let mut rng = get_rand();
 
-    // const KEY_SIZE: usize = BTREE_KEY_MAX_LEN;
-    const KEY_SIZE: usize = 24;
+    const KEY_SIZE: usize = 2;
     const VAL_MASK: u64 = 0xffff_0000_0000_ffff;
-    const TX_CNT: usize = 10;
+    const TX_CNT: usize = 500_000;
     const INSERTS_PER_TX_INIT: usize = 3;
     const INSERTS_PER_TX: usize = 3;
 
     let dur = Durability::Flush;
 
-    {
-        let mut w_tx = mgr.write_tx();
+    const RD_CNT: usize = 20_000_000;
+    const THREADS: usize = 7;
 
-        let mut alloc = w_tx.freelist_allocator().unwrap();
-        let mut btree = Btree::new(&mut alloc).unwrap();
+    let done = AtomicUsize::new(THREADS);
+    std::thread::scope(|s| {
+        s.spawn(|| {
+            {
+                let mut w_tx = mgr.write_tx();
 
-        for _ in 0..INSERTS_PER_TX_INIT {
-            let mut key = [0u8; KEY_SIZE];
-            rfill(&mut key, &mut rng);
-            let val: u64 = rng.random::<u64>() | VAL_MASK;
-            btree.insert(&mut alloc, &key, val).unwrap();
+                let mut alloc = w_tx.freelist_allocator().unwrap();
+                let mut btree = Btree::new(&mut alloc).unwrap();
+
+                for _ in 0..INSERTS_PER_TX_INIT {
+                    let mut key = [0u8; KEY_SIZE];
+                    rfill(&mut key, &mut rng);
+                    let val: u64 = rng.random::<u64>() | VAL_MASK;
+                    btree.insert(&mut alloc, &key, val).unwrap();
+                }
+
+                w_tx.set_catalog_root_pgid(btree.get_root_pgid());
+                w_tx.commit(dur).unwrap();
+            }
+
+            for _ in 0..TX_CNT {
+                if done.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                    break;
+                }
+                let mut w_tx = mgr.write_tx();
+                let root_pgid = w_tx.get_catalog_root_pgid();
+                let mut alloc = w_tx.freelist_allocator().unwrap();
+                let mut btree = Btree::new_from_root_pgid(root_pgid);
+
+                for _ in 0..INSERTS_PER_TX {
+                    let mut key = [0u8; KEY_SIZE];
+                    rfill(&mut key, &mut rng);
+                    let val: u64 = rng.random::<u64>() | VAL_MASK;
+                    btree.insert(&mut alloc, &key, val).unwrap();
+                }
+
+                w_tx.set_catalog_root_pgid(btree.get_root_pgid());
+                w_tx.commit(dur).unwrap();
+            }
+        });
+
+        for _ in 0..THREADS {
+            s.spawn(|| {
+                let mut rng = get_rand();
+                std::thread::sleep(std::time::Duration::from_millis(10));
+
+                for _ in 0..RD_CNT {
+                    let r_tx = mgr.read_tx();
+                    let root_pgid = r_tx.get_catalog_root_pgid();
+                    let btree = Btree::new_from_root_pgid(root_pgid);
+                    let mut key = [0u8; KEY_SIZE];
+                    rfill(&mut key, &mut rng);
+                    black_box(btree.get(&r_tx, &key).unwrap());
+                }
+
+                done.fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
+            });
         }
-
-        w_tx.set_catalog_root_pgid(btree.get_root_pgid());
-        w_tx.commit(dur).unwrap();
-    }
-
-    for _ in 0..TX_CNT {
-        let mut w_tx = mgr.write_tx();
-        let root_pgid = w_tx.get_catalog_root_pgid();
-        let mut alloc = w_tx.freelist_allocator().unwrap();
-        let mut btree = Btree::new_from_root_pgid(root_pgid);
-
-        for _ in 0..INSERTS_PER_TX {
-            let mut key = [0u8; KEY_SIZE];
-            rfill(&mut key, &mut rng);
-            let val: u64 = rng.random::<u64>() | VAL_MASK;
-            btree.insert(&mut alloc, &key, val).unwrap();
-        }
-
-        w_tx.set_catalog_root_pgid(btree.get_root_pgid());
-        w_tx.commit(dur).unwrap();
-    }
+    });
+    eprintln!("{} reads", RD_CNT * THREADS);
+    eprintln!("{} writes ", INSERTS_PER_TX * TX_CNT);
 }
 
 #[test]
