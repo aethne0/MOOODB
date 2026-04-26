@@ -35,9 +35,8 @@ pub(super) struct Pager {
     // to just have it be a mutex
     shard_dirs:      Box<[Mutex<HashMap<u64, usize>>]>,
     eviction_hand:   AtomicUsize,
-    tx_id:           AtomicU64,
     curr_superblock: RwLock<SuperblockHeader>,
-    write_tx_lock:   Mutex<()>,
+    writer_lock:     Mutex<()>,
 }
 
 unsafe impl Sync for Pager {}
@@ -52,8 +51,7 @@ impl Pager {
             pages:           (0..count).map(|_| FrameBuffer::zeros()).collect(),
             shard_dirs:      (0..SHARD_CNT).map(|_| Mutex::new(HashMap::default())).collect(),
             eviction_hand:   0.into(),
-            tx_id:           FIRST_TX_ID.into(),
-            write_tx_lock:   Mutex::new(()),
+            writer_lock:     Mutex::new(()),
             curr_superblock: RwLock::new(temp_header),
         };
 
@@ -106,12 +104,10 @@ impl Pager {
     #[must_use = "RAII WrHdl releases when dropped"]
     fn try_pin_write(&self, index: usize) -> Option<WrHdl<'_>> {
         let frame = &self.frames[index];
-        match frame.pins.compare_exchange(0, -1, Ordering::AcqRel, Ordering::Acquire) {
+        match frame.pins.compare_exchange(0, -1, Ordering::Acquire, Ordering::Relaxed) {
             Ok(_) => {
                 frame.usage.fetch_add(1, Ordering::Relaxed);
-                Some(unsafe {
-                    WrHdl::from_pager_index(self, index, self.tx_id.load(Ordering::Relaxed))
-                })
+                Some(unsafe { WrHdl::from_pager_index(self, index) })
             }
             Err(_) => None,
         }
@@ -120,7 +116,7 @@ impl Pager {
     #[must_use = "RAII WrHdl releases when dropped"]
     fn pin_write(&self, index: usize) -> WrHdl<'_> {
         let frame = &self.frames[index];
-        let cas_res = frame.pins.compare_exchange(0, -1, Ordering::AcqRel, Ordering::Acquire);
+        let cas_res = frame.pins.compare_exchange(0, -1, Ordering::Acquire, Ordering::Relaxed);
         mooo_assert!(
             cas_res.is_ok(),
             "pin_write should be uncontested (frame_index: {}, cas was: {})",
@@ -128,7 +124,7 @@ impl Pager {
             cas_res.unwrap_err()
         );
         frame.usage.fetch_add(1, Ordering::Relaxed);
-        unsafe { WrHdl::from_pager_index(self, index, self.tx_id.load(Ordering::Relaxed)) }
+        unsafe { WrHdl::from_pager_index(self, index) }
     }
 
     #[must_use = "RAII RdHdl releases when dropped"]
@@ -402,7 +398,7 @@ impl Pager {
 
     #[must_use = "RAII WriteTxHdl releases when dropped"]
     pub(crate) fn write_tx<'tx>(&'tx self) -> WriteTx<'tx> {
-        let lock = self.write_tx_lock.lock().unwrap();
+        let lock = self.writer_lock.lock().unwrap();
 
         let mut superblock = self.curr_superblock.read().expect("todo").clone();
         let prev_pgid = superblock.pgid.get();
@@ -483,18 +479,16 @@ impl FrameHeader {
 
 /// Exclusive frame write-handle
 pub(super) struct WrHdl<'pager> {
-    pub(super) buf: &'pager mut [u8; PAGE_SIZE],
     pager:          &'pager Pager,
     frame:          &'pager FrameHeader,
-    txid:           u64,
-    dirty:          bool,
+    pub(super) buf: &'pager mut [u8; PAGE_SIZE],
 }
 
 impl<'pager> WrHdl<'pager> {
-    unsafe fn from_pager_index(pager: &'pager Pager, index: usize, txid: u64) -> Self {
+    unsafe fn from_pager_index(pager: &'pager Pager, index: usize) -> Self {
         let frame = &pager.frames[index];
         let buf = unsafe { &mut *pager.pages[index].0.get() };
-        Self { pager: pager, frame: frame, buf: buf, txid, dirty: false }
+        Self { pager: pager, frame: frame, buf: buf }
     }
 
     pub(super) fn get_pgid(&self) -> u64 {
@@ -541,9 +535,9 @@ impl Drop for WrHdl<'_> {
 
 /// Shared frame read-handle
 pub(super) struct RdHdl<'pager> {
-    pub(super) buf: &'pager [u8; PAGE_SIZE],
     pager:          &'pager Pager,
     frame:          &'pager FrameHeader,
+    pub(super) buf: &'pager [u8; PAGE_SIZE],
 }
 
 impl<'pager> RdHdl<'pager> {
@@ -683,14 +677,19 @@ pub(super) trait PageWriter<'tx> {
 
 /// A write-tx that uses bump-allocation only
 pub(super) struct WriteTx<'tx> {
+    // TODO maybe we dont need this
     read_tx:         ReadTx<'tx>,
     pager:           &'tx Pager,
     superblock:      SuperblockHeader,
+    // TODO this should be a LL of frames maybe? - ah no cause we check it... hmm
     written_pages:   HashMap<u64, usize>,
+    // TODO maybe this can b a LL
     freed_pages:     Vec<u64>,
+    // TODO not sure
     unfreed_pages:   Vec<FreeEntry>,
-    _writer_tx_lock: MutexGuard<'tx, ()>,
+    // TODO Surely we can do something better
     freelist_crs:    Option<FreelistCursor<'tx>>, // Hmm...
+    _writer_tx_lock: MutexGuard<'tx, ()>,
 }
 
 impl<'tx> WriteTx<'tx> {
@@ -768,8 +767,6 @@ impl<'tx> WriteTx<'tx> {
             self.pager.fsync()?;
         }
 
-        // TODO txid should be set long befre this because pin methods use it maybe?
-        self.pager.tx_id.store(self.superblock.txid.get(), Ordering::Relaxed);
         *self.pager.curr_superblock.write().unwrap() = self.superblock.clone();
 
         Ok(())

@@ -7,7 +7,6 @@ use std::env::current_dir;
 use std::fs::File;
 use std::fs::OpenOptions;
 use std::hint::black_box;
-use std::sync::atomic::AtomicU8;
 use std::sync::atomic::AtomicUsize;
 
 use rand::rngs::ChaCha8Rng;
