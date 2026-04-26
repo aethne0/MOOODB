@@ -4,10 +4,10 @@ version = "0.1.0"
 rust-version = "1.95.0"
 edition = "2024"
 description = "is your btree imoootable?"
-repository = "https://git.monke.ca/yarn/MOOODB"
+repository = "https://github.com/aethne0/MOOODB"
 readme = "README.md"
 license-file = "LICENSE"
-authors = ["yarn"]
+authors = ["aethne0"]
 
 [dev-dependencies]
 rand = { version = "0.10.1", features = ["chacha"] }

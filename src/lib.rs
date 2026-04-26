@@ -1,5 +1,5 @@
 //! monke.ca
-//! Copyright (c) 2026 yarn (high monke monk)
+//! Copyright (c) 2026 aethne0 aka yarn aka the high monke monk
 //! Enjoy your programming, God willing.
 //!
 //! THE TERMS HAVE BEEN ORDAINED AS FOLLOWS:
