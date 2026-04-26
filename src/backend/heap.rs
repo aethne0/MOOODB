@@ -66,7 +66,7 @@ impl Heap {
         &mut self, tx: &mut R, slot_idx: u16,
     ) -> Result<(), PagerErr> {
         let whdl = tx.get_page_write(self.pgid)?;
-        // todo page leak - see comment at top of btree.rs
+        // TODO page leak - see comment at top of btree.rs
         let mut page = HeapPage::from_buffer(whdl.buf);
         let slot_opt = page.delete_slot_entry(slot_idx);
 

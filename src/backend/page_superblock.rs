@@ -1,17 +1,18 @@
 use super::hash_u64_modulo;
 use super::serialization::*;
 use super::PAGE_SIZE;
-use crate::mooo_assert;
 
 #[derive(Clone)]
 #[repr(C)]
 pub(super) struct SuperblockHeader {
     pub(super) prefix:               PagePrefix,
-    pub(super) alloc_bump_next_pgid: SerializedU64,
-    pub(super) alloc_free_head_pgid: SerializedU64,
-    pub(super) catalog_head_pgid:    SerializedU64,
+    pub(super) pgid_bump_next: SerializedU64,
+    pub(super) pgid_freelist: SerializedU64,
+    pub(super) pgid_catalog:    SerializedU64,
     pub(super) page_size:            SerializedU16,
 }
+
+pub(super) const PGTYPE_SUPERBLOCK: SerializedU64 = SerializedU64(*b"\0SupaBlk");
 
 unsafe impl Serialized for SuperblockHeader {}
 
@@ -63,8 +64,6 @@ pub(super) fn copy_superblock_to_page(buf: &mut [u8; PAGE_SIZE], sb_header: &Sup
     let cow_idx = hash_u64_modulo(id, 4) as usize;
     let idx = cow_idx * (1 - is_frog) + 4 * is_frog;
     // starts at lowest multiple of 32 past header
-    let art_start = (size_of::<SuperblockHeader>() + 31) & !31;
-    let art_end = art_start + 128;
-    mooo_assert!(art_end <= PAGE_SIZE);
-    buf[art_start..art_end].copy_from_slice(&COWS_AND_SUCH[idx]);
+    let art_start = PAGE_SIZE - 128;
+    buf[art_start..].copy_from_slice(&COWS_AND_SUCH[idx]);
 }

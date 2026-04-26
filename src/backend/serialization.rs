@@ -24,11 +24,10 @@ pub(super) const END_OF_PAGE: u16 = PAGE_SIZE as u16 - 1;
 #[derive(Clone)]
 #[repr(C)]
 pub(super) struct PagePrefix {
-    pub(super) checksum: SerializedU64,
-    pub(super) pgid:     SerializedU64,
-    pub(super) txid:     SerializedU64,
-    pub(super) _pad:     [u8; 1],
-    pub(super) meta:     [u8; 7],
+    pub(super) csum:   SerializedU64,
+    pub(super) pgid:   SerializedU64,
+    pub(super) txid:   SerializedU64,
+    pub(super) pgtype: SerializedU64,
 }
 unsafe impl Serialized for PagePrefix {}
 
@@ -37,20 +36,14 @@ unsafe impl Serialized for PagePrefix {}
 pub(super) const CHECKSUM_START_OFFSET: usize = offset_of!(PagePrefix, pgid);
 
 impl PagePrefix {
-    pub(super) fn new(pgid: u64, checksum: u64, tx_id: u64, meta: [u8; 7]) -> Self {
-        Self {
-            checksum: checksum.into(),
-            pgid:     pgid.into(),
-            txid:     tx_id.into(),
-            _pad:     [0],
-            meta:     meta,
-        }
+    pub(super) fn new(pgid: u64, csum: u64, txid: u64, pgtype: SerializedU64) -> Self {
+        Self { csum: csum.into(), pgid: pgid.into(), txid: txid.into(), pgtype: pgtype }
     }
 }
 
 // ------------ FreeEntry --------------------------------------------------------------------------
 
-#[derive(Clone, Copy)]
+#[derive(Debug, Clone, Copy)]
 #[repr(C)]
 pub(super) struct FreeEntry {
     pub(super) txid: SerializedU64,

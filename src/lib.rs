@@ -1,5 +1,13 @@
-//! monke.ca
+//! • ▌ ▄ ·.                   ·▄▄▄▄  ▄▄▄▄·
+//! ·██ ▐███▪▪     ▪     ▪     ██▪ ██ ▐█ ▀█▪
+//! ▐█ ▌▐▌▐█· ▄█▀▄  ▄█▀▄  ▄█▀▄ ▐█· ▐█▌▐█▀▀█▄
+//! ██ ██▌▐█▌▐█▌.▐▌▐█▌.▐▌▐█▌.▐▌██. ██ ██▄▪▐█
+//! ▀▀  █▪▀▀▀ ▀█▄▀▪ ▀█▄▀▪ ▀█▄▀▪▀▀▀▀▀• ·▀▀▀▀
+//!
+//! **MOOODB** is a copy-on-write relational database management system.
+//!
 //! Copyright (c) 2026 aethne0 aka yarn aka the high monke monk
+//!
 //! Enjoy your programming, God willing.
 //!
 //! THE TERMS HAVE BEEN ORDAINED AS FOLLOWS:
@@ -12,13 +20,6 @@
 //! - LEGAL DANGER
 //! - DANGER OF A PREVIOUSLY UNKNOWN KIND
 //!
-//! • ▌ ▄ ·.                   ·▄▄▄▄  ▄▄▄▄·
-//! ·██ ▐███▪▪     ▪     ▪     ██▪ ██ ▐█ ▀█▪
-//! ▐█ ▌▐▌▐█· ▄█▀▄  ▄█▀▄  ▄█▀▄ ▐█· ▐█▌▐█▀▀█▄
-//! ██ ██▌▐█▌▐█▌.▐▌▐█▌.▐▌▐█▌.▐▌██. ██ ██▄▪▐█
-//! ▀▀  █▪▀▀▀ ▀█▄▀▪ ▀█▄▀▪ ▀█▄▀▪▀▀▀▀▀• ·▀▀▀▀
-//!
-//! **MOOODB** is a copy-on-write relational database management system.
 
 #![warn(unreachable_pub)]
 #![warn(clippy::pedantic)]
@@ -36,10 +37,3 @@
 
 pub mod assert;
 pub mod backend;
-
-// TODO we need some way mark claimed pages as de-claimed, if we end up aborting something
-// see: Btree::pop_min_lt
-//
-// TODO btree has large stack allocations
-//
-// TODO btree delete rebalancing

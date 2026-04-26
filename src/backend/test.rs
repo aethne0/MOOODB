@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 // ▄▄▄▄▄▄▄▄ ..▄▄ · ▄▄▄▄▄.▄▄ ·
 // •██  ▀▄.▀·▐█ ▀. •██  ▐█ ▀.
 //  ▐█.▪▐▀▀▪▄▄▀▀▀█▄ ▐█.▪▄▀▀▀█▄
@@ -13,6 +14,7 @@ use rand::rngs::ChaCha8Rng;
 use rand::Rng;
 use rand::RngExt;
 use rand::SeedableRng;
+use rustc_hash::FxHashMap;
 
 use super::btree::Btree;
 use super::heap::Heap;
@@ -30,7 +32,7 @@ fn f_opts() -> OpenOptions {
 }
 
 fn get_rand() -> ChaCha8Rng {
-    ChaCha8Rng::seed_from_u64(0x000000000_b00b135)
+    ChaCha8Rng::seed_from_u64(0x1eaf_1eaf_1eaf_1eaf)
 }
 
 fn rfill(buf: &mut [u8], rng: &mut ChaCha8Rng) {
@@ -47,7 +49,7 @@ fn testfile() -> File {
     let mut path = current_dir().unwrap();
     path.push(".test_dbs");
     std::fs::create_dir_all(&path).unwrap();
-    path.push(format!("moootest_{}.moo", test_name));
+    path.push(format!("{}.moo", test_name));
     eprintln!("{:?}", &path);
     std::fs::OpenOptions::new()
         .read(true)
@@ -61,7 +63,121 @@ fn testfile() -> File {
 // ------------ Tests ------------------------------------------------------------------------------
 
 #[test]
+fn deletoid() {
+    eprintln!("");
+    const SIZE: usize = 64 * 1024 * 1024;
+    const FRAME_CNT: usize = SIZE / PAGE_SIZE;
+    let mgr = Pager::new(FRAME_CNT, testfile()).unwrap();
+
+    let mut rng = get_rand();
+
+    const KEY_SIZE: usize = 8;
+    const VAL_MASK: u64 = 0xffff_0000_0000_ffff;
+
+    const TX_CNT: usize = 1000;
+    const INSERTS_PER_TX_INIT: usize = 1000;
+    const DELETES_PER_TX: usize = 1;
+
+    let dur = Durability::Flush;
+
+    let mut entries = FxHashMap::default();
+
+    {
+        let mut tx = mgr.write_tx();
+
+        let mut btree = Btree::new(&mut tx).unwrap();
+
+        for _ in 0..INSERTS_PER_TX_INIT {
+            let mut key = [0u8; KEY_SIZE];
+            rfill(&mut key, &mut rng);
+            let val: u64 = rng.random::<u64>() | VAL_MASK;
+            btree.insert(&mut tx, &key, val).unwrap();
+            entries.insert(key, val);
+        }
+
+        tx.set_catalog_root_pgid(btree.get_root_pgid());
+        tx.commit(dur).unwrap();
+    }
+
+    let mut entries = entries.into_keys().collect::<Vec<_>>();
+
+    for _ in 0..TX_CNT {
+        let mut tx = mgr.write_tx();
+        let root_pgid = tx.get_catalog_root_pgid();
+        if root_pgid == PGID_NULL {
+            break;
+        }
+        let mut btree = Btree::from_pgid(root_pgid);
+
+        for _ in 0..DELETES_PER_TX {
+            let entry = entries.remove(rng.random_range(0..entries.len()));
+            btree.delete(&mut tx, &entry).unwrap();
+        }
+
+        tx.set_catalog_root_pgid(btree.get_root_pgid());
+        tx.commit(dur).unwrap();
+    }
+}
+
+// TODO use fxhash
+
+/*
+#[test]
 fn freelist() {
+    eprintln!("");
+    const SIZE: usize = 64 * 1024 * 1024;
+    const FRAME_CNT: usize = SIZE / PAGE_SIZE;
+    let mgr = Pager::new(FRAME_CNT, testfile());
+
+    let mut rng = get_rand();
+
+    // const KEY_SIZE: usize = 2;
+    const KEY_SIZE: usize = 8;
+    const VAL_MASK: u64 = 0xffff_0000_0000_ffff;
+    // not including initial
+    const TX_CNT: usize = 1;
+    const INSERTS_PER_TX_INIT: usize = 1;
+    const INSERTS_PER_TX: usize = 1;
+
+    let dur = Durability::Flush;
+
+    {
+        let mut w_tx = mgr.write_tx();
+
+        let mut alloc = w_tx.freelist_allocator().unwrap();
+        let mut btree = Btree::new(&mut alloc).unwrap();
+
+        for _ in 0..INSERTS_PER_TX_INIT {
+            let mut key = [0u8; KEY_SIZE];
+            rfill(&mut key, &mut rng);
+            let val: u64 = rng.random::<u64>() | VAL_MASK;
+            btree.insert(&mut alloc, &key, val).unwrap();
+        }
+
+        w_tx.set_catalog_root_pgid(btree.get_root_pgid());
+        w_tx.commit(dur).unwrap();
+    }
+
+    for _ in 0..TX_CNT {
+        let mut w_tx = mgr.write_tx();
+        let root_pgid = w_tx.get_catalog_root_pgid();
+        let mut alloc = w_tx.freelist_allocator().unwrap();
+        let mut btree = Btree::new_from_root_pgid(root_pgid);
+
+        for _ in 0..INSERTS_PER_TX {
+            let mut key = [0u8; KEY_SIZE];
+            rfill(&mut key, &mut rng);
+            let val: u64 = rng.random::<u64>() | VAL_MASK;
+            btree.insert(&mut alloc, &key, val).unwrap();
+        }
+
+        w_tx.set_catalog_root_pgid(btree.get_root_pgid());
+        w_tx.commit(dur).unwrap();
+    }
+}
+
+#[test]
+fn megalist() {
     const QUICK: usize = 10000;
     eprintln!("");
     const SIZE: usize = 64 * 1024 * 1024;
@@ -180,3 +296,4 @@ fn btree_inserts_single() {
         w_tx.commit(Durability::Flush).unwrap();
     }
 }
+*/

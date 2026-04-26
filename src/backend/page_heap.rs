@@ -17,6 +17,8 @@ pub(super) struct HeapPageHeader {
 const _: () = mooo_assert!(size_of::<HeapPageHeader>() == PAGE_HEADER_SIZE as usize);
 unsafe impl Serialized for HeapPageHeader {}
 
+const PGTYPE_HEAP: SerializedU64 = SerializedU64(*b"\0Heap\0\0\0");
+
 pub(super) struct HeapPage<Buf> {
     raw: Buf,
 }
@@ -30,7 +32,7 @@ impl<'b> HeapPage<&'b mut [u8; PAGE_SIZE]> {
 
     pub(super) fn new_with_buffer(buffer: &'b mut [u8; PAGE_SIZE]) -> Self {
         let mut page = Self::from_buffer(buffer);
-        page.prefix.meta = *b" Heap\0\0";
+        page.prefix.pgtype = PGTYPE_HEAP;
         page.reinit_page();
         page
     }

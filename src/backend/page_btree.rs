@@ -23,6 +23,9 @@ pub(super) struct BtreePageHeader {
 const _: () = mooo_assert!(size_of::<BtreePageHeader>() == PAGE_HEADER_SIZE as usize);
 unsafe impl Serialized for BtreePageHeader {}
 
+const PGTYPE_BTREELF: SerializedU64 = SerializedU64(*b"\0BtreeLf");
+const PGTYPE_BTREEIN: SerializedU64 = SerializedU64(*b"\0BtreeIn");
+
 /// A sorted B-tree page storing key-value pairs in ascending key order.
 pub(super) struct BtreePage<Buf> {
     raw: Buf,
@@ -116,10 +119,6 @@ impl<Buf: AsRef<[u8]>> BtreePage<Buf> {
         } else {
             BtreePageType::Leaf
         }
-    }
-
-    pub(super) fn is_half_full_or_more(&self) -> bool {
-        (BTREE_PAGE_USABLE_SPACE - self.free_bytes_contig()) >= BTREE_PAGE_USABLE_SPACE / 2
     }
 
     /// Returns the `(key, value)` pair stored at `slot_index`.
@@ -251,8 +250,8 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
         Some(offset)
     }
 
-    fn delete_slot_entry(&mut self, slot_index: u16) {
-        assert!(slot_index < self.len());
+    pub(super) fn delete_slot_entry(&mut self, slot_index: u16) {
+        mooo_assert!(slot_index < self.len());
         let (offset, len) = self.offset_len_from_slot(slot_index);
 
         let del = (PAGE_HEADER_SIZE + slot_index * SLOT_SIZE) as usize;
@@ -274,10 +273,10 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
         self.page_type.set(page_type as u16);
         match page_type {
             BtreePageType::Leaf => {
-                self.prefix.meta = *b"BtreeLf";
+                self.prefix.pgtype = PGTYPE_BTREELF;
             }
             BtreePageType::Inner => {
-                self.prefix.meta = *b"BtreeIn";
+                self.prefix.pgtype = PGTYPE_BTREEIN;
             }
         }
     }
@@ -361,7 +360,7 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
         self.insert_internal(key, val, false)
     }
 
-    fn compact(&mut self) {
+    pub(super) fn compact(&mut self) {
         let mut cloned_raw = [0u8; PAGE_SIZE];
         cloned_raw.copy_from_slice(self.raw());
         let cloned_page = BtreePage::from_buffer(&mut cloned_raw);

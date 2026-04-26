@@ -14,5 +14,6 @@ rand = { version = "0.10.1", features = ["chacha"] }
 
 [dependencies]
 parking_lot = "0.12.5"
+rustc-hash = "2.1.2"
 xxhash-rust = { version = "0.8.15", features = ["xxh3"] }
 

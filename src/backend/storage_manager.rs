@@ -1,3 +1,5 @@
+// TODO when a transaction fails we have stuck InTx frames
+
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
 use std::fs::File;
@@ -12,7 +14,6 @@ use std::sync::MutexGuard;
 use std::sync::RwLock;
 
 use super::btree::Btree;
-use super::btree::FreelistCursor;
 use super::compute_checksum;
 use super::frame_latch::*;
 use super::hash_u64_modulo;
@@ -49,7 +50,7 @@ pub(super) struct Pager {
 unsafe impl Sync for Pager {}
 
 impl Pager {
-    pub(super) fn new(count: usize, file: File) -> Self {
+    pub(super) fn new(count: usize, file: File) -> Result<Self, PagerErr> {
         let temp_header = SuperblockHeader::new_zeroed();
 
         let pager = Self {
@@ -65,33 +66,38 @@ impl Pager {
         // page 0&1 are reserved for superblocks
         let pgid_superblock = 0;
         let pgid_bump_next = 2;
-        let txid_first = 1;
+        let txid_first = 0;
 
         let header = {
             // write actual first superblock
-            let mut whdl = pager
-                .get_frame_write_pgid(pgid_superblock)
-                .expect("io error on superblock initialization");
+            let mut whdl = pager.get_frame_write_pgid(pgid_superblock)?;
 
             let superblock_header = SuperblockHeader {
-                prefix:               PagePrefix::new(pgid_superblock, 0, txid_first, *b"SUPABLK"),
-                alloc_free_head_pgid: PGID_NULL.into(),
-                alloc_bump_next_pgid: pgid_bump_next.into(),
-                catalog_head_pgid:    PGID_NULL.into(),
-                page_size:            (PAGE_SIZE as u16).into(),
+                prefix:         PagePrefix::new(pgid_superblock, 0, txid_first, PGTYPE_SUPERBLOCK),
+                pgid_freelist:  PGID_NULL.into(),
+                pgid_bump_next: pgid_bump_next.into(),
+                pgid_catalog:   PGID_NULL.into(),
+                page_size:      (PAGE_SIZE as u16).into(),
             };
 
             copy_superblock_to_page(whdl.buf, &superblock_header);
             whdl.mark_dirty(txid_first);
-            pager
-                .io_write(&mut whdl, pgid_superblock)
-                .expect("io error on superblock initialization");
+            pager.io_write(&mut whdl, pgid_superblock)?;
             superblock_header
         };
 
-        pager.fsync().expect("io error on superblock initialization");
         *pager.superblock_curr.write().unwrap() = header;
-        pager
+
+        {
+            // do one tx to create freelist and second superblock
+            let mut tx = pager.write_tx();
+            let freelist = Btree::new(&mut tx)?;
+            tx.superblock.pgid_freelist = freelist.get_root_pgid().into();
+            tx.commit(Durability::Flush)?;
+        }
+
+        pager.fsync()?;
+        Ok(pager)
     }
 
     // ------------ frame --------------------------------------------------------------------------
@@ -163,7 +169,7 @@ impl Pager {
 
         let checksum = compute_checksum(&whdl.buf[CHECKSUM_START_OFFSET..]);
         let header = PagePrefix::mut_from_prefix(whdl.buf);
-        let ok_checksum = header.checksum.get() == checksum;
+        let ok_checksum = header.csum.get() == checksum;
         let ok_pgid = header.pgid.get() == pgid;
         if !ok_checksum || !ok_pgid {
             return Err(PagerErr::Integrity);
@@ -194,15 +200,15 @@ impl Pager {
             let frame = &self.frames[frame_idx];
 
             let Some(frame_wguard) = frame.latch.try_write() else {
+                // someones reading|writing this frame
                 continue;
             };
 
             if frame_wguard.state == FrameState::InTx {
+                // frame is part of an in-progress write-tx
                 continue;
             }
 
-            // This could be Relaxed (maybe) but it might result in more aborts once we take the
-            // lock later? Would need testing really. Either is "correct" because we recheck later.
             let frame_usage_ctr = frame
                 .usage
                 .try_update(Ordering::Relaxed, Ordering::Relaxed, |old| Some(old.saturating_sub(1)))
@@ -223,7 +229,8 @@ impl Pager {
             match dir.get(&pgid) {
                 Some(&frame_index) => match self.try_pin_read(frame_index, pgid) {
                     None => {
-                        // we got a stale frame - retry
+                        // someone took this frame and changed its pgid since we checked the dir, so
+                        // we will abandon it and try again
                         continue;
                     }
                     Some(rhdl) => {
@@ -289,6 +296,10 @@ impl Pager {
         match dir.get(&pgid) {
             Some(&frame_index) => {
                 let mut whdl = self.try_pin_write(frame_index).expect("should be uncontested");
+                mooo_assert!(
+                    whdl.get_pgid() == pgid,
+                    "frame should have same pgid that it is filed under in the dir"
+                );
                 whdl.frame_inner.state = FrameState::InTx;
                 return Ok(whdl);
             }
@@ -328,7 +339,7 @@ impl Pager {
             let current = curr_guard.clone();
 
             let txid = current.txid.get();
-            read_tx_registry::register(txid);
+            tx_registry::register(txid);
 
             current
         };
@@ -344,34 +355,28 @@ impl Pager {
         let prev_pgid = superblock.pgid.get();
         superblock.txid += 1;
         superblock.pgid.set((prev_pgid + 1) % 2);
+        let freelist_pgid = superblock.pgid_freelist;
 
-        let read_tx = {
-            let superblock = superblock.clone();
-            read_tx_registry::register(superblock.txid.get());
-            ReadTx { pager: self, superblock }
-        };
-
-        let freelist_crs = match superblock.alloc_free_head_pgid.get() {
-            PGID_NULL => None,
-            freelist_pgid => Some(FreelistCursor::new(&read_tx, freelist_pgid).expect("todo")),
-        };
+        tx_registry::register(superblock.txid.get());
 
         WriteTx {
-            read_tx: read_tx,
-            pager: self,
+            pager:      self,
             superblock: superblock,
-            written_pages: HashMap::new(),
-            freed_pages: vec![],
-            unfreed_pages: vec![],
+
+            pages_allocated: HashMap::new(),
+            pages_freed:     Vec::new(),
+            pages_free_used: Vec::new(),
+
+            count_freelist_used: 0,
+            pgid_freelist_old:   freelist_pgid.get(),
+
             _writer_tx_lock: lock,
-            freelist_crs,
         }
     }
 }
 
 // ------------ Frame Definitions ------------------------------------------------------------------
-
-#[repr(align(4096))]
+// #[repr(align(4096))]
 struct FrameBuffer(UnsafeCell<[u8; PAGE_SIZE]>);
 
 impl FrameBuffer {
@@ -395,7 +400,6 @@ enum FrameState {
 
 #[repr(align(64))]
 struct FrameHeader {
-    index: usize,
     /// This doubles as a loading barrier - threads that want to read this page will attempt to take
     /// a readlock on this field, and writers will take a writelock, therefore readers will block
     /// until a reader has atomically (re-)populated the page and updated inner pgid.
@@ -405,6 +409,9 @@ struct FrameHeader {
     /// its not worthwhile because were already incrementing pin+usage which reside in the same
     /// cacheline.
     latch: Latch<FrameInner>,
+    /// Index of frame in our frame pool
+    index: usize,
+    /// we cant put usage inside `latch` because non-writers need to increment and decrement it
     usage: AtomicU64,
 }
 
@@ -455,6 +462,11 @@ impl<'pager> WrHdl<'pager> {
         self.frame.index
     }
 
+    fn abandon(&mut self) {
+        self.frame_inner.pgid = PGID_NULL;
+        self.frame_inner.state = FrameState::Evictable;
+    }
+
     /// Sets checksum and pgid on the page header prefix and marks the frame as dirty
     /// NOTE This should only be done once! We will panic if we call this on a dirty frame
     /// NOTE This must be called even if immediately before a write-out, because we set the header
@@ -474,7 +486,7 @@ impl<'pager> WrHdl<'pager> {
         // Checksum must computed after other sets!
         let checksum = compute_checksum(&self.buf[CHECKSUM_START_OFFSET..]);
         let header = PagePrefix::mut_from_prefix(self.buf);
-        header.checksum.set(checksum);
+        header.csum.set(checksum);
     }
 }
 
@@ -514,9 +526,9 @@ pub(crate) enum PagerErr {
 //  ▐█▌·▪▐█·█▌  WriteTx & ReadTx
 //  ▀▀▀ •▀▀ ▀▀
 
-// ------------ Thread-Local Read-tx Registry ------------------------------------------------------
+// ------------ Thread-Local Tx Registry ------------------------------------------------------
 
-mod read_tx_registry {
+mod tx_registry {
     use std::sync::atomic::AtomicU64;
     use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
@@ -578,13 +590,13 @@ pub(super) struct ReadTx<'tx> {
 
 impl Drop for ReadTx<'_> {
     fn drop(&mut self) {
-        read_tx_registry::deregister();
+        tx_registry::deregister();
     }
 }
 
 impl ReadTx<'_> {
     pub(super) fn get_catalog_root_pgid(&self) -> u64 {
-        self.superblock.catalog_head_pgid.get()
+        self.superblock.pgid_catalog.get()
     }
 }
 
@@ -618,82 +630,125 @@ pub(super) trait PageWriter<'tx> {
     /// maintains. This part is optional and up to the implementor - endlessly bump-allocating and
     /// "leaking" pages is "correct".
     ///
-    /// Note: it is the implementors job to set the `pgid` of this handed our WrHdl
+    /// NOTE it is the implementors job to set the `pgid` of this handed our WrHdl
     fn get_page_write<'op>(&'op mut self, pgid: u64) -> Result<WrHdl<'tx>, PagerErr>;
     fn get_page_alloc<'op>(&'op mut self) -> Result<WrHdl<'tx>, PagerErr>;
+    /// NOTE drop corresponding `WrHdl`/`RdHdl` before calling this!
     fn free_page(&mut self, pgid: u64);
+}
+
+impl Drop for WriteTx<'_> {
+    fn drop(&mut self) {
+        tx_registry::deregister();
+    }
 }
 
 /// A write-tx that uses bump-allocation only
 pub(super) struct WriteTx<'tx> {
     pager:           &'tx Pager,
     superblock:      SuperblockHeader,
+    pages_allocated: HashMap<u64, usize>,
+    pages_freed:     Vec<u64>,
+    pages_free_used: Vec<FreeEntry>,
+
+    count_freelist_used: usize,
+    pgid_freelist_old:   u64,
+
     _writer_tx_lock: MutexGuard<'tx, ()>,
-    // TODO It would be nice to get rid of all these allocations
-    // - `written_pages` is tricky because we *are* using it for O(1) lookups
-    // - `freed_pages` is tricky, we could use a LL but the frames may get evicted so no
-    // - `unfreed_pages` could be an LL, because the frames WILL stay resident, but its complexity
-    written_pages:   HashMap<u64, usize>,
-    freed_pages:     Vec<u64>,
-    unfreed_pages:   Vec<FreeEntry>,
-    // TODO maybe we dont need this - this is only used for `freelist_crs` cause of some borrow
-    // thing. We can probably do something better for `freelist_crs` in general, anyway.
-    read_tx:         ReadTx<'tx>,
-    freelist_crs:    Option<FreelistCursor<'tx>>, // Hmm...
 }
 
 impl<'tx> WriteTx<'tx> {
+    /// (should_write, should_fsync)
+    fn durability_tuple(durability: Durability) -> (bool, bool) {
+        match durability {
+            Durability::Lazy => (false, false),
+            Durability::Flush => (true, false),
+            Durability::Sync => (true, true),
+        }
+    }
+
     pub(super) fn get_catalog_root_pgid(&self) -> u64 {
-        self.superblock.catalog_head_pgid.get()
+        self.superblock.pgid_catalog.get()
     }
 
     pub(super) fn set_catalog_root_pgid(&mut self, pgid: u64) {
-        self.superblock.catalog_head_pgid.set(pgid);
+        self.superblock.pgid_catalog.set(pgid);
+    }
+
+    fn freelist_prev_next(&mut self) -> Result<Option<FreeEntry>, PagerErr> {
+        if self.pgid_freelist_old == PGID_NULL {
+            return Ok(None);
+        }
+
+        let freelist_old = Btree::from_pgid(self.pgid_freelist_old);
+        match freelist_old.freelist_get_index(self, self.count_freelist_used)? {
+            None => {
+                self.pgid_freelist_old = PGID_NULL;
+                Ok(None)
+            }
+            Some(entry) => {
+                self.count_freelist_used += 1;
+                Ok(Some(entry))
+            }
+        }
+    }
+
+    fn freelist_insert(&mut self, pgid: u64) -> Result<(), PagerErr> {
+        let freelist_head_pgid = self.superblock.pgid_freelist.get();
+        let mut freelist = if freelist_head_pgid == PGID_NULL {
+            Btree::new(self)?
+        } else {
+            Btree::from_pgid(freelist_head_pgid)
+        };
+
+        let entry = FreeEntry::new(self.superblock.txid.get(), pgid);
+        freelist.insert(self, entry.as_bytes(), pgid)?;
+        self.superblock.pgid_freelist = freelist.get_root_pgid().into();
+        Ok(())
+    }
+
+    fn freelist_delete(&mut self, entry: FreeEntry) -> Result<(), PagerErr> {
+        let freelist_head_pgid = self.superblock.pgid_freelist.get();
+        let mut freelist = if freelist_head_pgid == PGID_NULL {
+            Btree::new(self)?
+        } else {
+            Btree::from_pgid(freelist_head_pgid)
+        };
+
+        freelist.delete(self, entry.as_bytes())?;
+        self.superblock.pgid_freelist = freelist.get_root_pgid().into();
+        Ok(())
+    }
+
+    fn freelist_count(&self) -> Result<usize, PagerErr> {
+        let freelist_head_pgid = self.superblock.pgid_freelist.get();
+        if freelist_head_pgid == PGID_NULL {
+            return Ok(0);
+        } else {
+            Btree::from_pgid(freelist_head_pgid).len(self)
+        }
     }
 
     pub(super) fn commit(mut self, durability: Durability) -> Result<(), PagerErr> {
-        let should_write = matches!(durability, Durability::Sync | Durability::Flush);
-        let should_fsync = matches!(durability, Durability::Sync);
+        let (should_write, should_fsync) = Self::durability_tuple(durability);
 
-        // write freed pages to freelist, repeatedly until we converge on 0 freed pages
-        if self.freed_pages.len() > 0 || self.unfreed_pages.len() > 0 {
-            let old_freelist_pgid = self.superblock.alloc_free_head_pgid.get();
-            let txid = self.superblock.txid.get();
-
-            let mut freelist = if old_freelist_pgid != PGID_NULL {
-                self.freed_pages.push(old_freelist_pgid);
-                Btree::new_from_root_pgid(old_freelist_pgid)
-            } else {
-                Btree::new(&mut self.bump_allocator())?
-            };
-
-            loop {
-                let mut cont = false;
-
-                if let Some(free_entry) = self.unfreed_pages.pop() {
-                    freelist.delete(&mut self.freelist_allocator()?, free_entry.as_bytes())?;
-                    cont = true;
-                };
-
-                if let Some(pgid) = self.freed_pages.pop() {
-                    freelist.insert(
-                        &mut self.freelist_allocator()?,
-                        FreeEntry::new(txid, pgid).as_bytes(),
-                        pgid,
-                    )?;
-                    cont = true;
-                };
-
-                if !cont {
-                    break;
-                }
+        // write freed pages to freelist
+        // this can free more pages (of the old freelist) and also allocate new pages
+        while !self.pages_free_used.is_empty() || !self.pages_freed.is_empty() {
+            while let Some(entry_reused) = self.pages_free_used.pop() {
+                self.freelist_delete(entry_reused)?;
             }
-
-            self.superblock.alloc_free_head_pgid = freelist.get_root_pgid().into();
+            while let Some(pgid_freed) = self.pages_freed.pop() {
+                self.freelist_insert(pgid_freed)?;
+            }
         }
 
+        eprintln!("freelist count {}", self.freelist_count()?);
+
+        // mostly io after this point, as well as superblock swap
+
         // write "created" pages (written to pages)
-        for &frame_index in self.written_pages.values() {
+        for &frame_index in self.pages_allocated.values() {
             let mut whdl = self.pager.get_frame_write_index(frame_index);
             whdl.mark_dirty(self.superblock.txid.get());
             if should_write {
@@ -706,8 +761,8 @@ impl<'tx> WriteTx<'tx> {
         let sb_pgid = self.superblock.pgid.get();
         let mut whdl = self.pager.get_frame_write_pgid(sb_pgid)?;
         copy_superblock_to_page(whdl.buf, &self.superblock);
-
         whdl.mark_dirty(self.superblock.txid.get());
+
         if should_write {
             let pgid = whdl.get_pgid();
             self.pager.io_write(&mut whdl, pgid)?;
@@ -719,126 +774,54 @@ impl<'tx> WriteTx<'tx> {
 
         *self.pager.superblock_curr.write().unwrap() = self.superblock.clone();
 
+        eprintln!("--- done COMMIT tx{} ---", self.superblock.txid.get());
         Ok(())
     }
-
-    /// Page allocator that just bump allocates, only will allocate by incrementing the superblock's
-    /// `alloc_bump_next_pgid`.
-    ///
-    /// Allocators are basically free to construct and can be recursively contrstructed - they hold
-    /// no state themselves
-    fn bump_allocator<'alloc>(&'alloc mut self) -> BumpAlloc<'alloc, 'tx> {
-        BumpAlloc { tx: self }
-    }
-
-    /// Page allocator that will try to use the freelist, if its populated, and if there are pages
-    /// that are no longer being relied-on by live read-txs, and then fall back to bump allocating.
-    ///
-    /// Allocators are basically free to construct and can be recursively contrstructed - they hold
-    /// no state themselves
-    pub(super) fn freelist_allocator<'alloc>(
-        &'alloc mut self,
-    ) -> Result<FreelistAlloc<'alloc, 'tx>, PagerErr> {
-        Ok(FreelistAlloc { tx: self })
-    }
 }
 
-// ------------ Bump Allocator ---------------------------------------------------------------------
+// ------------ Allocator --------------------------------------------------------------------------
 
-pub(super) struct BumpAlloc<'alloc, 'tx: 'alloc> {
-    tx: &'alloc mut WriteTx<'tx>,
-}
-
-impl<'alloc, 'tx: 'alloc> PageReader<'tx> for BumpAlloc<'alloc, 'tx> {
+impl<'tx> PageReader<'tx> for WriteTx<'tx> {
     fn get_page_read(&self, pgid: u64) -> Result<RdHdl<'tx>, PagerErr> {
-        self.tx.pager.get_frame_read_pgid(pgid)
+        self.pager.get_frame_read_pgid(pgid)
     }
 }
 
-impl<'alloc, 'tx: 'alloc> PageWriter<'tx> for BumpAlloc<'alloc, 'tx> {
+impl<'tx> PageWriter<'tx> for WriteTx<'tx> {
     fn free_page(&mut self, pgid: u64) {
-        self.tx.freed_pages.push(pgid);
+        self.pages_freed.push(pgid);
     }
 
     /// Bump allocates - also adds page to our dirty-page linked list
     fn get_page_alloc<'op>(&'op mut self) -> Result<WrHdl<'tx>, PagerErr> {
-        let pgid = self.tx.superblock.alloc_bump_next_pgid.get();
-        self.tx.superblock.alloc_bump_next_pgid.add_assign(1);
-        let whdl = self.tx.pager.get_frame_write_pgid(pgid)?;
-        self.tx.written_pages.insert(pgid, whdl.get_frame_index());
-        Ok(whdl)
-    }
-
-    /// should return a writeable new page, or a writeable copy of an existing page (depending on
-    /// pgid)
-    fn get_page_write<'op>(&'op mut self, pgid: u64) -> Result<WrHdl<'tx>, PagerErr> {
-        if let Some(&index) = self.tx.written_pages.get(&pgid) {
-            // this is already a new page per our writetx
-            return Ok(self.tx.pager.get_frame_write_index(index));
-        }
-
-        // we need to Copy-on-Write
-        let old_rhdl = self.get_page_read(pgid)?;
-        let new_whdl = self.get_page_alloc()?;
-        new_whdl.buf.copy_from_slice(old_rhdl.buf);
-        self.free_page(pgid);
-
-        Ok(new_whdl)
-    }
-}
-
-// ------------ Freelist Allocator -----------------------------------------------------------------
-
-pub(super) struct FreelistAlloc<'alloc, 'tx: 'alloc> {
-    tx: &'alloc mut WriteTx<'tx>,
-}
-
-impl<'alloc, 'tx: 'alloc> PageReader<'tx> for FreelistAlloc<'alloc, 'tx> {
-    fn get_page_read(&self, pgid: u64) -> Result<RdHdl<'tx>, PagerErr> {
-        self.tx.pager.get_frame_read_pgid(pgid)
-    }
-}
-
-impl<'alloc, 'tx: 'alloc> PageWriter<'tx> for FreelistAlloc<'alloc, 'tx> {
-    fn free_page(&mut self, pgid: u64) {
-        // freed pages are only inserted into the freelist at the end
-        self.tx.freed_pages.push(pgid);
-    }
-
-    /// Freelist allocates - also adds page to our dirty-page linked list
-    fn get_page_alloc<'op>(&'op mut self) -> Result<WrHdl<'tx>, PagerErr> {
-        if let Some(freelist_crs) = &mut self.tx.freelist_crs {
-            let free_entry_opt = freelist_crs.next(&self.tx.read_tx)?;
-            if let Some(free_entry) = free_entry_opt {
-                if free_entry.txid.get() < read_tx_registry::get_min() {
-                    self.tx.unfreed_pages.push(free_entry);
-                    let pgid = free_entry.pgid.get();
-                    let whdl = self.tx.pager.get_frame_write_pgid(pgid)?;
-                    self.tx.written_pages.insert(pgid, whdl.get_frame_index());
-                    return Ok(whdl);
-                }
+        let pgid = match self.freelist_prev_next()? {
+            Some(entry) => {
+                eprintln!("ALLOC list tx{} pg{}", self.superblock.txid.get(), entry.pgid.get(),);
+                self.pages_free_used.push(entry);
+                entry.pgid.get()
             }
-            // if we didnt return it means we have no more free-able pages
-            // well do this so we dont waste time checking again
-            self.tx.freelist_crs = None;
-        }
+            None => {
+                let pgid = self.superblock.pgid_bump_next.get();
+                eprintln!("ALLOC bump tx{} pg{}", self.superblock.txid.get(), pgid);
+                self.superblock.pgid_bump_next.add_assign(1);
+                pgid
+            }
+        };
 
-        let pgid = self.tx.superblock.alloc_bump_next_pgid.get();
-        self.tx.superblock.alloc_bump_next_pgid.add_assign(1);
-        let whdl = self.tx.pager.get_frame_write_pgid(pgid)?;
-        self.tx.written_pages.insert(pgid, whdl.get_frame_index());
+        let whdl = self.pager.get_frame_write_pgid(pgid)?;
+        self.pages_allocated.insert(pgid, whdl.get_frame_index());
         Ok(whdl)
     }
 
     /// should return a writeable new page, or a writeable copy of an existing page (depending on
     /// pgid)
     fn get_page_write<'op>(&'op mut self, pgid: u64) -> Result<WrHdl<'tx>, PagerErr> {
-        if let Some(&index) = self.tx.written_pages.get(&pgid) {
+        if let Some(&index) = self.pages_allocated.get(&pgid) {
             // this is already a new page per our writetx
-            return Ok(self.tx.pager.get_frame_write_index(index));
+            return Ok(self.pager.get_frame_write_index(index));
         }
 
-        // we need to Copy-on-Write
+        // we need to CoW
         let old_rhdl = self.get_page_read(pgid)?;
         let new_whdl = self.get_page_alloc()?;
         new_whdl.buf.copy_from_slice(old_rhdl.buf);
