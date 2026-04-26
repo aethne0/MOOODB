@@ -7,41 +7,43 @@ use crate::mooo_assert;
 
 // ------------ Common Page Header Prefix ----------------------------------------------------------
 
-pub(super) const PAGE_HEADER_SIZE: u16 = 0x20;
+pub(super) const PAGE_HEADER_SIZE: u16 = 0x40;
 pub(super) const SLOT_SIZE: u16 = 2 * size_of::<u16>() as u16;
 pub(super) const SLOT_IDX_NULL: u16 = u16::MAX;
 pub(super) const END_OF_PAGE: u16 = PAGE_SIZE as u16 - 1;
 
-/// The first 24 bytes of every page on disk, regardless of page type.
+/// The first 32 bytes of every page on disk, regardless of page type.
 ///
 /// Layout (all big-endian):
 /// ```text
-/// offset  0 | checksum   u32
-/// offset  4 | dbg_pad    [u8;4]
-/// offset  8 | txid       u64
-/// offset 16 | pgid       u64
+/// offset  0 | checksum    u64
+/// offset  8 | txid        u64
+/// offset 16 | pgid        u64
+/// offset 24 | meta        [u8;8]
 /// ```
 #[derive(Clone)]
 #[repr(C)]
 pub(super) struct PagePrefix {
+    pub(super) checksum: SerializedU64,
     pub(super) pgid:     SerializedU64,
-    pub(super) checksum: SerializedU32,
-    pub(super) pgtype:   [u8; 4],
     pub(super) txid:     SerializedU64,
+    pub(super) _pad:     [u8; 1],
+    pub(super) meta:     [u8; 7],
 }
 unsafe impl Serialized for PagePrefix {}
 
 /// Where to start checksumming, we want to compute checksum using only the bytes AFTER the
 /// checksum, or else writing the checksum itself will invalidate itself.
-pub(super) const CHECKSUM_START_OFFSET: usize = offset_of!(PagePrefix, pgtype);
+pub(super) const CHECKSUM_START_OFFSET: usize = offset_of!(PagePrefix, pgid);
 
 impl PagePrefix {
-    pub(super) fn new(pgid: u64, checksum: u32, tx_id: u64) -> Self {
+    pub(super) fn new(pgid: u64, checksum: u64, tx_id: u64, meta: [u8; 7]) -> Self {
         Self {
             checksum: checksum.into(),
-            pgtype:   *b"SUPA",
             pgid:     pgid.into(),
             txid:     tx_id.into(),
+            _pad:     [0],
+            meta:     meta,
         }
     }
 }

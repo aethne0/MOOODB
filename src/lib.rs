@@ -42,7 +42,4 @@ pub mod backend;
 //
 // TODO btree has large stack allocations
 //
-// TODO at high numbers of TXs we get some frame conflict error when we have a
-// smaller pager size (frame count)
-//
 // TODO btree delete rebalancing

@@ -7,7 +7,6 @@ use crate::mooo_assert;
 #[repr(C)]
 pub(super) struct SuperblockHeader {
     pub(super) prefix:               PagePrefix,
-    pub(super) version:              SerializedU64,
     pub(super) alloc_bump_next_pgid: SerializedU64,
     pub(super) alloc_free_head_pgid: SerializedU64,
     pub(super) catalog_head_pgid:    SerializedU64,

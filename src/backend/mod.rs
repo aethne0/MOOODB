@@ -15,12 +15,14 @@ mod storage_manager;
 #[cfg(test)]
 mod test;
 
+use xxhash_rust::xxh3::xxh3_64;
+
 use crate::mooo_assert;
 pub(crate) use page_btree::BTREE_KEY_MAX_LEN;
 pub(crate) use storage_manager::*;
 
 /// PAGE_SIZE maybe be inclusively from 256-32KiB, and must be a power of two
-const PAGE_SIZE: usize = 0x1000;
+const PAGE_SIZE: usize = 0x100;
 const _: () = mooo_assert!(
     false
         || PAGE_SIZE == 0x100
@@ -53,33 +55,6 @@ const fn hash_u64_modulo(mut pgid: u64, modulo: usize) -> usize {
 }
 
 /// crc32c
-const fn compute_checksum(bytes: &[u8]) -> u32 {
-    const _CRC32C_TABLE: [u32; 256] = {
-        let mut table = [0u32; 256];
-        let mut i = 0;
-        while i < 256 {
-            let mut crc = i as u32;
-            let mut j = 0;
-            while j < 8 {
-                if crc & 1 != 0 {
-                    crc = (crc >> 1) ^ 0x82f6_3b78;
-                } else {
-                    crc >>= 1;
-                }
-                j += 1;
-            }
-            table[i] = crc;
-            i += 1;
-        }
-        table
-    };
-
-    let mut crc: u32 = 0xffff_ffff;
-    let mut i = 0;
-    while i < bytes.len() {
-        let idx = ((crc ^ bytes[i] as u32) & 0xff) as usize;
-        crc = (crc >> 8) ^ _CRC32C_TABLE[idx];
-        i += 1;
-    }
-    crc ^ 0xffff_ffff
+fn compute_checksum(bytes: &[u8]) -> u64 {
+    xxh3_64(bytes)
 }

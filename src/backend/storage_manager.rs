@@ -29,6 +29,7 @@ use crate::mooo_assert;
 // ▐█▪·•▐█ ▪▐▌▐█▄▪▐█▐█▄▄▌▐█•█▌  Page Buffer & IO
 // .▀    ▀  ▀ ·▀▀▀▀  ▀▀▀ .▀  ▀
 
+const ON_DISK_VERSION: u64 = 1;
 const SHARD_CNT: usize = 256;
 const NULL_HIGH_TXID: u64 = u64::MAX;
 
@@ -73,8 +74,7 @@ impl Pager {
                 .expect("io error on superblock initialization");
 
             let superblock_header = SuperblockHeader {
-                prefix:               PagePrefix::new(pgid_superblock, 0, txid_first),
-                version:              SerializedU64(*b"ver:0001"),
+                prefix:               PagePrefix::new(pgid_superblock, 0, txid_first, *b"SUPABLK"),
                 alloc_free_head_pgid: PGID_NULL.into(),
                 alloc_bump_next_pgid: pgid_bump_next.into(),
                 catalog_head_pgid:    PGID_NULL.into(),

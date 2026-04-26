@@ -14,6 +14,7 @@ const BTREE_PAGE_USABLE_SPACE: u16 = PAGE_SIZE as u16 - PAGE_HEADER_SIZE;
 #[repr(C)]
 pub(super) struct BtreePageHeader {
     pub(super) prefix:     PagePrefix,
+    _unused:               [u8; 24],
     pub(super) page_type:  SerializedU16,
     pub(super) upper_ptr:  SerializedU16,
     pub(super) free_bytes: SerializedU16,
@@ -34,7 +35,7 @@ impl<'buf> BtreePage<&'buf mut [u8; PAGE_SIZE]> {
         buffer: &'buf mut [u8; PAGE_SIZE], page_type: BtreePageType,
     ) -> Self {
         let mut page = Self::from_buffer(buffer);
-        page.clear_entries();
+        page.reinit_page();
         page.set_page_type(page_type);
         page
     }
@@ -218,7 +219,7 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
         SerializedU16::from(len).write_to_prefix(&mut raw[base + size_of::<u16>()..]);
     }
 
-    fn clear_entries(&mut self) {
+    fn reinit_page(&mut self) {
         self.upper_ptr = PAGE_HEADER_SIZE.into();
         self.lower_ptr = END_OF_PAGE.into();
         self.free_bytes = BTREE_PAGE_USABLE_SPACE.into();
@@ -271,10 +272,14 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
 
     pub(super) fn set_page_type(&mut self, page_type: BtreePageType) {
         self.page_type.set(page_type as u16);
-        self.prefix.pgtype = *match page_type {
-            BtreePageType::Leaf => b"BtLf",
-            BtreePageType::Inner => b"BtIn",
-        };
+        match page_type {
+            BtreePageType::Leaf => {
+                self.prefix.meta = *b"BtreeLf";
+            }
+            BtreePageType::Inner => {
+                self.prefix.meta = *b"BtreeIn";
+            }
+        }
     }
 
     /// Removes the entry with `key`. Does nothing if the key is not present.
@@ -360,7 +365,7 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
         let mut cloned_raw = [0u8; PAGE_SIZE];
         cloned_raw.copy_from_slice(self.raw());
         let cloned_page = BtreePage::from_buffer(&mut cloned_raw);
-        self.clear_entries();
+        self.reinit_page();
         for (k, v) in cloned_page.iter() {
             self.insert_unordered(k, v);
         }
@@ -374,7 +379,7 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
         let mut cloned_left_raw = [0u8; PAGE_SIZE];
         cloned_left_raw.copy_from_slice(self.raw());
         let og_page = BtreePage::from_buffer(&mut cloned_left_raw);
-        self.clear_entries();
+        self.reinit_page();
 
         let midpoint = og_page.len() / 2;
 

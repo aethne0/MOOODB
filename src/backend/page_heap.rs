@@ -8,6 +8,7 @@ use crate::mooo_assert;
 #[repr(C)]
 pub(super) struct HeapPageHeader {
     pub(super) prefix:     PagePrefix,
+    _unused:               [u8; 24],
     pub(super) page_flags: SerializedU16,
     pub(super) upper_ptr:  SerializedU16,
     pub(super) free_bytes: SerializedU16,
@@ -29,8 +30,8 @@ impl<'b> HeapPage<&'b mut [u8; PAGE_SIZE]> {
 
     pub(super) fn new_with_buffer(buffer: &'b mut [u8; PAGE_SIZE]) -> Self {
         let mut page = Self::from_buffer(buffer);
-        page.clear_entries();
-        page.prefix.pgtype = *b"HEAP";
+        page.prefix.meta = *b" Heap\0\0";
+        page.reinit_page();
         page
     }
 }
@@ -108,7 +109,7 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> HeapPage<Buf> {
         SerializedU16::from(len).write_to_prefix(&mut raw[base + size_of::<u16>()..]);
     }
 
-    fn clear_entries(&mut self) {
+    fn reinit_page(&mut self) {
         self.upper_ptr = PAGE_HEADER_SIZE.into();
         self.lower_ptr = END_OF_PAGE.into();
         self.free_bytes = (PAGE_SIZE as u16 - PAGE_HEADER_SIZE).into();
@@ -163,7 +164,7 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> HeapPage<Buf> {
         let mut cloned_raw = [0u8; PAGE_SIZE];
         cloned_raw.copy_from_slice(self.raw());
         let cloned_page = HeapPage::from_buffer(&mut cloned_raw);
-        self.clear_entries();
+        self.reinit_page();
         for (_, v) in cloned_page.iter() {
             self.append(v);
         }
@@ -292,7 +293,7 @@ mod test {
         page.append(b"data").unwrap();
         assert_eq!(page.len(), 1);
 
-        page.clear_entries();
+        page.reinit_page();
         assert_eq!(page.len(), 0);
         assert_eq!(page.free_bytes.get(), PAGE_SIZE as u16 - PAGE_HEADER_SIZE);
     }
