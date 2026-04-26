@@ -63,6 +63,7 @@ fn testfile() -> File {
 
 #[test]
 fn freelist() {
+    const QUICK: usize = 1;
     eprintln!("");
     const SIZE: usize = 64 * 1024 * 1024;
     const FRAME_CNT: usize = SIZE / PAGE_SIZE;
@@ -72,13 +73,13 @@ fn freelist() {
 
     const KEY_SIZE: usize = 2;
     const VAL_MASK: u64 = 0xffff_0000_0000_ffff;
-    const TX_CNT: usize = 500_000;
+    const TX_CNT: usize = 500_000 / QUICK;
     const INSERTS_PER_TX_INIT: usize = 3;
     const INSERTS_PER_TX: usize = 3;
 
     let dur = Durability::Flush;
 
-    const RD_CNT: usize = 20_000_000;
+    const RD_CNT: usize = 20_000_000 / QUICK;
     const THREADS: usize = 7;
 
     let done = AtomicUsize::new(THREADS);

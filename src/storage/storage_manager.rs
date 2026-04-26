@@ -3,7 +3,6 @@ use std::collections::HashMap;
 use std::fs::File;
 use std::ops::AddAssign;
 use std::os::unix::fs::FileExt;
-use std::sync::atomic::AtomicU8;
 
 use super::compute_checksum;
 use super::hash_u64_modulo;
@@ -70,7 +69,8 @@ impl Pager {
                 .expect("io error on superblock initialization");
             whdl.buf.fill(0);
             whdl.mark_dirty(0);
-            pgr.io_write(&mut whdl).expect("io error on superblock initialization");
+            pgr.io_write(&mut whdl, next_superblock_pgid)
+                .expect("io error on superblock initialization");
         }
 
         let header = {
@@ -90,7 +90,8 @@ impl Pager {
 
             copy_superblock_to_page(whdl.buf, &superblock_header);
             whdl.mark_dirty(FIRST_TX_ID);
-            pgr.io_write(&mut whdl).expect("io error on superblock initialization");
+            pgr.io_write(&mut whdl, superblock_pgid)
+                .expect("io error on superblock initialization");
             superblock_header
         };
 
@@ -134,7 +135,7 @@ impl Pager {
     fn try_pin_read(&self, index: usize, expected_pgid: u64) -> Option<RdHdl<'_>> {
         let frame = &self.frames[index];
 
-        if *frame.loading.read().unwrap() != expected_pgid {
+        if *frame.pgid.read().unwrap() != expected_pgid {
             // This was evicted between the time we got it from the dir and the time we got a
             // read-lock - caller will have to retry
             return None;
@@ -173,14 +174,15 @@ impl Pager {
     // ------------ io -----------------------------------------------------------------------------
 
     /// Note: `pgid` must be set on `whdl`! We use that to know which page to read!
+    /// We pass in pgid because we don't want this method to try to take a readlock on the frame's
+    /// pgid field, its easier to just manage that in the caller.
     #[must_use = "must handle error"]
-    fn io_write(&self, whdl: &mut WrHdl<'_>) -> Result<(), PagerErr> {
+    fn io_write(&self, whdl: &mut WrHdl<'_>, pgid: u64) -> Result<(), PagerErr> {
         mooo_assert!(
             whdl.frame.state.load(Ordering::Acquire) == FRAME_DIRTY,
             "should not be calling io_write on non-dirty frame"
         );
 
-        let pgid = whdl.get_pgid();
         match self
             .file
             .write_at(whdl.buf, pgid * PAGE_SIZE as u64)
@@ -204,11 +206,11 @@ impl Pager {
             .map_err(|e| PagerErr::Io(e.kind()))?;
 
         let checksum = compute_checksum(&whdl.buf[CHECKSUM_START_OFFSET..]);
-        {
-            let header = PagePrefix::mut_from_prefix(whdl.buf);
-            // TODO should just be an error eventually
-            mooo_assert!(header.checksum.get() == checksum, "checksums must match");
-            mooo_assert!(header.pgid.get() == pgid, "pgid not expected");
+        let header = PagePrefix::mut_from_prefix(whdl.buf);
+        let ok_checksum = header.checksum.get() == checksum;
+        let ok_pgid = header.pgid.get() == pgid;
+        if !ok_checksum || !ok_pgid {
+            return Err(PagerErr::Integrity);
         }
 
         Ok(())
@@ -286,8 +288,8 @@ impl Pager {
 
                     // this can be contested, because someone may have found this frame in the dir,
                     // and is calling `pin_read` and checking the pgid
-                    let mut loading_guard = whdl.frame.loading.write().unwrap();
-                    let frame_pgid = std::mem::replace(&mut *loading_guard, pgid);
+                    let mut frame_pgid_guard = whdl.frame.pgid.write().unwrap();
+                    let frame_pgid = std::mem::replace(&mut *frame_pgid_guard, pgid);
 
                     // TODO we should drop this and retake it - we are spinning looking for an
                     // eviction candidate while holding the lock
@@ -307,11 +309,8 @@ impl Pager {
                     // We need thread B to wait on our loading lock instead, and then see the frame
                     // has been evicted, and THEN load it in (because well then have written it out)
                     if whdl.frame.state.load(Ordering::Acquire) == FRAME_DIRTY {
-                        whdl.pgid = frame_pgid; // TODO i dont think we need to do this
-                        self.io_write(&mut whdl)?;
+                        self.io_write(&mut whdl, pgid)?;
                     }
-
-                    whdl.pgid = pgid;
 
                     // remove from old dir if needed
                     // It is ok if threads find this page before we do this, because we are holding
@@ -325,7 +324,7 @@ impl Pager {
                     self.io_read(&mut whdl, pgid)?;
 
                     let rhdl = self.pin_downgrade(whdl);
-                    drop(loading_guard);
+                    drop(frame_pgid_guard);
                     return Ok(rhdl);
                 }
             }
@@ -341,8 +340,7 @@ impl Pager {
 
         match dir.get(&pgid) {
             Some(&frame_index) => {
-                let mut whdl = self.pin_write(frame_index);
-                whdl.pgid = pgid;
+                let whdl = self.pin_write(frame_index);
                 whdl.frame.state.store(FRAME_IN_TX, Ordering::Release);
                 return Ok(whdl);
             }
@@ -357,8 +355,8 @@ impl Pager {
                     }
                 };
 
-                let mut loading_guard = whdl.frame.loading.write().unwrap();
-                let frame_pgid = std::mem::replace(&mut *loading_guard, pgid);
+                let mut loading_guard = whdl.frame.pgid.write().unwrap();
+                let frame_old_pgid = std::mem::replace(&mut *loading_guard, pgid);
                 // we do this here but not `get_frame_write_index` because `get_frame_write_index`
                 // should only be called on frames/pages already "created" by our tx.
                 whdl.frame.state.store(FRAME_IN_TX, Ordering::Release);
@@ -367,15 +365,12 @@ impl Pager {
                 drop(dir);
 
                 if whdl.frame.state.load(Ordering::Acquire) == FRAME_DIRTY {
-                    whdl.pgid = frame_pgid; // TODO i dont think we need to do this
-                    self.io_write(&mut whdl)?;
+                    self.io_write(&mut whdl, frame_old_pgid)?;
                 }
 
-                whdl.pgid = pgid;
-
                 let mut old_dir =
-                    self.shard_dirs[hash_u64_modulo(frame_pgid, SHARD_CNT)].lock().unwrap();
-                old_dir.remove(&frame_pgid);
+                    self.shard_dirs[hash_u64_modulo(frame_old_pgid, SHARD_CNT)].lock().unwrap();
+                old_dir.remove(&frame_old_pgid);
                 drop(old_dir);
 
                 return Ok(whdl);
@@ -385,8 +380,7 @@ impl Pager {
 
     #[must_use = "RAII WrHdl releases when dropped"]
     fn get_frame_write_index(&self, frame_index: usize) -> WrHdl<'_> {
-        let mut whdl = self.try_pin_write(frame_index).expect("must be uncontested");
-        whdl.pgid = *self.frames[frame_index].loading.read().unwrap(); // this could be better
+        let whdl = self.try_pin_write(frame_index).expect("must be uncontested");
         whdl
     }
 
@@ -451,28 +445,36 @@ impl FrameBuffer {
     }
 }
 
-const FRAME_EVICTABLE: u8 = 0;
-const FRAME_IN_TX: u8 = 1;
-const FRAME_DIRTY: u8 = 2;
+const FRAME_EVICTABLE: u64 = 0;
+const FRAME_IN_TX: u64 = 1;
+const FRAME_DIRTY: u64 = 2;
 
-#[repr(align(64))]
+// #[repr(align(64))]
 struct FrameHeader {
-    index:   usize,
+    index: usize,
     /// Negative is write, positive is read - write is exclusive
-    pins:    AtomicI64,
-    usage:   AtomicU64,
-    loading: RwLock<u64>,
-    state:   AtomicU8,
+    pins:  AtomicI64,
+    usage: AtomicU64,
+    state: AtomicU64,
+    /// This doubles as a loading barrier - threads that want to read this page will attempt to take
+    /// a readlock on this field, and writers will take a writelock, therefore readers will block
+    /// until a reader has atomically (re-)populated the page and updated inner pgid.
+    ///
+    /// PERF the stdlib implementation of this does a CMPXCHG every single time we add a reader,
+    /// which means cache invalidation - this likely could be more optimized using a custom lock but
+    /// its not worthwhile because were already incrementing pin+usage which reside in the same
+    /// cacheline.
+    pgid:  RwLock<u64>,
 }
 
 impl FrameHeader {
     fn new(index: usize) -> Self {
         Self {
-            index:   index,
-            pins:    0.into(),
-            usage:   0.into(),
-            state:   0.into(),
-            loading: RwLock::new(PGID_NULL), // TODO might not be using this value anymore
+            index: index,
+            pins:  0.into(),
+            usage: 0.into(),
+            state: 0.into(),
+            pgid:  RwLock::new(PGID_NULL),
         }
     }
 }
@@ -485,7 +487,6 @@ pub(super) struct WrHdl<'pager> {
     pager:          &'pager Pager,
     frame:          &'pager FrameHeader,
     txid:           u64,
-    pgid:           u64,
     dirty:          bool,
 }
 
@@ -493,12 +494,13 @@ impl<'pager> WrHdl<'pager> {
     unsafe fn from_pager_index(pager: &'pager Pager, index: usize, txid: u64) -> Self {
         let frame = &pager.frames[index];
         let buf = unsafe { &mut *pager.pages[index].0.get() };
-        Self { pager: pager, frame: frame, buf: buf, txid, pgid: PGID_NULL, dirty: false }
+        Self { pager: pager, frame: frame, buf: buf, txid, dirty: false }
     }
 
     pub(super) fn get_pgid(&self) -> u64 {
-        mooo_assert!(pgid_valid(self.pgid));
-        self.pgid
+        let pgid = *self.frame.pgid.read().unwrap();
+        mooo_assert!(pgid_valid(pgid));
+        pgid
     }
 
     pub(super) fn get_frame_index(&self) -> usize {
@@ -510,14 +512,15 @@ impl<'pager> WrHdl<'pager> {
     /// NOTE This must be called even if immediately before a write-out, because we set the header
     /// fields with it
     fn mark_dirty(&mut self, txid: u64) {
-        mooo_assert!(pgid_valid(self.pgid));
+        let pgid = self.get_pgid();
+        mooo_assert!(pgid_valid(pgid));
         mooo_assert!(txid != NULL_HIGH_TXID);
 
         let prev_frame_state = self.frame.state.swap(FRAME_DIRTY, Ordering::AcqRel);
         mooo_assert!(prev_frame_state == FRAME_IN_TX);
 
         let header = PagePrefix::mut_from_prefix(self.buf);
-        header.pgid.set(self.pgid);
+        header.pgid.set(pgid);
         header.txid.set(txid);
 
         // Checksum must computed after other sets!
@@ -561,6 +564,8 @@ impl Drop for RdHdl<'_> {
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum PagerErr {
     Io(std::io::ErrorKind),
+    /// `page_id` or `checksum` did not match
+    Integrity,
 }
 
 // ▄▄▄▄▄▐▄• ▄
@@ -743,7 +748,8 @@ impl<'tx> WriteTx<'tx> {
             let mut whdl = self.pager.get_frame_write_index(frame_index);
             whdl.mark_dirty(self.superblock.txid.get());
             if should_write {
-                self.pager.io_write(&mut whdl)?;
+                let pgid = whdl.get_pgid();
+                self.pager.io_write(&mut whdl, pgid)?;
             }
         }
 
@@ -754,7 +760,8 @@ impl<'tx> WriteTx<'tx> {
 
         whdl.mark_dirty(self.superblock.txid.get());
         if should_write {
-            self.pager.io_write(&mut whdl)?;
+            let pgid = whdl.get_pgid();
+            self.pager.io_write(&mut whdl, pgid)?;
         }
 
         if should_fsync {
