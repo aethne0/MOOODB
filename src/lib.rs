@@ -35,5 +35,7 @@
 // TODO
 #![allow(dead_code)]
 
+pub(crate) mod fixed_array;
+
 pub mod assert;
 pub mod backend;

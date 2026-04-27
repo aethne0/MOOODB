@@ -1,4 +1,3 @@
-use std::collections::HashMap;
 // ▄▄▄▄▄▄▄▄ ..▄▄ · ▄▄▄▄▄.▄▄ ·
 // •██  ▀▄.▀·▐█ ▀. •██  ▐█ ▀.
 //  ▐█.▪▐▀▀▪▄▄▀▀▀█▄ ▐█.▪▄▀▀▀█▄
@@ -16,8 +15,9 @@ use rand::RngExt;
 use rand::SeedableRng;
 use rustc_hash::FxHashMap;
 
+use crate::backend::heap::Heap;
+
 use super::btree::Btree;
-use super::heap::Heap;
 use super::*;
 
 fn fmt_bytes(bytes: &[u8]) -> String {
@@ -74,9 +74,10 @@ fn deletoid() {
     const KEY_SIZE: usize = 8;
     const VAL_MASK: u64 = 0xffff_0000_0000_ffff;
 
-    const TX_CNT: usize = 1000;
-    const INSERTS_PER_TX_INIT: usize = 1000;
+    const INIT_CNT: usize = 12;
+    const TX_CNT: usize = 4;
     const DELETES_PER_TX: usize = 1;
+    const _: () = mooo_assert!(INIT_CNT >= TX_CNT * DELETES_PER_TX);
 
     let dur = Durability::Flush;
 
@@ -87,7 +88,7 @@ fn deletoid() {
 
         let mut btree = Btree::new(&mut tx).unwrap();
 
-        for _ in 0..INSERTS_PER_TX_INIT {
+        for _ in 0..INIT_CNT {
             let mut key = [0u8; KEY_SIZE];
             rfill(&mut key, &mut rng);
             let val: u64 = rng.random::<u64>() | VAL_MASK;
@@ -175,14 +176,15 @@ fn freelist() {
         w_tx.commit(dur).unwrap();
     }
 }
+*/
 
 #[test]
 fn megalist() {
-    const QUICK: usize = 10000;
+    const QUICK: usize = 1000;
     eprintln!("");
-    const SIZE: usize = 64 * 1024 * 1024;
+    const SIZE: usize = 1024 * 1024 * 64;
     const FRAME_CNT: usize = SIZE / PAGE_SIZE;
-    let mgr = Pager::new(FRAME_CNT, testfile());
+    let mgr = Pager::new(FRAME_CNT, testfile()).unwrap();
 
     let mut rng = get_rand();
 
@@ -196,50 +198,47 @@ fn megalist() {
     let dur = Durability::Flush;
 
     const RD_CNT: usize = 20_000_000 / QUICK;
-    const THREADS: usize = 7;
+    const READER_THREADS: usize = 3;
 
-    let done = AtomicUsize::new(THREADS);
+    let done = AtomicUsize::new(READER_THREADS);
     std::thread::scope(|s| {
         s.spawn(|| {
             {
-                let mut w_tx = mgr.write_tx();
-
-                let mut alloc = w_tx.freelist_allocator().unwrap();
-                let mut btree = Btree::new(&mut alloc).unwrap();
+                let mut tx = mgr.write_tx();
+                let mut btree = Btree::new(&mut tx).unwrap();
 
                 for _ in 0..INSERTS_PER_TX_INIT {
                     let mut key = [0u8; KEY_SIZE];
                     rfill(&mut key, &mut rng);
                     let val: u64 = rng.random::<u64>() | VAL_MASK;
-                    btree.insert(&mut alloc, &key, val).unwrap();
+                    btree.insert(&mut tx, &key, val).unwrap();
                 }
 
-                w_tx.set_catalog_root_pgid(btree.get_root_pgid());
-                w_tx.commit(dur).unwrap();
+                tx.set_catalog_root_pgid(btree.get_root_pgid());
+                tx.commit(dur).unwrap();
             }
 
             for _ in 0..TX_CNT {
-                if done.load(std::sync::atomic::Ordering::Relaxed) == 0 {
+                if READER_THREADS > 0 && done.load(std::sync::atomic::Ordering::Relaxed) == 0 {
                     break;
                 }
-                let mut w_tx = mgr.write_tx();
-                let root_pgid = w_tx.get_catalog_root_pgid();
-                let mut alloc = w_tx.freelist_allocator().unwrap();
-                let mut btree = Btree::new_from_root_pgid(root_pgid);
+                let mut tx = mgr.write_tx();
+                let root_pgid = tx.get_catalog_root_pgid();
+                let mut btree = Btree::from_pgid(root_pgid);
 
                 for _ in 0..INSERTS_PER_TX {
                     let mut key = [0u8; KEY_SIZE];
                     rfill(&mut key, &mut rng);
                     let val: u64 = rng.random::<u64>() | VAL_MASK;
-                    btree.insert(&mut alloc, &key, val).unwrap();
+                    btree.insert(&mut tx, &key, val).unwrap();
                 }
 
-                w_tx.set_catalog_root_pgid(btree.get_root_pgid());
-                w_tx.commit(dur).unwrap();
+                tx.set_catalog_root_pgid(btree.get_root_pgid());
+                tx.commit(dur).unwrap();
             }
         });
 
-        for _ in 0..THREADS {
+        for _ in 0..READER_THREADS {
             s.spawn(|| {
                 let mut rng = get_rand();
                 std::thread::sleep(std::time::Duration::from_millis(10));
@@ -247,7 +246,7 @@ fn megalist() {
                 for _ in 0..RD_CNT {
                     let r_tx = mgr.read_tx();
                     let root_pgid = r_tx.get_catalog_root_pgid();
-                    let btree = Btree::new_from_root_pgid(root_pgid);
+                    let btree = Btree::from_pgid(root_pgid);
                     let mut key = [0u8; KEY_SIZE];
                     rfill(&mut key, &mut rng);
                     black_box(btree.get(&r_tx, &key).unwrap());
@@ -257,14 +256,14 @@ fn megalist() {
             });
         }
     });
-    eprintln!("{} reads", RD_CNT * THREADS);
+    eprintln!("{} reads", RD_CNT * READER_THREADS);
     eprintln!("{} writes ", INSERTS_PER_TX * TX_CNT);
 }
 
 #[test]
 fn btree_inserts_single() {
     eprintln!("");
-    let mgr = Pager::new(64, testfile());
+    let mgr = Pager::new(64, testfile()).unwrap();
 
     // const KEY_SIZE: usize = BTREE_KEY_MAX_LEN;
     const KEY_SIZE: usize = 24;
@@ -274,26 +273,23 @@ fn btree_inserts_single() {
     const DELETES_PER_TX: usize = 1;
 
     {
-        let mut w_tx = mgr.write_tx();
-        let mut alloc = w_tx.freelist_allocator().unwrap();
+        let mut tx = mgr.write_tx();
 
-        let mut heap = Heap::new(&mut alloc).unwrap();
-        heap.insert(&mut alloc, b"PLACEHOLDER").unwrap();
-        heap.insert(&mut alloc, b"first tx").unwrap();
-        w_tx.set_catalog_root_pgid(heap.get_root_pgid());
-        w_tx.commit(Durability::Flush).unwrap();
+        let mut heap = Heap::new(&mut tx).unwrap();
+        heap.insert(&mut tx, b"PLACEHOLDER").unwrap();
+        heap.insert(&mut tx, b"first tx").unwrap();
+        tx.set_catalog_root_pgid(heap.get_root_pgid());
+        tx.commit(Durability::Flush).unwrap();
     }
 
     for _ in 0..2 {
         // tx=3 (init, 2, 3)
-        let mut w_tx = mgr.write_tx();
-        let root_pgid = w_tx.get_catalog_root_pgid();
-        let mut alloc = w_tx.freelist_allocator().unwrap();
+        let mut tx = mgr.write_tx();
+        let root_pgid = tx.get_catalog_root_pgid();
 
         let mut heap = Heap::new_from_pgid(root_pgid);
-        heap.insert(&mut alloc, b"second tx").unwrap();
-        w_tx.set_catalog_root_pgid(heap.get_root_pgid());
-        w_tx.commit(Durability::Flush).unwrap();
+        heap.insert(&mut tx, b"second tx").unwrap();
+        tx.set_catalog_root_pgid(heap.get_root_pgid());
+        tx.commit(Durability::Flush).unwrap();
     }
 }
-*/

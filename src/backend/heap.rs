@@ -33,10 +33,10 @@ impl Heap {
     // ------------ Insert -------------------------------------------------------------------------
 
     pub(crate) fn get<'tx, R: PageReader<'tx>>(
-        &self, tx: &R, slot_idx: u16, buf: &mut [u8],
+        &self, tx: &R, slot_index: u16, buf: &mut [u8],
     ) -> Result<Option<usize>, PagerErr> {
         let page = HeapPage::from_buffer_ref(tx.get_page_read(self.pgid)?.buf);
-        match page.get_at_slot(slot_idx) {
+        match page.get_at_slot(slot_index) {
             Some(entry) => {
                 mooo_assert!(entry.len() <= buf.len());
                 buf[0..entry.len()].copy_from_slice(entry);
@@ -63,12 +63,12 @@ impl Heap {
     // ------------ Delete -------------------------------------------------------------------------
 
     pub(crate) fn delete<'tx, R: PageReader<'tx> + PageWriter<'tx>>(
-        &mut self, tx: &mut R, slot_idx: u16,
+        &mut self, tx: &mut R, slot_index: u16,
     ) -> Result<(), PagerErr> {
         let whdl = tx.get_page_write(self.pgid)?;
         // TODO page leak - see comment at top of btree.rs
         let mut page = HeapPage::from_buffer(whdl.buf);
-        let slot_opt = page.delete_slot_entry(slot_idx);
+        let slot_opt = page.delete_slot_entry(slot_index);
 
         self.pgid = whdl.get_pgid();
         Ok(slot_opt)

@@ -78,7 +78,7 @@ impl Btree {
                     traversal.push((rhdl, slot));
                 }
                 BtreePageType::Leaf => {
-                    traversal.push((rhdl, SLOT_IDX_NULL));
+                    traversal.push((rhdl, SLOT_INDEX_NULL));
                     break;
                 }
             }
@@ -98,9 +98,9 @@ impl Btree {
 
             if traversal.len() > 0 {
                 // fix parent_ptr
-                let (mut parent_whdl, slot_idx) = traversal.last_mut();
+                let (mut parent_whdl, slot_index) = traversal.last_mut();
                 let mut parent_page = BtreePage::from_buffer(parent_whdl.buf);
-                parent_page.overwrite_value_with_slot_index(slot_idx, whdl.get_pgid().into());
+                parent_page.overwrite_value_with_slot_index(slot_index, whdl.get_pgid().into());
             }
 
             let curr_page = BtreePage::from_buffer(whdl.buf);
@@ -112,7 +112,7 @@ impl Btree {
                     traversal.push((whdl, slot));
                 }
                 BtreePageType::Leaf => {
-                    traversal.push((whdl, SLOT_IDX_NULL));
+                    traversal.push((whdl, SLOT_INDEX_NULL));
                     break;
                 }
             }
@@ -175,6 +175,7 @@ impl Btree {
         }
     }
 
+    // TODO replace this with a persistent cursor, so we dont re-traverse every time
     #[must_use = "this fn has no side effects - why are you calling this?"]
     pub(crate) fn freelist_get_index<'tx, R: PageReader<'tx>>(
         &self, tx: &R, index: usize,
@@ -217,8 +218,8 @@ impl Btree {
             return Ok(page.len() as usize);
         }
 
-        for slot_idx in 0..page.len() {
-            let child_pgid = page.entry_at_slot(slot_idx).1.get();
+        for slot_index in 0..page.len() {
+            let child_pgid = page.entry_at_slot(slot_index).1.get();
             count += Btree::from_pgid(child_pgid).len(tx)?;
         }
 
@@ -254,13 +255,13 @@ impl Btree {
 
         // we have to (maybe) propogate our split
 
-        let mut traversal_idx = traversal.len() - 1;
-        while traversal_idx > 0 {
+        let mut traversal_index = traversal.len() - 1;
+        while traversal_index > 0 {
             // theres a page above us
-            // we will decrement our traversal_idx and fetch that page
+            // we will decrement our traversal_index and fetch that page
 
-            traversal_idx -= 1;
-            let (mut parent_whdl, _) = traversal.index_mut(traversal_idx);
+            traversal_index -= 1;
+            let (mut parent_whdl, _) = traversal.index_mut(traversal_index);
             let had_space = insert_child_ptr(&mut parent_whdl, &mut right_whdl);
 
             if had_space {
@@ -328,7 +329,7 @@ impl Btree {
 
             let pgid = whdl.get_pgid();
             drop(whdl);
-            tx.free_page(pgid);
+            tx.free_page(pgid)?;
         }
     }
 }

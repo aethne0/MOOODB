@@ -9,7 +9,7 @@ use crate::mooo_assert;
 
 pub(super) const PAGE_HEADER_SIZE: u16 = 0x40;
 pub(super) const SLOT_SIZE: u16 = 2 * size_of::<u16>() as u16;
-pub(super) const SLOT_IDX_NULL: u16 = u16::MAX;
+pub(super) const SLOT_INDEX_NULL: u16 = u16::MAX;
 pub(super) const END_OF_PAGE: u16 = PAGE_SIZE as u16 - 1;
 
 /// The first 32 bytes of every page on disk, regardless of page type.
@@ -68,9 +68,9 @@ unsafe impl Serialized for FreeEntry {}
 #[repr(C)]
 pub(super) struct HeapPtr(SerializedU64);
 impl HeapPtr {
-    pub(super) fn new(pgid: u64, slot_idx: u16) -> Self {
+    pub(super) fn new(pgid: u64, slot_index: u16) -> Self {
         mooo_assert!(pgid_valid(pgid));
-        let val = (pgid << 16) | (slot_idx as u64);
+        let val = (pgid << 16) | (slot_index as u64);
         Self(val.into())
     }
 
@@ -79,8 +79,8 @@ impl HeapPtr {
         self.0 = ((pgid << 16) | (self.0.get() & 0xffff)).into();
     }
 
-    pub(super) fn set_slot(&mut self, slot_idx: u16) {
-        self.0 = ((self.0.get() & 0xffff_ffff_ffff_0000) | (slot_idx as u64)).into();
+    pub(super) fn set_slot(&mut self, slot_index: u16) {
+        self.0 = ((self.0.get() & 0xffff_ffff_ffff_0000) | (slot_index as u64)).into();
     }
 
     pub(super) fn pgid(&self) -> u64 {
