@@ -75,35 +75,37 @@ fn deletoid() {
     const VAL_MASK: u64 = 0xffff_0000_0000_ffff;
 
     const INIT_CNT: usize = 12;
-    const TX_CNT: usize = 4;
+    const TX_CNT: usize = 12;
     const DELETES_PER_TX: usize = 1;
     const _: () = mooo_assert!(INIT_CNT >= TX_CNT * DELETES_PER_TX);
 
     let dur = Durability::Flush;
 
-    let mut entries = FxHashMap::default();
+    let mut entries = vec![];
 
     {
         let mut tx = mgr.write_tx();
 
         let mut btree = Btree::new(&mut tx).unwrap();
 
-        for _ in 0..INIT_CNT {
+        for i in 1..=INIT_CNT {
             let mut key = [0u8; KEY_SIZE];
             rfill(&mut key, &mut rng);
             let val: u64 = rng.random::<u64>() | VAL_MASK;
+            key[0..2].copy_from_slice(&(0x8000 - i as u16).to_be_bytes());
             btree.insert(&mut tx, &key, val).unwrap();
-            entries.insert(key, val);
+            entries.push((key, val));
         }
 
         tx.set_catalog_root_pgid(btree.get_root_pgid());
         tx.commit(dur).unwrap();
     }
 
-    let mut entries = entries.into_keys().collect::<Vec<_>>();
+    entries.reverse();
 
     for _ in 0..TX_CNT {
         let mut tx = mgr.write_tx();
+        let _txid = tx.get_txid();
         let root_pgid = tx.get_catalog_root_pgid();
         if root_pgid == PGID_NULL {
             break;
@@ -111,8 +113,8 @@ fn deletoid() {
         let mut btree = Btree::from_pgid(root_pgid);
 
         for _ in 0..DELETES_PER_TX {
-            let entry = entries.remove(rng.random_range(0..entries.len()));
-            btree.delete(&mut tx, &entry).unwrap();
+            let (key, _) = entries.pop().unwrap();
+            btree.delete(&mut tx, &key).unwrap();
         }
 
         tx.set_catalog_root_pgid(btree.get_root_pgid());

@@ -1,5 +1,6 @@
 // TODO all these unsafe bits should just be one method that gets the index and the &but at the same
 // time to ensure its safe
+// TODO on a IO failure of any kinda during a write-tx we should abort and then truncate
 
 use std::cell::UnsafeCell;
 use std::collections::HashMap;
@@ -48,6 +49,7 @@ pub(super) struct Pager {
     shard_dirs:      Box<[Mutex<HashMap<u64, usize>>]>,
     eviction_hand:   AtomicUsize,
     superblock_curr: RwLock<SuperblockHeader>,
+    // is writer poisoned
     writer_lock:     Mutex<()>,
 }
 
@@ -126,24 +128,30 @@ impl Pager {
     pub(crate) fn write_tx<'tx>(&'tx self) -> WriteTx<'tx> {
         let lock = self.writer_lock.lock().unwrap();
 
-        let mut superblock = self.superblock_curr.read().expect("todo").clone();
+        let mut superblock = self
+            .superblock_curr
+            .read()
+            .expect("we are the sole writer, nobody else should be writing to the superblock")
+            .clone();
         let prev_pgid = superblock.pgid.get();
         superblock.txid += 1;
         superblock.pgid.set((prev_pgid + 1) % 2);
         let freelist_pgid = superblock.pgid_freelist;
+        let file_size_prev = self.file.metadata().expect("todo").len();
 
         tx_registry::register(superblock.txid.get());
 
         WriteTx {
-            pager:                  self,
-            superblock:             superblock,
-            pages_allocated:        HashMap::new(),
-            pages_freed:            StackArray::new(),
-            fl_prev_used_ptr:       0,
-            fl_prev_dltd_ptr:       0,
-            fl_prev_pgid:           freelist_pgid.get(),
-            should_cleanup_on_drop: true,
-            _writer_tx_lock:        lock,
+            pager:            self,
+            superblock:       superblock,
+            not_commited:     true,
+            file_size_prev:   file_size_prev,
+            pages_allocated:  HashMap::new(),
+            pages_freed:      StackArray::new(),
+            fl_prev_used_ptr: 0,
+            fl_prev_dltd_ptr: 0,
+            fl_prev_pgid:     freelist_pgid.get(),
+            _writer_tx_lock:  lock,
         }
     }
 
@@ -151,6 +159,7 @@ impl Pager {
 
     /// We pass in pgid because we don't want this method to try to take a readlock on the frame's
     /// pgid field, its easier to just manage that in the caller.
+    /// NOTE if we encounter a write error we poison our pager, disallowing future write-txs
     #[must_use = "must handle error"]
     fn io_write(&self, whdl: &mut WrHdl<'_>, pgid: u64) -> Result<(), PagerErr> {
         mooo_assert!(
@@ -203,7 +212,8 @@ impl Pager {
     //  Frame handles & page-dir management                 ██▌▐▀▐█ ▪▐▌██▐█▌██. ██ ▐█▌▐▌▐█▄▄▌▐█▄▪▐█
     //                                                      ▀▀▀ · ▀  ▀ ▀▀ █▪▀▀▀▀▀• .▀▀▀  ▀▀▀  ▀▀▀▀
     // ---------------------------------------------------------------------------------------------
-    // NOTE To keep things easy to reason about, these should be the only places where we call lock
+    // NOTE
+    // To keep things easy to reason about, these should be the only places where we call lock
     // methods on the frame latch. By extension these will also be the only palces we construct
     // WrHdl and RdHdl (other than WrdHdl::Downgrade, but that doesnt take a new lock)
 
@@ -222,8 +232,8 @@ impl Pager {
         Some(WrHdl {
             frame:       frame,
             frame_inner: frame_guard,
-            // SAFETY as long as the frame_guard has been acquired from this frame (frame with `index`)
-            // then we know we effectively have a write-lock on this data
+            // SAFETY as long as the frame_guard has been acquired from this frame (frame with
+            // `index`) then we know we effectively have a write-lock on this data
             buf:         unsafe { &mut *self.pages[index].0.get() },
         })
     }
@@ -247,8 +257,8 @@ impl Pager {
         Some(RdHdl {
             frame:       frame,
             frame_inner: frame_guard,
-            // SAFETY as long as the frame_guard has been acquired from this frame (frame with `index`)
-            // then we know we effectively have a read-lock on this data
+            // SAFETY as long as the frame_guard has been acquired from this frame (frame with
+            // `index`) then we know we effectively have a read-lock on this data
             buf:         unsafe { &*self.pages[index].0.get() },
         })
     }
@@ -310,8 +320,8 @@ impl Pager {
                 Some(&frame_index) => {
                     match self.latch_read_and_check(frame_index, pgid) {
                         None => {
-                            // someone took this frame and changed its pgid since we checked the dir, so
-                            // we will abandon it and try again
+                            // someone took this frame and changed its pgid since we checked the
+                            // dir, so we will abandon it and try again
                             continue;
                         }
                         Some(rhdl) => {
@@ -330,14 +340,14 @@ impl Pager {
                     dir.insert(pgid, whdl.frame.index);
                     drop(dir);
 
-                    // frame is dirty so we have to write out
-                    // we do this while the frame is still in the old dir, because if we remove it
-                    // before hand the following race can happen
+                    // frame is dirty so we have to write out we do this while the frame is still in
+                    // the old dir, because if we remove it before hand the following race can
+                    // happen
                     //
                     // 1. we (thread A) remove it from dir
                     // 2. thread B wants the page, looks in dir, doesnt find it
-                    // 3. thread B tries to load off disk
-                    // -> We havent written it out yet though, so theyll load non-existent/stale data.
+                    // 3. thread B tries to load off disk -> We havent written it out yet though, so
+                    //    theyll load non-existent/stale data.
                     //
                     // We need thread B to wait on our loading lock instead, and then see the frame
                     // has been evicted, and THEN load it in (because well then have written it out)
@@ -415,7 +425,8 @@ impl Pager {
     }
 }
 
-// ------------ Frame Definitions ------------------------------------------------------------------
+// ------------ frame types ------------------------------------------------------------------------
+
 // #[repr(align(4096))]
 struct FrameBuffer(UnsafeCell<[u8; PAGE_SIZE]>);
 
@@ -555,7 +566,7 @@ pub(super) trait PageWriter<'tx> {
     /// NOTE it is the implementors job to set the `pgid` of this handed our WrHdl
     fn get_page_write<'op>(&'op mut self, pgid: u64) -> Result<WrHdl<'tx>, PagerErr>;
     fn get_page_alloc<'op>(&'op mut self) -> Result<WrHdl<'tx>, PagerErr>;
-    /// NOTE drop corresponding `WrHdl`/`RdHdl` before calling this!
+    /// NOTE **drop corresponding `WrHdl`/`RdHdl` before calling this!**
     fn free_page(&mut self, pgid: u64) -> Result<(), PagerErr>;
 }
 
@@ -661,11 +672,13 @@ impl<'tx> PageReader<'tx> for ReadTx<'tx> {
 
 /// A write-tx that uses bump-allocation only
 pub(super) struct WriteTx<'tx> {
-    pager:                  &'tx Pager,
-    superblock:             SuperblockHeader,
+    pager:           &'tx Pager,
+    superblock:      SuperblockHeader,
     /// This gets set after successful commit, to stop some drop cleanup stuff from happening
-    should_cleanup_on_drop: bool,
-    _writer_tx_lock:        MutexGuard<'tx, ()>,
+    not_commited:    bool,
+    /// For cleaning up pages that were spilled before commit, in the event of cancellation
+    file_size_prev:  u64,
+    _writer_tx_lock: MutexGuard<'tx, ()>,
 
     /// This will writeout to our new freelist if its full
     pages_freed:      StackArray<u64, 127>,
@@ -686,10 +699,14 @@ pub(super) struct WriteTx<'tx> {
 
 impl Drop for WriteTx<'_> {
     fn drop(&mut self) {
-        if self.should_cleanup_on_drop {
+        if self.not_commited {
             for (_, &frame_index) in self.pages_allocated.iter() {
                 self.pager.abandon_allocated_frame(frame_index);
             }
+            self.pager
+                .file
+                .set_len(self.file_size_prev)
+                .expect("TODO couldn't truncate file during tx cancellation");
         }
 
         tx_registry::deregister();
@@ -697,6 +714,10 @@ impl Drop for WriteTx<'_> {
 }
 
 impl<'tx> WriteTx<'tx> {
+    pub(super) fn get_txid(&self) -> u64 {
+        self.superblock.txid.get()
+    }
+
     pub(super) fn get_catalog_root_pgid(&self) -> u64 {
         self.superblock.pgid_catalog.get()
     }
@@ -743,7 +764,7 @@ impl<'tx> WriteTx<'tx> {
             self.pager.fsync()?;
         }
 
-        self.should_cleanup_on_drop = false;
+        self.not_commited = false;
         *self.pager.superblock_curr.write().unwrap() = self.superblock.clone();
         Ok(())
     }
@@ -823,6 +844,11 @@ impl<'tx> PageReader<'tx> for WriteTx<'tx> {
 }
 
 impl<'tx> PageWriter<'tx> for WriteTx<'tx> {
+    /// this has a couple limitations for simplcities sake
+    /// 1. we obviously cant undo bump-allocated allocations
+    /// 2. if we take a page from the old free-list, we can't put it back, because we're only taking
+    ///    from that list and adding to the new version of the ree-list. Hypothetically: we could
+    ///    have some in-memory thing to keep track of these, but don't atm.
     fn free_page(&mut self, pgid: u64) -> Result<(), PagerErr> {
         if let Some(frame_index) = self.pages_allocated.remove(&pgid) {
             // we allocated this page, so we should abandon it

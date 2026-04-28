@@ -1,22 +1,12 @@
-// TODO we need some way mark claimed pages as de-claimed, if we end up aborting something see:
-// Btree::pop_min_lt
-//
-// TODO btree has large stack allocations
-//
 // TODO btree delete rebalancing
-//
-// TODO key-only freelist btree
-//
-// TODO page leaks on early return - maybe we should call commit or something on CoW shadowed pages
-// er wait no i dont think it matters... cause we will just recover the old superblock unless we
-// keep doing stuff with the same wtx...
-//
-// `pop_min_lt`: TODO this is CoWing even if we dont make a change,
 //
 // TODO we can optimze `get_index` and `len` by keeping an entry count on inner pages, which should
 // be roughly free to maintain because of CoW
-//
 // TODO obviously for the freelist index thing we should just be keeping a cursor/iterator
+//
+// TODO key-only freelist btree
+//
+// TODO In delete there are some sorted inserts that could be optimized
 
 use std::cell::Ref;
 use std::cell::RefCell;
@@ -25,6 +15,7 @@ use std::mem::MaybeUninit;
 
 use super::page_btree::BtreePage;
 use super::page_btree::BtreePageType;
+use super::page_btree::SearchResult;
 use super::serialization::*;
 use super::storage_manager::*;
 use super::PagerErr;
@@ -100,7 +91,7 @@ impl Btree {
                 // fix parent_ptr
                 let (mut parent_whdl, slot_index) = traversal.last_mut();
                 let mut parent_page = BtreePage::from_buffer(parent_whdl.buf);
-                parent_page.overwrite_value_with_slot_index(slot_index, whdl.get_pgid().into());
+                parent_page.overwrite_value_at_slot_index(slot_index, whdl.get_pgid().into());
             }
 
             let curr_page = BtreePage::from_buffer(whdl.buf);
@@ -226,7 +217,7 @@ impl Btree {
         Ok(count)
     }
 
-    // ------------ Accessor methods (write) -------------------------------------------------------
+    // ------------ Insert -------------------------------------------------------------------------
 
     pub(crate) fn insert<'tx, R: PageReader<'tx> + PageWriter<'tx>>(
         &mut self, tx: &mut R, key: &[u8], val: impl Into<SerializedU64>,
@@ -288,61 +279,241 @@ impl Btree {
         return Ok(());
     }
 
+    // ------------ Delete -------------------------------------------------------------------------
+
     pub(crate) fn delete<'tx, R: PageReader<'tx> + PageWriter<'tx>>(
         &mut self, tx: &mut R, key: &[u8],
-    ) -> Result<(), PagerErr> {
+    ) -> Result<bool, PagerErr> {
         let mut traversal = self.traverse_cow(tx, key)?;
+
+        let mut slotidx_opt = Some({
+            let (whdl_leaf, _) = traversal.last_ref();
+            let page_leaf = BtreePage::from_buffer_ref(whdl_leaf.buf);
+            let SearchResult::Found(slotidx) = page_leaf.find_slot_from_key(key) else {
+                return Ok(false);
+            };
+            slotidx
+        });
+
+        loop {
+            match slotidx_opt {
+                None => return Ok(true),
+                Some(slotidx) => {
+                    slotidx_opt = self.delete_and_pop(tx, &mut traversal, slotidx)?;
+                }
+            }
+        }
+    }
+
+    /// returns true we deleted a leaf page
+    /// TODO doc
+    /// Pops topmost entry from traversal
+    fn delete_and_pop<'tx, R: PageReader<'tx> + PageWriter<'tx>>(
+        &mut self, tx: &mut R, traversal: &mut Traversal<WrHdl<'_>>, slot_index: u16,
+    ) -> Result<Option<u16>, PagerErr> {
         mooo_assert!(traversal.len() > 0);
         self.root_pgid = traversal.index_ref(0).0.get_pgid();
 
-        // this is a somewhat simplified delete method - we just delete an ntry, and then the only
-        // "rebalancing" we do is freeing the page if we are empty, and popping back up to the
-        // parent and deleting the entry there (recursively)
+        // remove from leaf
+        let (mut whdl, _) = traversal.pop();
+        let pgid = whdl.get_pgid();
+        let mut page = BtreePage::from_buffer(whdl.buf);
+        let is_root = self.root_pgid == pgid;
+        mooo_assert!(page.len() > 0);
+        page.delete_slot_entry(slot_index);
 
-        let mut leaf = true;
+        // if `is_root` we return in these branches
 
-        // we don't want to remove the root
-        loop {
-            // repeatedly pop and free empty leaves
-            let (whdl, slot) = traversal.pop();
-            let mut page = BtreePage::from_buffer(whdl.buf);
-
-            if leaf {
-                page.delete(key);
-                leaf = false;
-            } else {
-                page.delete_slot_entry(slot);
-            }
-
-            if page.len() > 0 {
-                // page still has items, were done
-                return Ok(());
-            }
-
-            if traversal.len() == 0 {
-                // were at the root of our btree, so we don't want to delete anymore
-                // this page is empty, though, so we should change it to a leaf, instead of having a
-                // top level empty inner node unexpectedly later
-                page.set_page_type(BtreePageType::Leaf);
-                return Ok(());
-            }
-
-            let pgid = whdl.get_pgid();
-            drop(whdl);
-            tx.free_page(pgid)?;
+        if is_root && page.is_leaf() {
+            // we are the root, and a leaf node, were good even if were empty
+            return Ok(None);
         }
+
+        if is_root && page.is_inner() {
+            mooo_assert!(page.len() > 0);
+            // we are the root, and an inner node
+
+            if page.len() > 1 {
+                // if we have >1 child we are good
+                return Ok(None);
+            }
+
+            // if we only have 1 child we will just suck them
+            // Don't forget that if we suck a singular leaf child we should become a leaf ourself
+
+            let pgid_child = {
+                let pgid_child = page.entry_at_slot(0).1.get();
+                let rhdl_child = tx.get_page_read(pgid_child)?;
+                let page_child = BtreePage::from_buffer_ref(rhdl_child.buf);
+
+                page.clear();
+                page.set_page_type(page_child.get_page_type());
+                for (key, val) in &page_child {
+                    page.insert(key, val);
+                }
+                pgid_child
+            };
+
+            tx.free_page(pgid_child)?;
+            return Ok(None);
+        }
+
+        if page.is_full_enough() {
+            // this page is not underflowing -> were good
+            return Ok(None);
+        }
+
+        let (whdl_parent, parent_slotidx_to_leaf) = traversal.pop();
+        let mut page_parent = BtreePage::from_buffer(whdl_parent.buf);
+
+        // By this point, our node is:
+        // - not the root
+        mooo_assert!(!is_root);
+        // - underflowing
+        mooo_assert!(!page.is_full_enough());
+        // - has at least one sibling
+        mooo_assert!(page_parent.len() > 1);
+
+        // we will try to borrow from left sibling (if exists),
+        // then try to borrow from right sibling (if exists)
+
+        // TODO we can probably deduplicate this right/left logic
+        if parent_slotidx_to_leaf > 0 {
+            // theres a sibling to our left
+            let pgid_sibling_old = page_parent.entry_at_slot(parent_slotidx_to_leaf - 1).1.get();
+            let can_borrow = {
+                let rhdl_sibling = tx.get_page_read(pgid_sibling_old)?;
+                let page_sibling = BtreePage::from_buffer_ref(rhdl_sibling.buf);
+                page_sibling.is_full_enough_without_last()
+            };
+
+            if can_borrow {
+                // this sibling is full enough to borrow from
+                let whdl_sibling = tx.get_page_write(pgid_sibling_old)?;
+                let pgid_sibling = whdl_sibling.get_pgid();
+                let mut page_sibling = BtreePage::from_buffer(whdl_sibling.buf);
+                let (key, val) = page_sibling.entry_at_slot(page_sibling.len() - 1);
+                page.insert(key, val);
+                page_sibling.delete_slot_entry(page_sibling.len() - 1);
+                mooo_assert!(page_sibling.len() > 0);
+                mooo_assert!(page_sibling.is_full_enough());
+                mooo_assert!(page.is_full_enough());
+
+                // we have a new leftmost key -> we need to update our parents pointer to us
+                page_parent.delete_slot_entry(parent_slotidx_to_leaf);
+                page_parent.insert(page.entry_at_slot(0).0, pgid.into());
+                // then also update our siblings newly CoW'd pointer
+                page_parent.delete_slot_entry(parent_slotidx_to_leaf - 1);
+                page_parent.insert(page_sibling.entry_at_slot(0).0, pgid_sibling.into());
+                return Ok(None);
+            }
+        }
+
+        if parent_slotidx_to_leaf < page_parent.len() - 1 {
+            // theres a sibling to our right
+            let pgid_sibling_old = page_parent.entry_at_slot(parent_slotidx_to_leaf + 1).1.get();
+            let can_borrow = {
+                let rhdl_sibling = tx.get_page_read(pgid_sibling_old)?;
+                let page_sibling = BtreePage::from_buffer_ref(rhdl_sibling.buf);
+                page_sibling.is_full_enough_without_first()
+            };
+
+            if can_borrow {
+                // this sibling is full enough to borrow from
+                let whdl_sibling = tx.get_page_write(pgid_sibling_old)?;
+                let pgid_sibling = whdl_sibling.get_pgid();
+                let mut page_sibling = BtreePage::from_buffer(whdl_sibling.buf);
+                let (key, val) = page_sibling.entry_at_slot(0);
+                page.insert(key, val);
+                page_sibling.delete_slot_entry(0);
+                mooo_assert!(page_sibling.len() > 0);
+                mooo_assert!(page_sibling.is_full_enough());
+                mooo_assert!(page.is_full_enough());
+
+                // right sibling has a new leftmost key -> we need to update the parent's
+                // pointer to it
+                page_parent.delete_slot_entry(parent_slotidx_to_leaf + 1);
+                page_parent.insert(page_sibling.entry_at_slot(0).0, pgid_sibling.into());
+                return Ok(None);
+            }
+        }
+
+        // note: we are only holding whdl_leaf and whdl_parent right now
+        //       We also haven't CoW'd a sibling yet
+
+        // we couldn't borrow from a sibling, so we need to merge
+        // well take left sibling if exists, otherwise right
+        let (dir_sibling, parent_slotidx_to_sibling) = if parent_slotidx_to_leaf > 0 {
+            (SiblingDir::Left, parent_slotidx_to_leaf - 1)
+        } else {
+            (SiblingDir::Right, parent_slotidx_to_leaf + 1)
+        };
+
+        let pgid_sibling = page_parent.entry_at_slot(parent_slotidx_to_sibling).1.get();
+        let rhdl_sibling = tx.get_page_read(pgid_sibling)?;
+
+        let page_leaf = {
+            drop(page);
+            merge(&mut whdl, &rhdl_sibling, dir_sibling);
+            BtreePage::from_buffer(whdl.buf)
+        };
+
+        if dir_sibling == SiblingDir::Left {
+            // if sibling was on our left, then our lowest key changed, so we need to update ptr
+            // idx-1 because our slot index was decrementing from deleting our left sibling!
+            page_parent.delete_slot_entry(parent_slotidx_to_leaf - 1);
+            page_parent.insert(page_leaf.entry_at_slot(0).0, pgid.into());
+        }
+
+        mooo_assert!(page_leaf.is_full_enough());
+        traversal.push((whdl_parent, SLOT_INDEX_NULL));
+        tx.free_page(pgid_sibling)?;
+        Ok(Some(parent_slotidx_to_sibling))
     }
 }
 
 // ------------ Helpers ----------------------------------------------------------------------------
 
-/// these pages should be initialized
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum SiblingDir {
+    Left,
+    Right,
+}
+
+/// Inserts a pointer in parent pointing to child, using the child whdl pgid and leftmost key.
+/// These pages should be initialized.
+/// **Return**'s whether or not insert had space - nothing was done if there was no space
 fn insert_child_ptr(parent_whdl: &mut WrHdl<'_>, child_whdl: &mut WrHdl<'_>) -> bool {
     // insert split leafs into new root
     let child_pgid = child_whdl.get_pgid();
     let child_page = BtreePage::from_buffer(child_whdl.buf);
     let mut parent_page = BtreePage::from_buffer(parent_whdl.buf);
     parent_page.insert(child_page.entry_at_slot(0).0, child_pgid.into())
+}
+
+/// Merges donor into receiver - doesn't mutate donor
+///
+/// If `donor` is RIGHT of the `receiver` then `direction_to_donor` should be `SiblingDir::Right`
+fn merge(receiver: &mut WrHdl<'_>, donor: &RdHdl<'_>, direction_to_donor: SiblingDir) {
+    let mut receiver = BtreePage::from_buffer(receiver.buf);
+    let donor = BtreePage::from_buffer_ref(donor.buf);
+
+    match direction_to_donor {
+        SiblingDir::Left => {
+            // donor is to our left, so keys will be less than ours, so we can't just append them
+            for (key, val) in &donor {
+                receiver.insert(key, val);
+            }
+        }
+        SiblingDir::Right => {
+            for (key, val) in &donor {
+                receiver.insert_unordered(key, val);
+            }
+        }
+    }
+
+    #[cfg(debug_assertions)]
+    receiver.compact();
 }
 
 /// left should be initialized, right should NOT be initiliazed
@@ -373,7 +544,7 @@ fn redistribute_with_child_ptr(
 // ------------ Page traversal list ----------------------------------------------------------------
 
 // const STACK_SIZE: usize = 48;
-const STACK_SIZE: usize = 8;
+const STACK_SIZE: usize = 64;
 struct Traversal<T> {
     head: usize,
     arr:  [MaybeUninit<(RefCell<T>, u16)>; STACK_SIZE],

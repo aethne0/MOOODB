@@ -38,7 +38,7 @@ impl<'buf> BtreePage<&'buf mut [u8; PAGE_SIZE]> {
         buffer: &'buf mut [u8; PAGE_SIZE], page_type: BtreePageType,
     ) -> Self {
         let mut page = Self::from_buffer(buffer);
-        page.reinit_page();
+        page.clear();
         page.set_page_type(page_type);
         page
     }
@@ -96,6 +96,22 @@ impl<Buf: AsRef<[u8]>> BtreePage<Buf> {
         (self.upper_ptr.get() - PAGE_HEADER_SIZE) / SLOT_SIZE
     }
 
+    pub(super) fn is_full_enough(&self) -> bool {
+        self.free_bytes() <= (PAGE_SIZE as u16 - PAGE_HEADER_SIZE) / 2
+    }
+
+    pub(super) fn is_full_enough_without_first(&self) -> bool {
+        mooo_assert!(self.len() > 0);
+        let entry_size = self.offset_len_from_slot(0).1 as u16;
+        self.free_bytes() + entry_size <= (PAGE_SIZE as u16 - PAGE_HEADER_SIZE) / 2
+    }
+
+    pub(super) fn is_full_enough_without_last(&self) -> bool {
+        mooo_assert!(self.len() > 0);
+        let entry_size = self.offset_len_from_slot(self.len() - 1).1 as u16;
+        self.free_bytes() + entry_size <= (PAGE_SIZE as u16 - PAGE_HEADER_SIZE) / 2
+    }
+
     fn offset_len_from_slot(&self, slot_index: u16) -> (u16, u16) {
         let base = (PAGE_HEADER_SIZE + slot_index * SLOT_SIZE) as usize;
         let raw = self.raw.as_ref();
@@ -141,7 +157,7 @@ impl<Buf: AsRef<[u8]>> BtreePage<Buf> {
 
     /// Binary searches for `key` and returns a [`SearchResult`] indicating whether it was
     /// found and at which slot, or where it would be inserted to maintain order.
-    fn find_slot_from_key(&self, key: &[u8]) -> SearchResult {
+    pub(super) fn find_slot_from_key(&self, key: &[u8]) -> SearchResult {
         let _ = u16::try_from(key.len()).expect("passed key too large");
 
         if self.len() == 0 {
@@ -218,7 +234,7 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
         SerializedU16::from(len).write_to_prefix(&mut raw[base + size_of::<u16>()..]);
     }
 
-    fn reinit_page(&mut self) {
+    pub(super) fn clear(&mut self) {
         self.upper_ptr = PAGE_HEADER_SIZE.into();
         self.lower_ptr = END_OF_PAGE.into();
         self.free_bytes = BTREE_PAGE_USABLE_SPACE.into();
@@ -288,7 +304,8 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
         }
     }
 
-    pub(super) fn overwrite_value_with_slot_index(&mut self, slot_index: u16, val: SerializedU64) {
+    pub(super) fn overwrite_value_at_slot_index(&mut self, slot_index: u16, val: SerializedU64) {
+        mooo_assert!(self.len() > slot_index);
         let (offset, len) = self.offset_len_from_slot(slot_index);
         let start = offset as usize + len as usize - size_of::<SerializedU64>();
         self.raw.as_mut()[start..start + size_of::<SerializedU64>()]
@@ -364,7 +381,7 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
         let mut cloned_raw = [0u8; PAGE_SIZE];
         cloned_raw.copy_from_slice(self.raw());
         let cloned_page = BtreePage::from_buffer(&mut cloned_raw);
-        self.reinit_page();
+        self.clear();
         for (k, v) in cloned_page.iter() {
             self.insert_unordered(k, v);
         }
@@ -378,7 +395,7 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
         let mut cloned_left_raw = [0u8; PAGE_SIZE];
         cloned_left_raw.copy_from_slice(self.raw());
         let og_page = BtreePage::from_buffer(&mut cloned_left_raw);
-        self.reinit_page();
+        self.clear();
 
         let midpoint = og_page.len() / 2;
 
