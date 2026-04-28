@@ -88,28 +88,35 @@ impl<Buf: AsRef<[u8]>> BtreePage<Buf> {
         1 + self.lower_ptr.get() - self.upper_ptr.get()
     }
 
-    fn free_bytes(&self) -> u16 {
-        self.free_bytes.get()
-    }
-
     pub(super) fn len(&self) -> u16 {
         (self.upper_ptr.get() - PAGE_HEADER_SIZE) / SLOT_SIZE
     }
 
+    fn bytes_used(&self) -> u16 {
+        (PAGE_SIZE as u16 - PAGE_HEADER_SIZE) - self.free_bytes.get()
+    }
+
     pub(super) fn is_full_enough(&self) -> bool {
-        self.free_bytes() <= (PAGE_SIZE as u16 - PAGE_HEADER_SIZE) / 2
+        self.free_bytes.get() <= (PAGE_SIZE as u16 - PAGE_HEADER_SIZE) / 2
     }
 
     pub(super) fn is_full_enough_without_first(&self) -> bool {
         mooo_assert!(self.len() > 0);
+        // TODO check
         let entry_size = self.offset_len_from_slot(0).1 as u16;
-        self.free_bytes() + entry_size <= (PAGE_SIZE as u16 - PAGE_HEADER_SIZE) / 2
+        self.free_bytes.get() + entry_size <= (PAGE_SIZE as u16 - PAGE_HEADER_SIZE) / 2
     }
 
     pub(super) fn is_full_enough_without_last(&self) -> bool {
         mooo_assert!(self.len() > 0);
-        let entry_size = self.offset_len_from_slot(self.len() - 1).1 as u16;
-        self.free_bytes() + entry_size <= (PAGE_SIZE as u16 - PAGE_HEADER_SIZE) / 2
+        let entry_size = self.offset_len_from_slot(self.len() - 1).1 as u16 + SLOT_SIZE;
+        self.free_bytes.get() + entry_size <= (PAGE_SIZE as u16 - PAGE_HEADER_SIZE) / 2
+    }
+
+    pub(super) fn could_merge_with<BufOther: AsRef<[u8]>>(
+        &self, other: &BtreePage<BufOther>,
+    ) -> bool {
+        self.bytes_used() + other.bytes_used() <= (PAGE_SIZE as u16 - PAGE_HEADER_SIZE)
     }
 
     fn offset_len_from_slot(&self, slot_index: u16) -> (u16, u16) {
@@ -268,7 +275,7 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
 
     pub(super) fn delete_slot_entry(&mut self, slot_index: u16) {
         mooo_assert!(slot_index < self.len());
-        let (offset, len) = self.offset_len_from_slot(slot_index);
+        let (_offset, len) = self.offset_len_from_slot(slot_index);
 
         let del = (PAGE_HEADER_SIZE + slot_index * SLOT_SIZE) as usize;
         let end = (PAGE_HEADER_SIZE + self.len() * SLOT_SIZE) as usize;
@@ -278,11 +285,7 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
         self.free_bytes = (self.free_bytes.get() + SLOT_SIZE + len).into();
 
         #[cfg(debug_assertions)]
-        {
-            self.raw.as_mut()[offset as usize..(offset + len) as usize].fill(0);
-            let stale = (PAGE_HEADER_SIZE + self.len() * SLOT_SIZE) as usize;
-            self.raw.as_mut()[stale..stale + SLOT_SIZE as usize].fill(0);
-        }
+        self.compact();
     }
 
     pub(super) fn set_page_type(&mut self, page_type: BtreePageType) {
@@ -363,17 +366,24 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
         let val_size = size_of::<SerializedU64>() as u16;
         self.raw.as_mut()[(offset + key_len) as usize..(offset + key_len + val_size) as usize]
             .copy_from_slice(val.as_bytes());
+
         true
     }
 
     /// Inserts or updates `(key, val)` maintaining sorted order. Returns `false` if the page is full.
     pub(super) fn insert(&mut self, key: &[u8], val: SerializedU64) -> bool {
+        #[cfg(debug_assertions)]
+        self.compact();
+
         self.insert_internal(key, val, true)
     }
 
     /// Appends `(key, val)` to the end of the slot array without a binary search.
     /// Note: Breaks the sort invariant unless the caller guarantees the entry belongs at the end.
     pub(super) fn insert_unordered(&mut self, key: &[u8], val: SerializedU64) -> bool {
+        #[cfg(debug_assertions)]
+        self.compact();
+
         self.insert_internal(key, val, false)
     }
 
@@ -383,7 +393,7 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
         let cloned_page = BtreePage::from_buffer(&mut cloned_raw);
         self.clear();
         for (k, v) in cloned_page.iter() {
-            self.insert_unordered(k, v);
+            self.insert_internal(k, v, false);
         }
     }
 
@@ -404,6 +414,12 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
         }
         for (k, v) in (midpoint..og_page.len()).map(|i| og_page.entry_at_slot(i)) {
             right_page.insert_unordered(k, v);
+        }
+
+        #[cfg(debug_assertions)]
+        {
+            self.compact();
+            right_page.compact();
         }
     }
 }

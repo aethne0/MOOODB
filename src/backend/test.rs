@@ -13,11 +13,9 @@ use rand::rngs::ChaCha8Rng;
 use rand::Rng;
 use rand::RngExt;
 use rand::SeedableRng;
-use rustc_hash::FxHashMap;
-
-use crate::backend::heap::Heap;
 
 use super::btree::Btree;
+use super::heap::Heap;
 use super::*;
 
 fn fmt_bytes(bytes: &[u8]) -> String {
@@ -50,7 +48,6 @@ fn testfile() -> File {
     path.push(".test_dbs");
     std::fs::create_dir_all(&path).unwrap();
     path.push(format!("{}.moo", test_name));
-    eprintln!("{:?}", &path);
     std::fs::OpenOptions::new()
         .read(true)
         .truncate(true)
@@ -65,17 +62,17 @@ fn testfile() -> File {
 #[test]
 fn deletoid() {
     eprintln!("");
-    const SIZE: usize = 64 * 1024 * 1024;
+    const SIZE: usize = 8 * 1024 * 1024 * 1024;
     const FRAME_CNT: usize = SIZE / PAGE_SIZE;
     let mgr = Pager::new(FRAME_CNT, testfile()).unwrap();
 
     let mut rng = get_rand();
 
-    const KEY_SIZE: usize = 8;
+    const KEY_SIZE: usize = 24;
     const VAL_MASK: u64 = 0xffff_0000_0000_ffff;
 
-    const INIT_CNT: usize = 12;
-    const TX_CNT: usize = 12;
+    const INIT_CNT: usize = 2_000_000;
+    const TX_CNT: usize = 1_000_000;
     const DELETES_PER_TX: usize = 1;
     const _: () = mooo_assert!(INIT_CNT >= TX_CNT * DELETES_PER_TX);
 
@@ -92,7 +89,7 @@ fn deletoid() {
             let mut key = [0u8; KEY_SIZE];
             rfill(&mut key, &mut rng);
             let val: u64 = rng.random::<u64>() | VAL_MASK;
-            key[0..2].copy_from_slice(&(0x8000 - i as u16).to_be_bytes());
+            key[0..8].copy_from_slice(&(0x8000_0000_0000_0000 - i as u64).to_be_bytes());
             btree.insert(&mut tx, &key, val).unwrap();
             entries.push((key, val));
         }
@@ -103,6 +100,7 @@ fn deletoid() {
 
     entries.reverse();
 
+    let start = std::time::Instant::now();
     for _ in 0..TX_CNT {
         let mut tx = mgr.write_tx();
         let _txid = tx.get_txid();
@@ -120,65 +118,11 @@ fn deletoid() {
         tx.set_catalog_root_pgid(btree.get_root_pgid());
         tx.commit(dur).unwrap();
     }
+    let end = std::time::Instant::now();
+
+    // ~46s
+    eprintln!("{} deletes took {}s", TX_CNT, end.duration_since(start).as_secs_f32());
 }
-
-// TODO use fxhash
-
-/*
-#[test]
-fn freelist() {
-    eprintln!("");
-    const SIZE: usize = 64 * 1024 * 1024;
-    const FRAME_CNT: usize = SIZE / PAGE_SIZE;
-    let mgr = Pager::new(FRAME_CNT, testfile());
-
-    let mut rng = get_rand();
-
-    // const KEY_SIZE: usize = 2;
-    const KEY_SIZE: usize = 8;
-    const VAL_MASK: u64 = 0xffff_0000_0000_ffff;
-    // not including initial
-    const TX_CNT: usize = 1;
-    const INSERTS_PER_TX_INIT: usize = 1;
-    const INSERTS_PER_TX: usize = 1;
-
-    let dur = Durability::Flush;
-
-    {
-        let mut w_tx = mgr.write_tx();
-
-        let mut alloc = w_tx.freelist_allocator().unwrap();
-        let mut btree = Btree::new(&mut alloc).unwrap();
-
-        for _ in 0..INSERTS_PER_TX_INIT {
-            let mut key = [0u8; KEY_SIZE];
-            rfill(&mut key, &mut rng);
-            let val: u64 = rng.random::<u64>() | VAL_MASK;
-            btree.insert(&mut alloc, &key, val).unwrap();
-        }
-
-        w_tx.set_catalog_root_pgid(btree.get_root_pgid());
-        w_tx.commit(dur).unwrap();
-    }
-
-    for _ in 0..TX_CNT {
-        let mut w_tx = mgr.write_tx();
-        let root_pgid = w_tx.get_catalog_root_pgid();
-        let mut alloc = w_tx.freelist_allocator().unwrap();
-        let mut btree = Btree::new_from_root_pgid(root_pgid);
-
-        for _ in 0..INSERTS_PER_TX {
-            let mut key = [0u8; KEY_SIZE];
-            rfill(&mut key, &mut rng);
-            let val: u64 = rng.random::<u64>() | VAL_MASK;
-            btree.insert(&mut alloc, &key, val).unwrap();
-        }
-
-        w_tx.set_catalog_root_pgid(btree.get_root_pgid());
-        w_tx.commit(dur).unwrap();
-    }
-}
-*/
 
 #[test]
 fn megalist() {

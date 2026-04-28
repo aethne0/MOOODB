@@ -1,9 +1,10 @@
 // TODO all these unsafe bits should just be one method that gets the index and the &but at the same
 // time to ensure its safe
 // TODO on a IO failure of any kinda during a write-tx we should abort and then truncate
+// TODO we need some sort of "spill" for mega-huge write-tx's where the working set cant fit in
+// memory
 
 use std::cell::UnsafeCell;
-use std::collections::HashMap;
 use std::fs::File;
 use std::mem::replace;
 use std::ops::AddAssign;
@@ -15,6 +16,8 @@ use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::RwLock;
 
+use rustc_hash::FxHashMap;
+
 use super::btree::Btree;
 use super::compute_checksum;
 use super::frame_latch::*;
@@ -24,7 +27,7 @@ use super::pgid_valid;
 use super::serialization::*;
 use super::PAGE_SIZE;
 use super::PGID_NULL;
-use crate::fixed_array::StackArray;
+use crate::collections::StackArray;
 use crate::mooo_assert;
 
 // -------------------------------------------------------------------------------------------------
@@ -39,6 +42,12 @@ const ON_DISK_VERSION: u64 = 1;
 const SHARD_CNT: usize = 256;
 const TXID_NULL_HIGH: u64 = u64::MAX;
 
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum PagerErr {
+    Io(std::io::ErrorKind),
+    Integrity,
+}
+
 pub(super) struct Pager {
     file:            File,
     frames:          Box<[FrameHeader]>,
@@ -46,7 +55,7 @@ pub(super) struct Pager {
     // these are Mutexs instead of RwLocks because we often have to take a read-lock, then drop it,
     // then try to take a writelock, then double check - because of sharding it is probably faster
     // to just have it be a mutex
-    shard_dirs:      Box<[Mutex<HashMap<u64, usize>>]>,
+    shard_dirs:      Box<[Mutex<FxHashMap<u64, usize>>]>,
     eviction_hand:   AtomicUsize,
     superblock_curr: RwLock<SuperblockHeader>,
     // is writer poisoned
@@ -63,7 +72,7 @@ impl Pager {
             file:            file,
             frames:          (0..count).map(|i| FrameHeader::new(i)).collect(),
             pages:           (0..count).map(|_| FrameBuffer::zeros()).collect(),
-            shard_dirs:      (0..SHARD_CNT).map(|_| Mutex::new(HashMap::default())).collect(),
+            shard_dirs:      (0..SHARD_CNT).map(|_| Mutex::new(FxHashMap::default())).collect(),
             eviction_hand:   0.into(),
             writer_lock:     Mutex::new(()),
             superblock_curr: RwLock::new(temp_header),
@@ -146,7 +155,7 @@ impl Pager {
             superblock:       superblock,
             not_commited:     true,
             file_size_prev:   file_size_prev,
-            pages_allocated:  HashMap::new(),
+            pages_allocated:  FxHashMap::default(),
             pages_freed:      StackArray::new(),
             fl_prev_used_ptr: 0,
             fl_prev_dltd_ptr: 0,
@@ -526,19 +535,20 @@ pub(super) struct RdHdl<'pager> {
     pub(super) buf: &'pager [u8; PAGE_SIZE],
 }
 
-#[derive(Debug, Clone, Copy)]
-pub(crate) enum PagerErr {
-    Io(std::io::ErrorKind),
-    /// `page_id` or `checksum` did not match
-    Integrity,
+impl<'pager> RdHdl<'pager> {
+    pub(super) fn get_pgid(&self) -> u64 {
+        let pgid = self.frame_inner.pgid;
+        mooo_assert!(pgid_valid(pgid));
+        pgid
+    }
 }
 
 // -------------------------------------------------------------------------------------------------
-// ▄▄▄▄▄▐▄• ▄
-// •██   █▌█▌▪
-//  ▐█.▪ ·██·
-//  ▐█▌·▪▐█·█▌  WriteTx & ReadTx
-//  ▀▀▀ •▀▀ ▀▀
+//                                                                                      ▄▄▄▄▄▐▄• ▄
+//                                                                                      •██   █▌█▌▪
+//                                                                                       ▐█.▪ ·██·
+//  WriteTx & ReadTx                                                                     ▐█▌·▪▐█·█▌
+//                                                                                       ▀▀▀ •▀▀ ▀▀
 // -------------------------------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
@@ -550,6 +560,10 @@ pub(super) enum Durability {
     Flush,
     /// Writes and fsyncs
     Sync,
+}
+
+pub(super) trait PageReader<'tx> {
+    fn get_page_read(&self, pgid: u64) -> Result<RdHdl<'tx>, PagerErr>;
 }
 
 pub(super) trait PageWriter<'tx> {
@@ -609,6 +623,7 @@ mod tx_registry {
                 .expect("tried to take re-entrant read guard");
         });
     }
+
     pub(super) fn deregister() {
         THREAD_INDEX.with(|&thread_index| {
             COUNTERS[thread_index].store(TXID_NULL_HIGH, Ordering::Release);
@@ -634,10 +649,6 @@ mod tx_registry {
 //  ReadTx                                                       ▐█•█▌▐█▄▄▌▐█ ▪▐▌██. ██  ▐█▌·▪▐█·█▌
 //                                                               .▀  ▀ ▀▀▀  ▀  ▀ ▀▀▀▀▀•  ▀▀▀ •▀▀ ▀▀
 // -------------------------------------------------------------------------------------------------
-
-pub(super) trait PageReader<'tx> {
-    fn get_page_read(&self, pgid: u64) -> Result<RdHdl<'tx>, PagerErr>;
-}
 
 pub(super) struct ReadTx<'tx> {
     pager:      &'tx Pager,
@@ -670,7 +681,6 @@ impl<'tx> PageReader<'tx> for ReadTx<'tx> {
 //                                                             ▀▀▀▀ ▀▪.▀  ▀▀▀▀ ▀▀▀  ▀▀▀  ▀▀▀ •▀▀ ▀▀
 // -------------------------------------------------------------------------------------------------
 
-/// A write-tx that uses bump-allocation only
 pub(super) struct WriteTx<'tx> {
     pager:           &'tx Pager,
     superblock:      SuperblockHeader,
@@ -694,7 +704,7 @@ pub(super) struct WriteTx<'tx> {
     // we could simplify this into just an array, but then wed have to do a lookup via the pager
     // every single time we wanted to use one of our own pages, and itd also be much less efficient
     // to check if a given page was created by us (in `get_page_write`).
-    pages_allocated:  HashMap<u64, usize>,
+    pages_allocated:  FxHashMap<u64, usize>,
 }
 
 impl Drop for WriteTx<'_> {

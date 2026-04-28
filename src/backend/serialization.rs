@@ -1,3 +1,4 @@
+use std::fmt::Display;
 use std::mem::offset_of;
 use std::ops::AddAssign;
 
@@ -148,6 +149,12 @@ impl AddAssign<u64> for SerializedU64 {
     }
 }
 
+impl Display for SerializedU64 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "{}_s", self.get())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(transparent)]
 pub(super) struct SerializedU32([u8; 4]);
@@ -187,6 +194,12 @@ impl AddAssign<u32> for SerializedU32 {
     }
 }
 
+impl Display for SerializedU32 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "{}_s", self.get())
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(transparent)]
 pub(super) struct SerializedU16([u8; 2]);
@@ -219,6 +232,13 @@ impl From<u16> for SerializedU16 {
         Self(v.to_be_bytes())
     }
 }
+
+impl Display for SerializedU16 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        writeln!(f, "{}_s", self.get())
+    }
+}
+
 
 // ------------ Common Serialized Integer Trait ----------------------------------------------------
 
