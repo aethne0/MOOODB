@@ -5,6 +5,10 @@ use super::serialization::*;
 use super::PAGE_SIZE;
 use crate::mooo_assert;
 
+// TODO
+const SLOT_SIZE: u16 = 2 * size_of::<u16>() as u16;
+const SLOT_INDEX_NULL: u16 = u16::MAX;
+
 #[repr(C)]
 pub(super) struct HeapPageHeader {
     pub(super) prefix:     PagePrefix,

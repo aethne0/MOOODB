@@ -18,11 +18,10 @@ mod test;
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::mooo_assert;
-pub(crate) use page_btree::BTREE_KEY_MAX_LEN;
 pub(crate) use storage_manager::*;
 
 /// PAGE_SIZE maybe be inclusively from 256-32KiB, and must be a power of two
-const PAGE_SIZE: usize = 0x1000;
+const PAGE_SIZE: usize = 0x100;
 const _: () = mooo_assert!(
     false
         || PAGE_SIZE == 0x100

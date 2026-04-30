@@ -1,9 +1,11 @@
 // TODO all these unsafe bits should just be one method that gets the index and the &but at the same
 // time to ensure its safe
-// TODO on a IO failure of any kinda during a write-tx we should abort and then truncate
+// TODO on a IO failure of any kinda during a write-tx we should abort and then truncate (were
+// actually doing this but it needs to be improved)
 // TODO we need some sort of "spill" for mega-huge write-tx's where the working set cant fit in
-// memory
+// memory - right now tests can stall easily if they do a larger than memory initial write-set
 
+use std::cell::RefCell;
 use std::cell::UnsafeCell;
 use std::fs::File;
 use std::mem::replace;
@@ -19,9 +21,12 @@ use std::sync::RwLock;
 use rustc_hash::FxHashMap;
 
 use super::btree::Btree;
+use super::btree::Cursor;
 use super::compute_checksum;
 use super::frame_latch::*;
 use super::hash_u64_modulo;
+use super::page_btree::BtreePage;
+use super::page_btree::BtreePageType;
 use super::page_superblock::*;
 use super::pgid_valid;
 use super::serialization::*;
@@ -80,8 +85,18 @@ impl Pager {
 
         // page 0&1 are reserved for superblocks
         let pgid_superblock = 0;
-        let pgid_bump_next = 2;
+        let pgid_freelist_init = 2;
+        let pgid_bump_next = 3;
         let txid_first = 0;
+
+        {
+            // initial freelist root
+            let mut whdl = pager.get_frame_write_pgid(pgid_freelist_init)?;
+            BtreePage::new_with_buffer(&mut whdl.buf, BtreePageType::Leaf);
+            whdl.mark_dirty(txid_first);
+            pager.io_write(&mut whdl, pgid_freelist_init)?;
+            whdl.get_pgid();
+        }
 
         let header = {
             // write actual first superblock
@@ -89,7 +104,7 @@ impl Pager {
 
             let superblock_header = SuperblockHeader {
                 prefix:         PagePrefix::new(pgid_superblock, 0, txid_first, PGTYPE_SUPERBLOCK),
-                pgid_freelist:  PGID_NULL.into(),
+                pgid_freelist:  pgid_freelist_init.into(),
                 pgid_bump_next: pgid_bump_next.into(),
                 pgid_catalog:   PGID_NULL.into(),
                 page_size:      (PAGE_SIZE as u16).into(),
@@ -102,14 +117,6 @@ impl Pager {
         };
 
         *pager.superblock_curr.write().unwrap() = header;
-
-        {
-            // do one tx to create freelist and second superblock
-            let mut tx = pager.write_tx();
-            let freelist = Btree::new(&mut tx)?;
-            tx.superblock.pgid_freelist = freelist.get_root_pgid().into();
-            tx.commit(Durability::Flush)?;
-        }
 
         pager.fsync()?;
         Ok(pager)
@@ -147,20 +154,20 @@ impl Pager {
         superblock.pgid.set((prev_pgid + 1) % 2);
         let freelist_pgid = superblock.pgid_freelist;
         let file_size_prev = self.file.metadata().expect("todo").len();
+        let freelist_cursor = Btree::from_pgid(freelist_pgid.get()).cursor();
 
         tx_registry::register(superblock.txid.get());
 
         WriteTx {
-            pager:            self,
-            superblock:       superblock,
-            not_commited:     true,
-            file_size_prev:   file_size_prev,
-            pages_allocated:  FxHashMap::default(),
-            pages_freed:      StackArray::new(),
-            fl_prev_used_ptr: 0,
-            fl_prev_dltd_ptr: 0,
-            fl_prev_pgid:     freelist_pgid.get(),
-            _writer_tx_lock:  lock,
+            pager:           self,
+            superblock:      superblock,
+            not_commited:    true,
+            file_size_prev:  file_size_prev,
+            pages_allocated: FxHashMap::default(),
+            pages_freed:     StackArray::new(),
+            fl_prev_crs:     RefCell::new(freelist_cursor.clone()),
+            fl_prev_crs_lag: RefCell::new(freelist_cursor),
+            _writer_tx_lock: lock,
         }
     }
 
@@ -200,7 +207,7 @@ impl Pager {
 
         let checksum = compute_checksum(&whdl.buf[CHECKSUM_START_OFFSET..]);
         let header = PagePrefix::mut_from_prefix(whdl.buf);
-        let ok_checksum = header.csum.get() == checksum;
+        let ok_checksum = header.checksum.get() == checksum;
         let ok_pgid = header.pgid.get() == pgid;
         if !ok_checksum || !ok_pgid {
             return Err(PagerErr::Integrity);
@@ -514,7 +521,7 @@ impl<'pager> WrHdl<'pager> {
         // Checksum must computed after other sets!
         let checksum = compute_checksum(&self.buf[CHECKSUM_START_OFFSET..]);
         let header = PagePrefix::mut_from_prefix(self.buf);
-        header.csum.set(checksum);
+        header.checksum.set(checksum);
     }
 
     /// atomically downgrades a WrHdl to a RdHdl - no writers will acquire a lock on this frame
@@ -691,20 +698,16 @@ pub(super) struct WriteTx<'tx> {
     _writer_tx_lock: MutexGuard<'tx, ()>,
 
     /// This will writeout to our new freelist if its full
-    pages_freed:      StackArray<u64, 127>,
-    /// root pgid of our old snapshotted freelist, we will be taking from this for allocations
-    fl_prev_pgid:     u64,
-    /// number of allocations we've taken from this freelist - we take them in order up to either
-    /// the end or up to (but not including) the txid of the lowest current registered tx
-    fl_prev_used_ptr: usize,
-    /// number of allocations from the old freelist that we've deleted from our new version of the
-    /// freelist - see `fl_prev_used_ptr`
-    fl_prev_dltd_ptr: usize,
+    pages_freed:     StackArray<u64, 127>,
+    fl_prev_crs:     RefCell<Cursor>,
+    fl_prev_crs_lag: RefCell<Cursor>,
+
     // TODO rewrite a stack version of this
     // we could simplify this into just an array, but then wed have to do a lookup via the pager
     // every single time we wanted to use one of our own pages, and itd also be much less efficient
     // to check if a given page was created by us (in `get_page_write`).
-    pages_allocated:  FxHashMap<u64, usize>,
+    // TODO well have to think about this once we implement in-tx spill as well
+    pages_allocated: FxHashMap<u64, usize>,
 }
 
 impl Drop for WriteTx<'_> {
@@ -774,30 +777,35 @@ impl<'tx> WriteTx<'tx> {
             self.pager.fsync()?;
         }
 
+        let lenss = self.pager.file.metadata().unwrap().len();
+        let freelist = Btree::from_pgid(self.superblock.pgid_freelist.get());
+        let length = freelist.len(&self)?;
+        eprintln!("freelist: {} / {}", length, lenss as usize / PAGE_SIZE);
+
         self.not_commited = false;
         *self.pager.superblock_curr.write().unwrap() = self.superblock.clone();
+
         Ok(())
     }
 
     // ------------ Freelist stuff -----------------------------------------------------------------
 
     fn freelist_prev_next(&mut self) -> Result<Option<FreeEntry>, PagerErr> {
-        if self.fl_prev_pgid == PGID_NULL {
+        let Some(free_entry) = self
+            .fl_prev_crs
+            .borrow_mut()
+            .peek(self, |bytes, _| FreeEntry::read_from_bytes(bytes))?
+        else {
             return Ok(None);
-        }
+        };
 
-        let freelist_old = Btree::from_pgid(self.fl_prev_pgid);
-        match freelist_old.freelist_get_index(self, self.fl_prev_used_ptr)? {
-            Some(entry) => {
-                let txid_bound = tx_registry::get_min();
-                if entry.txid.get() < txid_bound {
-                    self.fl_prev_used_ptr += 1;
-                    Ok(Some(entry))
-                } else {
-                    Ok(None)
-                }
-            }
-            None => Ok(None),
+        let txid_bound = tx_registry::get_min();
+
+        if free_entry.txid.get() < txid_bound {
+            self.fl_prev_crs.borrow_mut().advance(self)?;
+            return Ok(Some(free_entry));
+        } else {
+            return Ok(None);
         }
     }
 
@@ -810,7 +818,7 @@ impl<'tx> WriteTx<'tx> {
         };
 
         let entry = FreeEntry::new(self.superblock.txid.get(), pgid);
-        freelist.insert(self, entry.as_bytes(), pgid)?;
+        freelist.insert(self, entry.as_bytes(), &[])?;
         self.superblock.pgid_freelist = freelist.get_root_pgid().into();
         Ok(())
     }
@@ -829,18 +837,29 @@ impl<'tx> WriteTx<'tx> {
     }
 
     fn freelist_apply_changes(&mut self) -> Result<(), PagerErr> {
-        while self.fl_prev_dltd_ptr < self.fl_prev_used_ptr || !self.pages_freed.is_empty() {
-            while self.fl_prev_dltd_ptr < self.fl_prev_used_ptr {
-                let freelist_old = Btree::from_pgid(self.fl_prev_pgid);
-                let entry = freelist_old.freelist_get_index(self, self.fl_prev_dltd_ptr)?.unwrap();
+        loop {
+            let mut done = true;
+
+            while self.fl_prev_crs_lag.borrow().seen() < self.fl_prev_crs.borrow().seen() {
+                let entry = self
+                    .fl_prev_crs_lag
+                    .borrow_mut()
+                    .next(self, |key, _| FreeEntry::read_from_bytes(key))?
+                    .unwrap();
                 self.freelist_new_delete(entry)?;
-                self.fl_prev_dltd_ptr += 1
+                done = false;
             }
 
             while let Some(pgid_freed) = self.pages_freed.pop() {
                 self.freelist_new_insert(pgid_freed)?;
+                done = false;
+            }
+
+            if done {
+                break;
             }
         }
+
         Ok(())
     }
 }

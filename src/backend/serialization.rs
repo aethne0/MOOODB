@@ -9,8 +9,6 @@ use crate::mooo_assert;
 // ------------ Common Page Header Prefix ----------------------------------------------------------
 
 pub(super) const PAGE_HEADER_SIZE: u16 = 0x40;
-pub(super) const SLOT_SIZE: u16 = 2 * size_of::<u16>() as u16;
-pub(super) const SLOT_INDEX_NULL: u16 = u16::MAX;
 pub(super) const END_OF_PAGE: u16 = PAGE_SIZE as u16 - 1;
 
 /// The first 32 bytes of every page on disk, regardless of page type.
@@ -25,10 +23,10 @@ pub(super) const END_OF_PAGE: u16 = PAGE_SIZE as u16 - 1;
 #[derive(Clone)]
 #[repr(C)]
 pub(super) struct PagePrefix {
-    pub(super) csum:   SerializedU64,
-    pub(super) pgid:   SerializedU64,
-    pub(super) txid:   SerializedU64,
-    pub(super) pgtype: SerializedU64,
+    pub(super) checksum: SerializedU64,
+    pub(super) pgid:     SerializedU64,
+    pub(super) txid:     SerializedU64,
+    pub(super) pgtype:   SerializedU64,
 }
 unsafe impl Serialized for PagePrefix {}
 
@@ -37,8 +35,13 @@ unsafe impl Serialized for PagePrefix {}
 pub(super) const CHECKSUM_START_OFFSET: usize = offset_of!(PagePrefix, pgid);
 
 impl PagePrefix {
-    pub(super) fn new(pgid: u64, csum: u64, txid: u64, pgtype: SerializedU64) -> Self {
-        Self { csum: csum.into(), pgid: pgid.into(), txid: txid.into(), pgtype: pgtype }
+    pub(super) fn new(pgid: u64, checksum: u64, txid: u64, pgtype: SerializedU64) -> Self {
+        Self {
+            checksum: checksum.into(),
+            pgid:     pgid.into(),
+            txid:     txid.into(),
+            pgtype:   pgtype,
+        }
     }
 }
 
@@ -48,16 +51,24 @@ impl PagePrefix {
 #[repr(C)]
 pub(super) struct FreeEntry {
     pub(super) txid: SerializedU64,
-    pub(super) pgid: SerializedU64,
+    pub(super) pgid: SerializedU48,
 }
 
 impl FreeEntry {
-    pub(super) fn new(txid: impl Into<SerializedU64>, pgid: impl Into<SerializedU64>) -> Self {
+    pub(super) fn new(txid: impl Into<SerializedU64>, pgid: impl Into<SerializedU48>) -> Self {
         Self { txid: txid.into(), pgid: pgid.into() }
     }
 
     pub(super) fn txid_bound(txid: impl Into<SerializedU64>) -> Self {
         Self { txid: txid.into(), pgid: 0.into() }
+    }
+
+    pub(super) fn txid(&self) -> u64 {
+        todo!()
+    }
+
+    pub(super) fn pgid(&self) -> u64 {
+        todo!()
     }
 }
 unsafe impl Serialized for FreeEntry {}
@@ -103,6 +114,8 @@ impl Into<SerializedU64> for HeapPtr {
         self.0
     }
 }
+
+// TODO macro all this etc
 
 // ▪   ▐ ▄ ▄▄▄▄▄▄▄▄ . ▄▄ • ▄▄▄ .▄▄▄
 // ██ •█▌▐█•██  ▀▄.▀·▐█ ▀ ▪▀▄.▀·▀▄ █·
@@ -151,7 +164,7 @@ impl AddAssign<u64> for SerializedU64 {
 
 impl Display for SerializedU64 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "{}_s", self.get())
+        write!(f, "{}_s", self.get())
     }
 }
 
@@ -196,7 +209,7 @@ impl AddAssign<u32> for SerializedU32 {
 
 impl Display for SerializedU32 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "{}_s", self.get())
+        write!(f, "{}_s", self.get())
     }
 }
 
@@ -235,10 +248,9 @@ impl From<u16> for SerializedU16 {
 
 impl Display for SerializedU16 {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        writeln!(f, "{}_s", self.get())
+        write!(f, "{}_s", self.get())
     }
 }
-
 
 // ------------ Common Serialized Integer Trait ----------------------------------------------------
 
@@ -278,5 +290,55 @@ pub(super) unsafe trait Serialized: Sized {
 
     fn mut_from_prefix(buf: &mut [u8]) -> &mut Self {
         Self::mut_from_bytes(&mut buf[..size_of::<Self>()])
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[repr(transparent)]
+pub(super) struct SerializedU48(pub(super) [u8; 6]);
+unsafe impl Serialized for SerializedU48 {}
+
+const U48MAX: u64 = 0xffff_ffff_ffff;
+
+impl PartialOrd for SerializedU48 {
+    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+impl Ord for SerializedU48 {
+    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
+        self.get().cmp(&other.get())
+    }
+}
+
+impl SerializedU48 {
+    pub(super) fn get(&self) -> u64 {
+        let mut buf = [0u8; 8];
+        buf[2..].copy_from_slice(&self.0);
+        u64::from_be_bytes(buf)
+    }
+
+    pub(super) fn set(&mut self, val: u64) {
+        assert!(val <= U48MAX);
+        self.0.copy_from_slice(&val.to_be_bytes()[2..]);
+    }
+}
+
+impl From<u64> for SerializedU48 {
+    fn from(v: u64) -> Self {
+        Self(v.to_be_bytes()[2..].try_into().unwrap())
+    }
+}
+
+impl AddAssign<u64> for SerializedU48 {
+    fn add_assign(&mut self, rhs: u64) {
+        self.set(self.get() + rhs);
+    }
+}
+
+impl Display for SerializedU48 {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}_s", self.get())
     }
 }
