@@ -1,23 +1,36 @@
 use std::mem::MaybeUninit;
+use std::ptr::addr_of_mut;
 
 use crate::mooo_assert;
 
 // -------------------------------------------------------------------------------------------------
-// .▄▄ · ▄▄▄▄▄ ▄▄▄·  ▄▄· ▄ •▄      ▄▄▄· ▄▄▄  ▄▄▄   ▄▄▄·  ▄· ▄▌
-// ▐█ ▀. •██  ▐█ ▀█ ▐█ ▌▪█▌▄▌▪    ▐█ ▀█ ▀▄ █·▀▄ █·▐█ ▀█ ▐█▪██▌
-// ▄▀▀▀█▄ ▐█.▪▄█▀▀█ ██ ▄▄▐▀▀▄·    ▄█▀▀█ ▐▀▀▄ ▐▀▀▄ ▄█▀▀█ ▐█▌▐█▪
-// ▐█▄▪▐█ ▐█▌·▐█ ▪▐▌▐███▌▐█.█▌    ▐█ ▪▐▌▐█•█▌▐█•█▌▐█ ▪▐▌ ▐█▀·.  Stack allocated fixed array
-//  ▀▀▀▀  ▀▀▀  ▀  ▀ ·▀▀▀ ·▀  ▀     ▀  ▀ .▀  ▀.▀  ▀ ▀  ▀   ▀ •
+// ·▄▄▄▪  ▐▄• ▄ ▄▄▄ .·▄▄▄▄       ▄▄▄· ▄▄▄  ▄▄▄   ▄▄▄·  ▄· ▄▌
+// ▐▄▄·██  █▌█▌▪▀▄.▀·██▪ ██     ▐█ ▀█ ▀▄ █·▀▄ █·▐█ ▀█ ▐█▪██▌
+// ██▪ ▐█· ·██· ▐▀▀▪▄▐█· ▐█▌    ▄█▀▀█ ▐▀▀▄ ▐▀▀▄ ▄█▀▀█ ▐█▌▐█▪
+// ██▌.▐█▌▪▐█·█▌▐█▄▄▌██. ██     ▐█ ▪▐▌▐█•█▌▐█•█▌▐█ ▪▐▌ ▐█▀·.    Fixed array & stack
+// ▀▀▀ ▀▀▀•▀▀ ▀▀ ▀▀▀ ▀▀▀▀▀•      ▀  ▀ .▀  ▀.▀  ▀ ▀  ▀   ▀ •
 // -------------------------------------------------------------------------------------------------
 
-pub(crate) struct StackArray<T, const LENGTH: usize> {
+pub(crate) struct FixedArray<T, const LENGTH: usize> {
     head: usize,
     arr:  [MaybeUninit<T>; LENGTH],
 }
 
-impl<T, const LENGTH: usize> StackArray<T, LENGTH> {
+impl<T, const LENGTH: usize> FixedArray<T, LENGTH> {
     pub(crate) const fn new() -> Self {
         Self { arr: [const { MaybeUninit::uninit() }; LENGTH], head: 0 }
+    }
+
+    pub(crate) fn new_boxed() -> Box<Self> {
+        unsafe {
+            let mut b: Box<MaybeUninit<Self>> = Box::new_uninit();
+            let ptr = b.as_mut_ptr();
+
+            addr_of_mut!((*ptr).head).write(0);
+            addr_of_mut!((*ptr).arr).write([const { MaybeUninit::uninit() }; LENGTH]);
+
+            b.assume_init()
+        }
     }
 
     pub(crate) const fn capacity(&self) -> usize {
@@ -105,7 +118,7 @@ impl<T, const LENGTH: usize> StackArray<T, LENGTH> {
     }
 }
 
-impl<T, const LENGTH: usize> Drop for StackArray<T, LENGTH> {
+impl<T, const LENGTH: usize> Drop for FixedArray<T, LENGTH> {
     fn drop(&mut self) {
         for i in 0..self.len() {
             unsafe { self.arr[i].assume_init_drop() };
@@ -113,7 +126,7 @@ impl<T, const LENGTH: usize> Drop for StackArray<T, LENGTH> {
     }
 }
 
-impl<T: Clone, const L: usize> Clone for StackArray<T, L> {
+impl<T: Clone, const L: usize> Clone for FixedArray<T, L> {
     fn clone(&self) -> Self {
         let mut cloned = Self::new();
         for i in 0..self.len() {

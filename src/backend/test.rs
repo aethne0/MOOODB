@@ -3,21 +3,20 @@
 //  ▐█.▪▐▀▀▪▄▄▀▀▀█▄ ▐█.▪▄▀▀▀█▄
 //  ▐█▌·▐█▄▄▌▐█▄▪▐█ ▐█▌·▐█▄▪▐█
 //  ▀▀▀  ▀▀▀  ▀▀▀▀  ▀▀▀  ▀▀▀▀
+use std::env::current_dir;
+use std::fs::File;
+use std::fs::OpenOptions;
+use std::time::Instant;
+
 use rand::rngs::ChaCha8Rng;
 use rand::Rng;
 use rand::RngExt;
 use rand::SeedableRng;
-use std::env::current_dir;
-use std::fs::File;
-use std::fs::OpenOptions;
 
 use super::btree::Btree;
 use super::*;
-
-fn fmt_bytes(bytes: &[u8]) -> String {
-    let inner: Vec<String> = bytes.iter().map(|b| format!("{b:02x}")).collect();
-    format!("[{}]", inner.join(" "))
-}
+use crate::util::fmt_bytes;
+use crate::util::fmt_size;
 
 fn f_opts() -> OpenOptions {
     let mut opts = std::fs::OpenOptions::new();
@@ -58,7 +57,7 @@ fn testfile() -> File {
 #[test]
 fn deletoid_small() {
     eprintln!("");
-    const SIZE: usize = 64 * 1024 * 1024;
+    const SIZE: usize = 16 * 1024 * 1024;
     const FRAME_CNT: usize = SIZE / PAGE_SIZE;
     let mgr = Pager::new(FRAME_CNT, testfile()).unwrap();
 
@@ -67,9 +66,9 @@ fn deletoid_small() {
     const KEY_SIZE: usize = 22;
     const VAL_MASK: u64 = 0xffff_0000_0000_ffff;
 
-    const INIT_CNT: usize = 20;
-    const TX_CNT: usize = 1;
-    const DELETES_PER_TX: usize = 20; // 13
+    const INIT_CNT: usize = 1_000;
+    const TX_CNT: usize = 100;
+    const DELETES_PER_TX: usize = 9;
     const _: () = mooo_assert!(INIT_CNT >= TX_CNT * DELETES_PER_TX);
 
     let dur = Durability::Flush;
@@ -81,20 +80,31 @@ fn deletoid_small() {
 
         let mut btree = Btree::new(&mut tx).unwrap();
 
-        for i in 1..=INIT_CNT {
+        for _i in 1..=INIT_CNT {
             let mut key = [0u8; KEY_SIZE];
             rfill(&mut key, &mut rng);
             let val: u64 = rng.random::<u64>() | VAL_MASK;
-            key[0..8].copy_from_slice(&(0x8000_0000_0000_0000 - i as u64).to_be_bytes());
+            // key[0..8].copy_from_slice(&(0x8000_0000_0000_0000 - i as u64).to_be_bytes());
             btree.insert(&mut tx, &key, &val.to_be_bytes()).unwrap();
             entries.push((key, val));
         }
 
-        eprintln!("init");
+        /*
         let mut crs = btree.cursor();
         while let Some(_) =
             crs.next(&tx, |k, v| eprintln!("{} {}", fmt_bytes(k), fmt_bytes(v))).unwrap()
         {}
+        */
+
+        let meta = btree.meta(&tx).unwrap();
+        eprintln!(
+            "len {} | pages {} | pages(leaf) {} | pages(inner) {} | bytes {}",
+            meta.entry_cnt,
+            meta.page_cnt_total,
+            meta.page_cnt_leaf,
+            meta.page_cnt_inner,
+            meta.bytes
+        );
 
         tx.set_catalog_root_pgid(btree.get_root_pgid());
         tx.commit(dur).unwrap();
@@ -102,7 +112,6 @@ fn deletoid_small() {
 
     entries.reverse();
 
-    let start = std::time::Instant::now();
     for _ in 0..TX_CNT {
         let mut tx = mgr.write_tx();
         let _txid = tx.get_txid();
@@ -112,31 +121,26 @@ fn deletoid_small() {
         }
         let mut btree = Btree::from_pgid(root_pgid);
 
-        for i in 0..DELETES_PER_TX {
+        for _ in 0..DELETES_PER_TX {
             let (key, _) = entries.pop().unwrap();
-            eprintln!("DELETE {}", fmt_bytes(&key));
-            let x = btree.delete(&mut tx, &key).unwrap();
-            if !x {
-                eprintln!("ah{}", i);
-            }
-        }
-
-        eprintln!("after");
-        let mut crs = btree.cursor();
-        while let Some(_) =
-            crs.next(&tx, |k, v| eprintln!("{} {}", fmt_bytes(k), fmt_bytes(v))).unwrap()
-        {}
-
-        if btree.len(&tx).unwrap() != INIT_CNT - DELETES_PER_TX {
-            eprintln!("big problem!");
+            let _x = btree.delete(&mut tx, &key).unwrap();
         }
 
         tx.set_catalog_root_pgid(btree.get_root_pgid());
         tx.commit(dur).unwrap();
-    }
-    let end = std::time::Instant::now();
 
-    eprintln!("{} deletes took {}s", TX_CNT, end.duration_since(start).as_secs_f32());
+        /*
+        let tx = mgr.read_tx();
+        let fl = Btree::from_pgid(tx.freelistpgid());
+        let mut crs = fl.cursor();
+        eprintln!(">>> freelist <<<");
+        while let Some(e) =
+            crs.next(&tx, |a, b| Whatever { key: a.to_vec(), val: b.to_vec() }).unwrap()
+        {
+            eprintln!("    {:?}", e.key);
+        }
+        */
+    }
 }
 
 #[test]
@@ -189,7 +193,7 @@ struct Whatever {
     val: Vec<u8>,
 }
 
-#[test]
+// #[test]
 fn deletoid_2() {
     eprintln!("");
     const SIZE: usize = 8 * 1024 * 1024 * 1024;
@@ -252,4 +256,78 @@ fn deletoid_2() {
 
     // ~46s 4096
     eprintln!("{} deletes took {}s", TX_CNT, end.duration_since(start).as_secs_f32());
+}
+
+#[test]
+fn insertoid() {
+    eprintln!("");
+    const SIZE: usize = 1024 * 1024 * 1024;
+    const FRAME_CNT: usize = SIZE / PAGE_SIZE;
+    let mgr = Pager::new(FRAME_CNT, testfile()).unwrap();
+
+    let mut rng = get_rand();
+
+    const KEY_SIZE: usize = 22;
+    const VAL_MASK: u64 = 0xffff_0000_0000_ffff;
+
+    const TX_CNT: usize = 100;
+    const INSERTS_PER_TX: usize = 300;
+
+    let dur = Durability::Flush;
+
+    {
+        let mut tx = mgr.write_tx();
+        let btree = Btree::new(&mut tx).unwrap();
+        tx.set_catalog_root_pgid(btree.get_root_pgid());
+        tx.commit(dur).unwrap();
+    }
+
+    let start = Instant::now();
+
+    for _ in 0..TX_CNT {
+        let mut tx = mgr.write_tx();
+        let mut btree = Btree::from_pgid(tx.get_catalog_root_pgid());
+
+        for _i in 0..=INSERTS_PER_TX {
+            let mut key = [0u8; KEY_SIZE];
+            rfill(&mut key, &mut rng);
+            let val: u64 = rng.random::<u64>() | VAL_MASK;
+            // key[0..8].copy_from_slice(&(0x8000_0000_0000_0000 - i as u64).to_be_bytes());
+            btree.insert(&mut tx, &key, &val.to_be_bytes()).unwrap();
+        }
+
+        /*
+        let mut crs = btree.cursor();
+        while let Some(_) =
+            crs.next(&tx, |k, v| eprintln!("{} {}", fmt_bytes(k), fmt_bytes(v))).unwrap()
+        {}
+        */
+
+        let now = Instant::now();
+        let meta = btree.meta(&tx).unwrap();
+        eprintln!(
+            "[ len {} | pages {} | pages(leaf) {} | pages(inner) {} | bytes {} ] [ {:.2} / sec ]",
+            meta.entry_cnt,
+            meta.page_cnt_total,
+            meta.page_cnt_leaf,
+            meta.page_cnt_inner,
+            fmt_size(meta.bytes as usize),
+            meta.entry_cnt as f64 / now.duration_since(start).as_secs_f64(),
+        );
+
+        tx.set_catalog_root_pgid(btree.get_root_pgid());
+        tx.commit(dur).unwrap();
+
+        /*
+        let tx = mgr.read_tx();
+        let fl = Btree::from_pgid(tx.freelistpgid());
+        let mut crs = fl.cursor();
+        eprintln!(">>> freelist <<<");
+        while let Some(e) =
+            crs.next(&tx, |a, b| Whatever { key: a.to_vec(), val: b.to_vec() }).unwrap()
+        {
+            eprintln!("{:?}", e.key);
+        }
+        */
+    }
 }

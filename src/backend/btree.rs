@@ -1,13 +1,16 @@
+use std::ops::AddAssign;
+
 use super::page_btree::*;
 use super::serialization::*;
 use super::storage_manager::*;
 use super::PagerErr;
 use crate::backend::PGID_NULL;
-use crate::collections::StackArray;
+use crate::collections::FixedArray;
 use crate::mooo_assert;
+use crate::util::fmt_bytes;
 
 const TRAVERSAL_LENGTH: usize = 48;
-type Traversal<T> = StackArray<(T, u16), TRAVERSAL_LENGTH>;
+type Traversal<T> = FixedArray<(T, u16), TRAVERSAL_LENGTH>;
 
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum Dir {
@@ -17,7 +20,7 @@ enum Dir {
 
 /// It is the responsibility of the caller to update anything that points to `root_pgid`
 #[derive(Clone, Copy)]
-pub(crate) struct Btree {
+pub(super) struct Btree {
     root_pgid: u64,
 }
 
@@ -34,7 +37,7 @@ fn bytes_from_pgid(pgid: u64) -> [u8; 8] {
 impl Btree {
     /// Allocates and initializes btree root page
     #[must_use]
-    pub(crate) fn new<'tx, R: PageReader<'tx> + PageWriter<'tx>>(
+    pub(super) fn new<'tx, R: PageReader<'tx> + PageWriter<'tx>>(
         tx: &mut R,
     ) -> Result<Btree, PagerErr> {
         let whdl = tx.get_page_alloc()?;
@@ -45,11 +48,11 @@ impl Btree {
 
     /// For opening an EXISTING btree
     #[must_use]
-    pub(crate) fn from_pgid(root_pgid: u64) -> Self {
+    pub(super) fn from_pgid(root_pgid: u64) -> Self {
         Self { root_pgid }
     }
 
-    pub(crate) fn get_root_pgid(&self) -> u64 {
+    pub(super) fn get_root_pgid(&self) -> u64 {
         self.root_pgid
     }
 
@@ -118,7 +121,7 @@ impl Btree {
     }
 
     /// Counts total number of entries in entire tree - recursive.
-    pub(crate) fn len<'tx, R: PageReader<'tx>>(&self, tx: &R) -> Result<usize, PagerErr> {
+    pub(super) fn len<'tx, R: PageReader<'tx>>(&self, tx: &R) -> Result<usize, PagerErr> {
         let pgid = self.root_pgid;
         let mut count = 0;
 
@@ -135,7 +138,40 @@ impl Btree {
         Ok(count)
     }
 
-    pub(crate) fn cursor(&self) -> Cursor {
+    /// Counts total number of entries in entire tree - recursive.
+    /// (entry_count, leaf_page_count, inner_page_count, bytes_entries)
+    pub(super) fn meta<'tx, R: PageReader<'tx>>(&self, tx: &R) -> Result<BtreeMeta, PagerErr> {
+        let pgid = self.root_pgid;
+
+        let page = BtreePage::from_buffer_ref(tx.get_page_read(pgid)?.buf);
+        if page.is_leaf() {
+            let meta = BtreeMeta {
+                page_cnt_total: 1,
+                page_cnt_leaf:  1,
+                page_cnt_inner: 0,
+                entry_cnt:      page.len() as u64,
+                bytes:          page.entry_bytes() as u64,
+            };
+            return Ok(meta);
+        }
+
+        let mut meta = BtreeMeta {
+            page_cnt_total: 1,
+            page_cnt_leaf:  0,
+            page_cnt_inner: 1,
+            entry_cnt:      0,
+            bytes:          0,
+        };
+
+        for slot_index in 0..page.len() {
+            let pgid_child = pgid_from_bytes(page.key_val_slices_from_slot(slot_index).1);
+            meta += Btree::from_pgid(pgid_child).meta(tx)?;
+        }
+
+        Ok(meta)
+    }
+
+    pub(super) fn cursor(&self) -> Cursor {
         Cursor::new(self.root_pgid)
     }
 
@@ -148,7 +184,7 @@ impl Btree {
     // ---------------------------------------------------------------------------------------------
 
     /*
-    pub(crate) fn get<'tx, R: PageReader<'tx>>(
+    pub(super) fn get<'tx, R: PageReader<'tx>>(
         &self, tx: &R, key: &[u8],
     ) -> Result<Option<&[u8]>, PagerErr> {
         let mut next_pgid = self.root_pgid;
@@ -163,7 +199,7 @@ impl Btree {
         }
     }
 
-    pub(crate) fn min<'tx, R: PageReader<'tx>>(
+    pub(super) fn min<'tx, R: PageReader<'tx>>(
         &self, tx: &R,
     ) -> Result<Option<(&[u8], &[u8])>, PagerErr> {
         let mut next_pgid = self.root_pgid;
@@ -180,7 +216,7 @@ impl Btree {
         }
     }
 
-    pub(crate) fn max<'tx, R: PageReader<'tx>>(
+    pub(super) fn max<'tx, R: PageReader<'tx>>(
         &self, tx: &R,
     ) -> Result<Option<(&[u8], &[u8])>, PagerErr> {
         let mut next_pgid = self.root_pgid;
@@ -206,7 +242,7 @@ impl Btree {
     //                                                                ▀▀▀▀▀ █▪ ▀▀▀▀  ▀▀▀ .▀  ▀ ▀▀▀
     // ---------------------------------------------------------------------------------------------
 
-    pub(crate) fn insert<'tx, R: PageReader<'tx> + PageWriter<'tx>>(
+    pub(super) fn insert<'tx, R: PageReader<'tx> + PageWriter<'tx>>(
         &mut self, tx: &mut R, key: &[u8], val: &[u8],
     ) -> Result<(), PagerErr> {
         let mut traversal = self.traverse_cow(tx, key)?;
@@ -320,7 +356,7 @@ impl Btree {
     //                                                             ▀▀▀▀▀•  ▀▀▀ .▀▀▀  ▀▀▀  ▀▀▀  ▀▀▀
     // ---------------------------------------------------------------------------------------------
 
-    pub(crate) fn delete<'tx, R: PageReader<'tx> + PageWriter<'tx>>(
+    pub(super) fn delete<'tx, R: PageReader<'tx> + PageWriter<'tx>>(
         &mut self, tx: &mut R, key: &[u8],
     ) -> Result<bool, PagerErr> {
         let mut traversal = self.traverse_cow(tx, key)?;
@@ -560,6 +596,7 @@ impl Btree {
     /// Merges donor into receiver - doesn't mutate donor
     ///
     /// If `donor` is RIGHT of `receiver` then `direction_to_donor` should be `SiblingDir::Right`
+    /// ASSUMES PAGES ARE INITIALIZED
     fn absorb_and_free_sibling<'tx, R: PageReader<'tx> + PageWriter<'tx>>(
         tx: &mut R, receiver: &mut WrHdl<'_>, donor: RdHdl<'_>, dir_to_donor: Dir,
     ) -> Result<(), PagerErr> {
@@ -597,13 +634,12 @@ impl Btree {
 // NOTE: cursors do not hold any pins, pin-holding for optimization should be done at the tx level
 
 #[derive(Clone)]
-pub(crate) struct Cursor {
-    btree:          Btree,
-    traversal:      StackArray<(u64, u16), TRAVERSAL_LENGTH>,
-    slot_idx:       u16,
-    seen_cnt:       usize,
-    needs_page_adv: bool,
-    is_exhausted:   bool,
+pub(super) struct Cursor {
+    pub(super) btree: Btree,
+    traversal:        FixedArray<(u64, u16), TRAVERSAL_LENGTH>,
+    slot_idx:         u16,
+    needs_page_adv:   bool,
+    is_exhausted:     bool,
 }
 
 impl<'tx> Cursor {
@@ -613,22 +649,32 @@ impl<'tx> Cursor {
             btree:          Btree::from_pgid(pgid_root),
             traversal:      Traversal::new(),
             slot_idx:       0,
-            seen_cnt:       0,
             needs_page_adv: false,
             is_exhausted:   false,
         }
     }
 
-    pub(crate) fn seen(&self) -> usize {
-        self.seen_cnt
-    }
-
-    pub(crate) fn is_exhausted(&self) -> bool {
+    pub(super) fn is_exhausted(&self) -> bool {
         self.is_exhausted
     }
 
+    fn reinit(&mut self) {
+        self.traversal.clear();
+        self.slot_idx = 0;
+        self.needs_page_adv = false;
+        self.is_exhausted = false;
+    }
+
+    pub(super) fn seek<R: PageReader<'tx>, T>(
+        &mut self, _tx: &R, _read_into_owned: impl FnOnce(&[u8], &[u8]) -> T,
+    ) -> Result<Option<T>, PagerErr> {
+        // this is complicated - we should pop the stack only as much as we need to to get to our
+        // sought key
+        todo!()
+    }
+
     /// visits current entry but does not advance cursor head
-    pub(crate) fn peek<R: PageReader<'tx>, T>(
+    pub(super) fn peek<R: PageReader<'tx>, T>(
         &mut self, tx: &R, read_into_owned: impl FnOnce(&[u8], &[u8]) -> T,
     ) -> Result<Option<T>, PagerErr> {
         // This will only be Some if we were uninitialized
@@ -656,7 +702,7 @@ impl<'tx> Cursor {
     }
 
     /// advances then visits
-    pub(crate) fn next<T, R: PageReader<'tx>>(
+    pub(super) fn next<T, R: PageReader<'tx>>(
         &mut self, tx: &R, read_into_owned: impl FnOnce(&[u8], &[u8]) -> T,
     ) -> Result<Option<T>, PagerErr> {
         let Some(rhdl) = self.advance_and_check_exhausted(tx)? else {
@@ -669,7 +715,7 @@ impl<'tx> Cursor {
     }
 
     /// visits current entry but does not advance cursor head
-    pub(crate) fn advance<R: PageReader<'tx>>(&mut self, tx: &R) -> Result<(), PagerErr> {
+    pub(super) fn advance<R: PageReader<'tx>>(&mut self, tx: &R) -> Result<(), PagerErr> {
         self.advance_and_check_exhausted(tx).map(|_| ())
     }
 
@@ -719,7 +765,6 @@ impl<'tx> Cursor {
         mooo_assert!(!self.traversal.is_empty());
 
         self.slot_idx += 1;
-        self.seen_cnt += 1;
 
         let (pgid, _) = *self.traversal.last_ref();
         let rhdl = tx.get_page_read(pgid)?;
@@ -769,5 +814,23 @@ impl<'tx> Cursor {
             pgid_next = pgid_from_bytes(page_parent.key_val_slices_from_slot(0).1);
             self.traversal.push((pgid_next, 0));
         }
+    }
+}
+
+pub(super) struct BtreeMeta {
+    pub(super) page_cnt_total: u64,
+    pub(super) page_cnt_leaf:  u64,
+    pub(super) page_cnt_inner: u64,
+    pub(super) entry_cnt:      u64,
+    pub(super) bytes:          u64,
+}
+
+impl AddAssign for BtreeMeta {
+    fn add_assign(&mut self, rhs: Self) {
+        self.page_cnt_total += rhs.page_cnt_total;
+        self.page_cnt_leaf += rhs.page_cnt_leaf;
+        self.page_cnt_inner += rhs.page_cnt_inner;
+        self.entry_cnt += rhs.entry_cnt;
+        self.bytes += rhs.bytes;
     }
 }

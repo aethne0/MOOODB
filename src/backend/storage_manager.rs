@@ -32,8 +32,8 @@ use super::pgid_valid;
 use super::serialization::*;
 use super::PAGE_SIZE;
 use super::PGID_NULL;
-use crate::collections::StackArray;
 use crate::mooo_assert;
+use crate::MiB;
 
 // -------------------------------------------------------------------------------------------------
 //  ▄▄▄· ▄▄▄·  ▄▄ • ▄▄▄ .▄▄▄
@@ -53,6 +53,8 @@ pub(crate) enum PagerErr {
     Integrity,
 }
 
+const PAGEFREED_LIST_LEN: usize = MiB!(1) / size_of::<u64>();
+
 pub(super) struct Pager {
     file:            File,
     frames:          Box<[FrameHeader]>,
@@ -63,7 +65,8 @@ pub(super) struct Pager {
     shard_dirs:      Box<[Mutex<FxHashMap<u64, usize>>]>,
     eviction_hand:   AtomicUsize,
     superblock_curr: RwLock<SuperblockHeader>,
-    // is writer poisoned
+    // we put the boxed freed-pages array in this mutex so write-txs can reuse it instead of
+    // reallocating each time
     writer_lock:     Mutex<()>,
 }
 
@@ -164,10 +167,11 @@ impl Pager {
             not_commited:    true,
             file_size_prev:  file_size_prev,
             pages_allocated: FxHashMap::default(),
-            pages_freed:     StackArray::new(),
             fl_prev_crs:     RefCell::new(freelist_cursor.clone()),
-            fl_prev_crs_lag: RefCell::new(freelist_cursor),
-            _writer_tx_lock: lock,
+            fl_prev_lag_crs: RefCell::new(freelist_cursor),
+            fl_prev_lag_cnt: 0,
+            pgid_freed_head: PGID_NULL,
+            _lock:           lock,
         }
     }
 
@@ -318,7 +322,9 @@ impl Pager {
 
     #[must_use = "RAII WrHdl releases when dropped"]
     fn get_frame_write_index(&self, frame_index: usize) -> WrHdl<'_> {
-        let whdl = self.latch_try_write(frame_index).expect("must be uncontested");
+        let whdl = self
+            .latch_try_write(frame_index)
+            .expect(&format!("must be uncontested (frame_idx:{})", frame_index));
         whdl
     }
 
@@ -398,7 +404,9 @@ impl Pager {
 
         match dir.get(&pgid) {
             Some(&frame_index) => {
-                let mut whdl = self.latch_try_write(frame_index).expect("should be uncontested");
+                let mut whdl = self
+                    .latch_try_write(frame_index)
+                    .expect(&format!("should be uncontested (pgid: {})", pgid));
                 mooo_assert!(
                     whdl.get_pgid() == pgid,
                     "frame should have same pgid that it is filed under in the dir"
@@ -569,6 +577,12 @@ pub(super) enum Durability {
     Sync,
 }
 
+impl<'tx> ReadTx<'tx> {
+    pub(super) fn freelistpgid(&self) -> u64 {
+        self.superblock.pgid_freelist.get()
+    }
+}
+
 pub(super) trait PageReader<'tx> {
     fn get_page_read(&self, pgid: u64) -> Result<RdHdl<'tx>, PagerErr>;
 }
@@ -695,12 +709,10 @@ pub(super) struct WriteTx<'tx> {
     not_commited:    bool,
     /// For cleaning up pages that were spilled before commit, in the event of cancellation
     file_size_prev:  u64,
-    _writer_tx_lock: MutexGuard<'tx, ()>,
-
-    /// This will writeout to our new freelist if its full
-    pages_freed:     StackArray<u64, 127>,
     fl_prev_crs:     RefCell<Cursor>,
-    fl_prev_crs_lag: RefCell<Cursor>,
+    fl_prev_lag_crs: RefCell<Cursor>,
+    fl_prev_lag_cnt: usize,
+    pgid_freed_head: u64,
 
     // TODO rewrite a stack version of this
     // we could simplify this into just an array, but then wed have to do a lookup via the pager
@@ -708,6 +720,8 @@ pub(super) struct WriteTx<'tx> {
     // to check if a given page was created by us (in `get_page_write`).
     // TODO well have to think about this once we implement in-tx spill as well
     pages_allocated: FxHashMap<u64, usize>,
+
+    _lock: MutexGuard<'tx, ()>,
 }
 
 impl Drop for WriteTx<'_> {
@@ -727,6 +741,11 @@ impl Drop for WriteTx<'_> {
 }
 
 impl<'tx> WriteTx<'tx> {
+    // TEMP
+    pub(super) fn freelistpgid(&self) -> u64 {
+        self.superblock.pgid_freelist.get()
+    }
+
     pub(super) fn get_txid(&self) -> u64 {
         self.superblock.txid.get()
     }
@@ -777,11 +796,6 @@ impl<'tx> WriteTx<'tx> {
             self.pager.fsync()?;
         }
 
-        let lenss = self.pager.file.metadata().unwrap().len();
-        let freelist = Btree::from_pgid(self.superblock.pgid_freelist.get());
-        let length = freelist.len(&self)?;
-        eprintln!("freelist: {} / {}", length, lenss as usize / PAGE_SIZE);
-
         self.not_commited = false;
         *self.pager.superblock_curr.write().unwrap() = self.superblock.clone();
 
@@ -789,6 +803,27 @@ impl<'tx> WriteTx<'tx> {
     }
 
     // ------------ Freelist stuff -----------------------------------------------------------------
+
+    fn pages_freed_push(&mut self, pgid: u64) -> Result<(), PagerErr> {
+        let whdl = self.pager.get_frame_write_pgid(pgid)?;
+        // nothing on this page matters, and it is freed so we wont ever read this
+        SerializedU64::from(self.pgid_freed_head).write_to_prefix(whdl.buf);
+        self.pgid_freed_head = pgid;
+        Ok(())
+    }
+
+    fn pages_freed_pop(&mut self) -> Result<Option<u64>, PagerErr> {
+        let pgid = self.pgid_freed_head;
+        if pgid == PGID_NULL {
+            return Ok(None);
+        }
+
+        let whdl = self.pager.get_frame_write_pgid(pgid)?;
+        self.pgid_freed_head =
+            SerializedU64::read_from_bytes(&whdl.buf[0..size_of::<SerializedU64>()]).get();
+
+        Ok(Some(pgid))
+    }
 
     fn freelist_prev_next(&mut self) -> Result<Option<FreeEntry>, PagerErr> {
         let Some(free_entry) = self
@@ -802,6 +837,7 @@ impl<'tx> WriteTx<'tx> {
         let txid_bound = tx_registry::get_min();
 
         if free_entry.txid.get() < txid_bound {
+            self.fl_prev_lag_cnt += 1;
             self.fl_prev_crs.borrow_mut().advance(self)?;
             return Ok(Some(free_entry));
         } else {
@@ -840,9 +876,10 @@ impl<'tx> WriteTx<'tx> {
         loop {
             let mut done = true;
 
-            while self.fl_prev_crs_lag.borrow().seen() < self.fl_prev_crs.borrow().seen() {
+            while self.fl_prev_lag_cnt > 0 {
+                self.fl_prev_lag_cnt -= 1;
                 let entry = self
-                    .fl_prev_crs_lag
+                    .fl_prev_lag_crs
                     .borrow_mut()
                     .next(self, |key, _| FreeEntry::read_from_bytes(key))?
                     .unwrap();
@@ -850,7 +887,7 @@ impl<'tx> WriteTx<'tx> {
                 done = false;
             }
 
-            while let Some(pgid_freed) = self.pages_freed.pop() {
+            while let Some(pgid_freed) = self.pages_freed_pop()? {
                 self.freelist_new_insert(pgid_freed)?;
                 done = false;
             }
@@ -884,17 +921,17 @@ impl<'tx> PageWriter<'tx> for WriteTx<'tx> {
             self.pager.abandon_allocated_frame(frame_index);
         }
 
-        if self.pages_freed.is_full() {
-            self.freelist_apply_changes()?;
-        }
-        self.pages_freed.push(pgid);
+        self.pages_freed_push(pgid)?;
         Ok(())
     }
 
     /// Bump allocates - also adds page to our dirty-page linked list
     fn get_page_alloc<'op>(&'op mut self) -> Result<WrHdl<'tx>, PagerErr> {
         let pgid = match self.freelist_prev_next()? {
-            Some(entry) => entry.pgid.get(),
+            Some(entry) => {
+                let pgid = entry.pgid.get();
+                pgid
+            }
             None => {
                 let pgid = self.superblock.pgid_bump_next.get();
                 self.superblock.pgid_bump_next.add_assign(1);
@@ -918,6 +955,7 @@ impl<'tx> PageWriter<'tx> for WriteTx<'tx> {
         let old_rhdl = self.get_page_read(pgid)?;
         let new_whdl = self.get_page_alloc()?;
         new_whdl.buf.copy_from_slice(old_rhdl.buf);
+        drop(old_rhdl);
         self.free_page(pgid)?;
 
         Ok(new_whdl)

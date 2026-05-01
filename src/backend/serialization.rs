@@ -62,14 +62,6 @@ impl FreeEntry {
     pub(super) fn txid_bound(txid: impl Into<SerializedU64>) -> Self {
         Self { txid: txid.into(), pgid: 0.into() }
     }
-
-    pub(super) fn txid(&self) -> u64 {
-        todo!()
-    }
-
-    pub(super) fn pgid(&self) -> u64 {
-        todo!()
-    }
 }
 unsafe impl Serialized for FreeEntry {}
 

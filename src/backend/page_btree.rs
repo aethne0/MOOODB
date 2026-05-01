@@ -1,6 +1,5 @@
 use std::ops::Deref;
 use std::ops::DerefMut;
-use std::ops::Range;
 
 use super::serialization::*;
 use super::PAGE_SIZE;
@@ -99,6 +98,10 @@ impl<Buf: AsRef<[u8]>> BtreePage<Buf> {
 
     fn bytes_used(&self) -> u16 {
         PAGE_USABLE_SPACE - self.free_bytes.get()
+    }
+
+    pub(super) fn entry_bytes(&self) -> u16 {
+        PAGE_USABLE_SPACE - self.free_bytes.get() - self.len() * SLOT_SIZE
     }
 
     pub(super) fn is_full_enough(&self) -> bool {
@@ -266,7 +269,6 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
         self.upper_ptr = PAGE_HEADER_SIZE.into();
         self.lower_ptr = END_OF_PAGE.into();
         self.free_bytes = PAGE_USABLE_SPACE.into();
-
         #[cfg(debug_assertions)]
         self.raw.as_mut()[PAGE_HEADER_SIZE as usize..].fill(0);
     }
