@@ -21,6 +21,22 @@ pub(super) struct BtreePageHeader {
 const _: () = mooo_assert!(size_of::<BtreePageHeader>() == PAGE_HEADER_SIZE as usize);
 unsafe impl Serialized for BtreePageHeader {}
 
+// SLOT Values are laid out like:
+// [flags:u1][key_len:u15][key:var][val:var]
+// So val starts at sizeof<u16> + key_len
+pub(super) const SLOT_INDEX_NULL: u16 = u16::MAX;
+const SLOT_SIZE: u16 = 2 * size_of::<u16>() as u16;
+
+const PAGE_USABLE_SPACE: u16 = PAGE_SIZE as u16 - PAGE_HEADER_SIZE;
+const MAX_ENTRY_LEN: usize = ((PAGE_SIZE - PAGE_HEADER_SIZE as usize) / 2) - (SLOT_SIZE as usize);
+const MAX_KEY_LEN: usize = PAGE_SIZE / 4;
+const MAX_VAL_LEN: usize = MAX_ENTRY_LEN - MAX_KEY_LEN;
+const _: () = mooo_assert!(MAX_ENTRY_LEN < u16::MAX as usize);
+const _: () = mooo_assert!(MAX_KEY_LEN < MAX_ENTRY_LEN);
+const _: () = mooo_assert!(MAX_KEY_LEN < (1 << 15) - 1, "Max key len must fit in u15");
+const _: () =
+    mooo_assert!(MAX_VAL_LEN >= size_of::<HeapPtr>(), "Value must be able to fit overflow ptr");
+
 const PGTYPE_BTREELF: SerializedU64 = SerializedU64(*b"\0BtreeLf");
 const PGTYPE_BTREEIN: SerializedU64 = SerializedU64(*b"\0BtreeIn");
 
@@ -30,14 +46,6 @@ pub(super) struct BtreePage<Buf> {
 }
 
 // constructors
-
-// Values are laid out like:
-// [key_len:u16][key:var][val:var]
-// So val starts at sizeof<u16> + key_len
-pub(super) const SLOT_INDEX_NULL: u16 = u16::MAX;
-const SLOT_SIZE: u16 = 2 * size_of::<u16>() as u16;
-const PAGE_USABLE_SPACE: u16 = PAGE_SIZE as u16 - PAGE_HEADER_SIZE;
-const MAX_ENTRY_LEN: usize = ((PAGE_SIZE - PAGE_HEADER_SIZE as usize) / 2) - (SLOT_SIZE as usize);
 
 impl<'buf> BtreePage<&'buf mut [u8; PAGE_SIZE]> {
     pub(super) fn initialize_with_buffer(
@@ -145,6 +153,16 @@ impl<Buf: AsRef<[u8]>> BtreePage<Buf> {
         self.bytes_used() + other.bytes_used() <= PAGE_USABLE_SPACE
     }
 
+    fn read_slot(&self, slot_index: u16) -> (bool, usize, usize) {
+        let raw = self.raw.as_ref();
+        let base = (PAGE_HEADER_SIZE + slot_index * SLOT_SIZE) as usize;
+        let offset_and_flags = SerializedU16::read_from_bytes(&raw[base..]).get();
+        let is_overflow = (offset_and_flags & 0b1000_0000_0000_0000) > 0;
+        let offset = (offset_and_flags & 0b0111_1111_1111_1111) as usize;
+        let len = SerializedU16::ref_from_bytes(&raw[base + size_of::<u16>()..]).get() as usize;
+        (is_overflow, offset, len)
+    }
+
     pub(super) fn key_val_slices_from_slot(&self, slot_index: u16) -> (&[u8], &[u8]) {
         let entry = self.entry_slice_from_slot(slot_index);
         mooo_assert!(entry.len() > size_of::<SerializedU16>());
@@ -155,11 +173,8 @@ impl<Buf: AsRef<[u8]>> BtreePage<Buf> {
 
     fn entry_slice_from_slot(&self, slot_index: u16) -> &[u8] {
         mooo_assert!(slot_index < self.len());
-        let base = (PAGE_HEADER_SIZE + slot_index * SLOT_SIZE) as usize;
         let raw = self.raw.as_ref();
-
-        let offset = SerializedU16::ref_from_bytes(&raw[base..]).get() as usize;
-        let len = SerializedU16::ref_from_bytes(&raw[base + size_of::<u16>()..]).get() as usize;
+        let (_, offset, len) = self.read_slot(slot_index);
         &raw[offset..offset + len]
     }
 
@@ -192,6 +207,7 @@ impl<Buf: AsRef<[u8]>> BtreePage<Buf> {
     /// Binary searches for `key` and returns a [`SearchResult`] indicating whether it was
     /// found and at which slot, or where it would be inserted to maintain order.
     pub(super) fn find_slot_from_key(&self, key: &[u8]) -> SearchResult {
+        mooo_assert!(key.len() <= MAX_KEY_LEN);
         let _ = u16::try_from(key.len()).expect("passed key too large");
 
         if self.len() == 0 {
@@ -226,6 +242,7 @@ impl<Buf: AsRef<[u8]>> BtreePage<Buf> {
 
     /// Returns the value associated with `key`, or `None` if not present.
     pub(super) fn get(&self, key: &[u8]) -> Option<&[u8]> {
+        mooo_assert!(key.len() <= MAX_KEY_LEN);
         match self.find_slot_from_key(key) {
             SearchResult::Found(slot_index) => Some(self.key_val_slices_from_slot(slot_index).1),
             _ => None,
@@ -237,6 +254,7 @@ impl<Buf: AsRef<[u8]>> BtreePage<Buf> {
     /// Finds the last slot whose key does not exceed `key`. Slot 0 is a catch-all for any key
     /// smaller than slot 1's separator, so inner nodes never need their keys updated during descent.
     pub(super) fn get_traversal_next_page(&self, key: &[u8]) -> Option<(&[u8], u16)> {
+        mooo_assert!(key.len() <= MAX_KEY_LEN);
         mooo_assert!(self.is_inner(), "shouldnt be called on leaf node");
         mooo_assert!(self.len() > 0, "inner node shouldnt be empty");
         let slot_index = match self.find_slot_from_key(key) {
@@ -248,6 +266,9 @@ impl<Buf: AsRef<[u8]>> BtreePage<Buf> {
     }
 
     fn has_space(&self, key: &[u8], val: &[u8]) -> Result<u16, ()> {
+        mooo_assert!(key.len() <= MAX_KEY_LEN);
+        mooo_assert!(val.len() <= MAX_VAL_LEN);
+
         let entry_len = u16::try_from(size_of::<SerializedU16>() + key.len() + val.len())
             .expect("entry too big for u16");
         if entry_len + SLOT_SIZE > self.free_bytes.get() {
@@ -274,21 +295,20 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
     /// Entire entry slice including value-offset header
     fn entry_slices_from_slot_mut(&mut self, slot_index: u16) -> &mut [u8] {
         mooo_assert!(slot_index < self.len());
-        let base = (PAGE_HEADER_SIZE + slot_index * SLOT_SIZE) as usize;
-        let raw = self.raw.as_ref();
-
-        let offset = SerializedU16::ref_from_bytes(&raw[base..]).get() as usize;
-        let len = SerializedU16::ref_from_bytes(&raw[base + size_of::<u16>()..]).get() as usize;
+        let (_, offset, len) = self.read_slot(slot_index);
         &mut self.raw.as_mut()[offset..offset + len]
     }
 
-    fn write_slot(&mut self, slot_index: u16, offset: u16, len: u16) {
+    fn write_slot(&mut self, slot_index: u16, mut offset: u16, len: u16, is_overflow: bool) {
         mooo_assert!(
             slot_index <= self.len(),
             "we shouldnt be writing past the next available slot"
         );
         let base = (PAGE_HEADER_SIZE + slot_index * SLOT_SIZE) as usize;
         let raw = self.raw.as_mut();
+        if is_overflow {
+            offset |= 0b1000_0000_0000_0000;
+        }
         SerializedU16::from(offset).write_to_prefix(&mut raw[base..]);
         SerializedU16::from(len).write_to_prefix(&mut raw[base + size_of::<u16>()..]);
     }
@@ -316,7 +336,7 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
             self.raw.as_mut().copy_within(start..end, dest);
         }
 
-        self.write_slot(slot_index, offset, entry_len);
+        self.write_slot(slot_index, offset, entry_len, false);
         self.upper_ptr = (self.upper_ptr.get() + SLOT_SIZE).into();
         self.lower_ptr = (lower - entry_len).into();
         self.free_bytes = (self.free_bytes.get() - SLOT_SIZE - entry_len).into();
@@ -352,6 +372,7 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
 
     /// Removes the entry with `key`. Does nothing if the key is not present.
     pub(super) fn delete(&mut self, key: &[u8]) {
+        mooo_assert!(key.len() <= MAX_KEY_LEN);
         if let SearchResult::Found(slot_index) = self.find_slot_from_key(key) {
             self.delete_slot_entry(slot_index);
         }
@@ -359,6 +380,7 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
 
     /// MUST have the same length as the old value!!
     pub(super) fn overwrite_value_at_slot_index(&mut self, slot_index: u16, val: &[u8]) {
+        mooo_assert!(val.len() <= MAX_VAL_LEN);
         mooo_assert!(self.len() > slot_index);
         let (_, value_slice) = self.key_val_slices_from_slot_mut(slot_index);
         mooo_assert!(value_slice.len() == val.len());
@@ -366,6 +388,8 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
     }
 
     fn insert_internal(&mut self, key: &[u8], val: &[u8], ordered: bool) -> bool {
+        mooo_assert!(key.len() <= MAX_KEY_LEN);
+        mooo_assert!(val.len() <= MAX_VAL_LEN);
         mooo_assert!(
             size_of::<SerializedU16>() + key.len() + val.len() <= MAX_ENTRY_LEN,
             "with a page size of {} the max btree entry length is {} (len={} passed)",
@@ -404,7 +428,7 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
             }
         } else {
             let off = self.lower_ptr.get() - entry_len + 1;
-            self.write_slot(slot_index, off, entry_len);
+            self.write_slot(slot_index, off, entry_len, false);
             self.lower_ptr = (off - 1).into();
             self.free_bytes = (self.free_bytes.get() - entry_len).into();
             off as usize
@@ -424,6 +448,7 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
 
     /// Inserts or updates `(key, val)` maintaining sorted order. Returns `false` if the page is full.
     pub(super) fn insert(&mut self, key: &[u8], val: &[u8]) -> bool {
+        mooo_assert!(key.len() <= MAX_KEY_LEN);
         #[cfg(debug_assertions)]
         self.compact();
 
@@ -433,6 +458,8 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
     /// Appends `(key, val)` to the end of the slot array without a binary search.
     /// Note: Breaks the sort invariant unless the caller guarantees the entry belongs at the end.
     pub(super) fn insert_unordered(&mut self, key: &[u8], val: &[u8]) -> bool {
+        mooo_assert!(key.len() <= MAX_KEY_LEN);
+        mooo_assert!(val.len() <= MAX_VAL_LEN);
         #[cfg(debug_assertions)]
         self.compact();
 

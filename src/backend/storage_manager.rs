@@ -33,7 +33,6 @@ use super::serialization::*;
 use super::PAGE_SIZE;
 use super::PGID_NULL;
 use crate::mooo_assert;
-use crate::MiB;
 
 // -------------------------------------------------------------------------------------------------
 //  ▄▄▄· ▄▄▄·  ▄▄ • ▄▄▄ .▄▄▄
@@ -52,8 +51,6 @@ pub(crate) enum PagerErr {
     Io(std::io::ErrorKind),
     Integrity,
 }
-
-const PAGEFREED_LIST_LEN: usize = MiB!(1) / size_of::<u64>();
 
 pub(super) struct Pager {
     file:            File,

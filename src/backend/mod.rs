@@ -40,10 +40,9 @@ const fn pgid_valid(pgid: u64) -> bool {
     pgid <= _PGID_MAX
 }
 
-// i dont understand any of this
-
 /// MurmurHash3
 const fn hash_u64_modulo(mut pgid: u64, modulo: usize) -> usize {
+    // i dont understand any of this
     mooo_assert!(modulo & (modulo - 1) == 0, "modulo must be power of 2");
     pgid ^= pgid >> 33;
     pgid = pgid.wrapping_mul(0xff51_afd7_ed55_8ccd);
@@ -53,7 +52,6 @@ const fn hash_u64_modulo(mut pgid: u64, modulo: usize) -> usize {
     (pgid as usize) & (modulo - 1)
 }
 
-/// crc32c
 fn compute_checksum(bytes: &[u8]) -> u64 {
     xxh3_64(bytes)
 }
