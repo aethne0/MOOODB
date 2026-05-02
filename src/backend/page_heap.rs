@@ -1,3 +1,4 @@
+// TODO more asserts (see btree_page.rs)
 use std::ops::Deref;
 use std::ops::DerefMut;
 
@@ -5,9 +6,13 @@ use super::serialization::*;
 use super::PAGE_SIZE;
 use crate::mooo_assert;
 
-// TODO
+// one of these bits will be whether or not the value is chained, and then the last sizeof(HeapPtr)
+// of the actual value will be the next ptr
 const SLOT_SIZE: u16 = 2 * size_of::<u16>() as u16;
 const SLOT_INDEX_NULL: u16 = u16::MAX;
+// TODO
+const HEAP_MAX_VAL_LEN: usize =
+    PAGE_SIZE - PAGE_HEADER_SIZE as usize - SLOT_SIZE as usize - size_of::<HeapPtr>();
 
 #[repr(C)]
 pub(super) struct HeapPageHeader {

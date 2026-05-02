@@ -29,8 +29,8 @@ const SLOT_SIZE: u16 = 2 * size_of::<u16>() as u16;
 
 const PAGE_USABLE_SPACE: u16 = PAGE_SIZE as u16 - PAGE_HEADER_SIZE;
 const MAX_ENTRY_LEN: usize = ((PAGE_SIZE - PAGE_HEADER_SIZE as usize) / 2) - (SLOT_SIZE as usize);
-const MAX_KEY_LEN: usize = PAGE_SIZE / 4;
-const MAX_VAL_LEN: usize = MAX_ENTRY_LEN - MAX_KEY_LEN;
+pub(crate) const MAX_KEY_LEN: usize = PAGE_SIZE / 4;
+pub(crate) const MAX_VAL_LEN: usize = MAX_ENTRY_LEN - MAX_KEY_LEN;
 const _: () = mooo_assert!(MAX_ENTRY_LEN < u16::MAX as usize);
 const _: () = mooo_assert!(MAX_KEY_LEN < MAX_ENTRY_LEN);
 const _: () = mooo_assert!(MAX_KEY_LEN < (1 << 15) - 1, "Max key len must fit in u15");
