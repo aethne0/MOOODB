@@ -67,7 +67,7 @@ pub(super) struct Pager {
     superblock_curr: RwLock<SuperblockHeader>,
     // we put the boxed freed-pages array in this mutex so write-txs can reuse it instead of
     // reallocating each time
-    writer_lock:     Mutex<()>,
+    writer_lock:     Mutex<FxHashMap<u64, usize>>,
 }
 
 unsafe impl Sync for Pager {}
@@ -76,13 +76,17 @@ impl Pager {
     pub(super) fn new(count: usize, file: File) -> Result<Self, PagerErr> {
         let temp_header = SuperblockHeader::new_zeroed();
 
+        // these are all our heap allocations
+        let mut alloc_map = FxHashMap::default();
+        alloc_map.reserve(65536);
+
         let pager = Self {
             file:            file,
             frames:          (0..count).map(|i| FrameHeader::new(i)).collect(),
             pages:           (0..count).map(|_| FrameBuffer::zeros()).collect(),
             shard_dirs:      (0..SHARD_CNT).map(|_| Mutex::new(FxHashMap::default())).collect(),
             eviction_hand:   0.into(),
-            writer_lock:     Mutex::new(()),
+            writer_lock:     Mutex::new(alloc_map),
             superblock_curr: RwLock::new(temp_header),
         };
 
@@ -95,7 +99,7 @@ impl Pager {
         {
             // initial freelist root
             let mut whdl = pager.get_frame_write_pgid(pgid_freelist_init)?;
-            BtreePage::new_with_buffer(&mut whdl.buf, BtreePageType::Leaf);
+            BtreePage::initialize_with_buffer(&mut whdl.buf, BtreePageType::Leaf);
             whdl.mark_dirty(txid_first);
             pager.io_write(&mut whdl, pgid_freelist_init)?;
             whdl.get_pgid();
@@ -145,7 +149,9 @@ impl Pager {
 
     #[must_use = "RAII WriteTxHdl releases when dropped"]
     pub(crate) fn write_tx<'tx>(&'tx self) -> WriteTx<'tx> {
-        let lock = self.writer_lock.lock().unwrap();
+        let mut lock = self.writer_lock.lock().unwrap();
+        eprintln!("locklen {}", lock.len());
+        lock.clear(); // TODO this maybe is pretty expensive, actually?
 
         let mut superblock = self
             .superblock_curr
@@ -166,12 +172,11 @@ impl Pager {
             superblock:      superblock,
             not_commited:    true,
             file_size_prev:  file_size_prev,
-            pages_allocated: FxHashMap::default(),
+            pages_allocated: lock,
             fl_prev_crs:     RefCell::new(freelist_cursor.clone()),
             fl_prev_lag_crs: RefCell::new(freelist_cursor),
             fl_prev_lag_cnt: 0,
             pgid_freed_head: PGID_NULL,
-            _lock:           lock,
         }
     }
 
@@ -713,15 +718,11 @@ pub(super) struct WriteTx<'tx> {
     fl_prev_lag_crs: RefCell<Cursor>,
     fl_prev_lag_cnt: usize,
     pgid_freed_head: u64,
-
-    // TODO rewrite a stack version of this
     // we could simplify this into just an array, but then wed have to do a lookup via the pager
     // every single time we wanted to use one of our own pages, and itd also be much less efficient
     // to check if a given page was created by us (in `get_page_write`).
     // TODO well have to think about this once we implement in-tx spill as well
-    pages_allocated: FxHashMap<u64, usize>,
-
-    _lock: MutexGuard<'tx, ()>,
+    pages_allocated: MutexGuard<'tx, FxHashMap<u64, usize>>,
 }
 
 impl Drop for WriteTx<'_> {

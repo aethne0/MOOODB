@@ -4,10 +4,10 @@ use super::page_btree::*;
 use super::serialization::*;
 use super::storage_manager::*;
 use super::PagerErr;
+use crate::backend::pgid_valid;
 use crate::backend::PGID_NULL;
 use crate::collections::FixedArray;
 use crate::mooo_assert;
-use crate::util::fmt_bytes;
 
 const TRAVERSAL_LENGTH: usize = 48;
 type Traversal<T> = FixedArray<(T, u16), TRAVERSAL_LENGTH>;
@@ -26,11 +26,14 @@ pub(super) struct Btree {
 
 fn pgid_from_bytes(val: &[u8]) -> u64 {
     mooo_assert!(val.len() == size_of::<SerializedU64>());
-    SerializedU64::read_from_bytes(val).get()
+    let pgid = SerializedU64::read_from_bytes(val).get();
+    mooo_assert!(pgid_valid(pgid));
+    pgid
 }
 
 /// Handles endianness etc
 fn bytes_from_pgid(pgid: u64) -> [u8; 8] {
+    mooo_assert!(pgid_valid(pgid));
     SerializedU64::from(pgid).0
 }
 
@@ -42,13 +45,14 @@ impl Btree {
     ) -> Result<Btree, PagerErr> {
         let whdl = tx.get_page_alloc()?;
         let pgid = whdl.get_pgid();
-        BtreePage::new_with_buffer(whdl.buf, BtreePageType::Leaf);
+        BtreePage::initialize_with_buffer(whdl.buf, BtreePageType::Leaf);
         Ok(Self::from_pgid(pgid))
     }
 
     /// For opening an EXISTING btree
     #[must_use]
     pub(super) fn from_pgid(root_pgid: u64) -> Self {
+        mooo_assert!(pgid_valid(root_pgid));
         Self { root_pgid }
     }
 
@@ -95,7 +99,7 @@ impl Btree {
             let whdl = tx.get_page_write(next_pgid)?;
 
             if traversal.len() > 0 {
-                // fix parent_ptr
+                // fixing parent_ptr
                 let (parent_whdl, slot_index) = traversal.last_mut();
                 let mut parent_page = BtreePage::from_buffer(parent_whdl.buf);
                 parent_page
@@ -266,7 +270,7 @@ impl Btree {
 
         if at_root {
             let mut whdl_root = tx.get_page_alloc()?;
-            BtreePage::new_with_buffer(whdl_root.buf, BtreePageType::Inner);
+            BtreePage::initialize_with_buffer(whdl_root.buf, BtreePageType::Inner);
             Self::insert_child_ptr(&mut whdl_root, &mut whdl);
             Self::insert_child_ptr(&mut whdl_root, &mut whdl_sibling);
             self.root_pgid = whdl_root.get_pgid();
@@ -337,7 +341,7 @@ impl Btree {
         whdl_left: &mut WrHdl<'_>, whdl_right: &mut WrHdl<'_>, key: &[u8], val: &[u8],
     ) {
         let mut left = BtreePage::from_buffer(whdl_left.buf);
-        let mut right = BtreePage::new_with_buffer(whdl_right.buf, left.get_page_type());
+        let mut right = BtreePage::initialize_with_buffer(whdl_right.buf, left.get_page_type());
         left.redistribute_into(&mut right);
         if key < right.key_val_slices_from_slot(0).0 {
             let _had_space = left.insert(key, val);

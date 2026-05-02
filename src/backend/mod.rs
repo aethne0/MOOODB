@@ -21,7 +21,7 @@ use crate::mooo_assert;
 pub(crate) use storage_manager::*;
 
 /// PAGE_SIZE maybe be inclusively from 256-32KiB, and must be a power of two
-const PAGE_SIZE: usize = 0x1000;
+const PAGE_SIZE: usize = 0x200;
 const _: () = mooo_assert!(
     false
         || PAGE_SIZE == 0x100

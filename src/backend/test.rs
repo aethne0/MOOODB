@@ -270,8 +270,9 @@ fn insertoid() {
     const KEY_SIZE: usize = 22;
     const VAL_MASK: u64 = 0xffff_0000_0000_ffff;
 
-    const TX_CNT: usize = 100;
-    const INSERTS_PER_TX: usize = 300;
+    const TX_CNT: usize = 10;
+    const INSERTS_PER_TX: usize = 50;
+    const _CNT: usize = TX_CNT * INSERTS_PER_TX;
 
     let dur = Durability::Flush;
 

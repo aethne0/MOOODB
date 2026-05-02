@@ -12,8 +12,10 @@ pub(super) struct BtreePageHeader {
     pub(super) prefix:     PagePrefix,
     _unused:               [u8; 24],
     pub(super) page_type:  SerializedU16,
+    /// ptr to byte after end of slot array (grows from top - end of header)
     pub(super) upper_ptr:  SerializedU16,
     pub(super) free_bytes: SerializedU16,
+    /// ptr to byte before start of values (grows from bottom)
     pub(super) lower_ptr:  SerializedU16,
 }
 const _: () = mooo_assert!(size_of::<BtreePageHeader>() == PAGE_HEADER_SIZE as usize);
@@ -38,23 +40,29 @@ const PAGE_USABLE_SPACE: u16 = PAGE_SIZE as u16 - PAGE_HEADER_SIZE;
 const MAX_ENTRY_LEN: usize = ((PAGE_SIZE - PAGE_HEADER_SIZE as usize) / 2) - (SLOT_SIZE as usize);
 
 impl<'buf> BtreePage<&'buf mut [u8; PAGE_SIZE]> {
-    pub(super) fn new_with_buffer(
+    pub(super) fn initialize_with_buffer(
         buffer: &'buf mut [u8; PAGE_SIZE], page_type: BtreePageType,
     ) -> Self {
-        let mut page = Self::from_buffer(buffer);
+        let mut page = Self { raw: buffer };
         page.clear();
         page.set_page_type(page_type);
         page
     }
 
-    pub(super) const fn from_buffer(buffer: &'buf mut [u8; PAGE_SIZE]) -> Self {
-        Self { raw: buffer }
+    /// Page MUST be initialized
+    pub(super) fn from_buffer(buffer: &'buf mut [u8; PAGE_SIZE]) -> Self {
+        let page = Self { raw: buffer };
+        mooo_assert!(page.is_initialized());
+        page
     }
 }
 
 impl<'b> BtreePage<&'b [u8; PAGE_SIZE]> {
-    pub(super) const fn from_buffer_ref(buffer: &'b [u8; PAGE_SIZE]) -> Self {
-        Self { raw: buffer }
+    /// Page MUST be initialized
+    pub(super) fn from_buffer_ref(buffer: &'b [u8; PAGE_SIZE]) -> Self {
+        let page = Self { raw: buffer };
+        mooo_assert!(page.is_initialized());
+        page
     }
 }
 
@@ -89,7 +97,18 @@ impl<Buf: AsRef<[u8]>> BtreePage<Buf> {
     }
 
     fn free_bytes_contig(&self) -> u16 {
+        mooo_assert!(self.lower_ptr.get() >= self.upper_ptr.get() - 1);
         1 + self.lower_ptr.get() - self.upper_ptr.get()
+    }
+
+    /// Assert
+    fn is_initialized(&self) -> bool {
+        // check that type is set
+        let _ = self.get_page_type();
+        // check that pointers are (seemingly) sane
+        mooo_assert!(self.lower_ptr.get() >= self.upper_ptr.get() - 1);
+        mooo_assert!(self.free_bytes_contig() <= self.free_bytes.get());
+        true
     }
 
     pub(super) fn len(&self) -> u16 {
@@ -135,6 +154,7 @@ impl<Buf: AsRef<[u8]>> BtreePage<Buf> {
     }
 
     fn entry_slice_from_slot(&self, slot_index: u16) -> &[u8] {
+        mooo_assert!(slot_index < self.len());
         let base = (PAGE_HEADER_SIZE + slot_index * SLOT_SIZE) as usize;
         let raw = self.raw.as_ref();
 
@@ -144,6 +164,7 @@ impl<Buf: AsRef<[u8]>> BtreePage<Buf> {
     }
 
     fn len_from_slot(&self, slot_index: u16) -> u16 {
+        mooo_assert!(slot_index < self.len());
         let base = (PAGE_HEADER_SIZE + slot_index * SLOT_SIZE) as usize;
         let raw = self.raw.as_ref();
         SerializedU16::ref_from_bytes(&raw[base + size_of::<u16>()..]).get()
@@ -158,10 +179,13 @@ impl<Buf: AsRef<[u8]>> BtreePage<Buf> {
     }
 
     pub(super) fn get_page_type(&self) -> BtreePageType {
-        if self.page_type.get() == BtreePageType::Inner as u16 {
+        let t = self.page_type.get();
+        if t == BtreePageType::Inner as u16 {
             BtreePageType::Inner
-        } else {
+        } else if t == BtreePageType::Leaf as u16 {
             BtreePageType::Leaf
+        } else {
+            unreachable!("invalid page type")
         }
     }
 
@@ -213,10 +237,8 @@ impl<Buf: AsRef<[u8]>> BtreePage<Buf> {
     /// Finds the last slot whose key does not exceed `key`. Slot 0 is a catch-all for any key
     /// smaller than slot 1's separator, so inner nodes never need their keys updated during descent.
     pub(super) fn get_traversal_next_page(&self, key: &[u8]) -> Option<(&[u8], u16)> {
-        // TODO
         mooo_assert!(self.is_inner(), "shouldnt be called on leaf node");
         mooo_assert!(self.len() > 0, "inner node shouldnt be empty");
-
         let slot_index = match self.find_slot_from_key(key) {
             SearchResult::Found(slot_index) => slot_index,
             SearchResult::NotFound(slot_index) => slot_index.saturating_sub(1),
@@ -241,6 +263,7 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
     pub(super) fn key_val_slices_from_slot_mut(
         &mut self, slot_index: u16,
     ) -> (&mut [u8], &mut [u8]) {
+        mooo_assert!(slot_index < self.len());
         let entry = self.entry_slices_from_slot_mut(slot_index);
         mooo_assert!(entry.len() > size_of::<SerializedU16>());
         let key_len =
@@ -250,6 +273,7 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
 
     /// Entire entry slice including value-offset header
     fn entry_slices_from_slot_mut(&mut self, slot_index: u16) -> &mut [u8] {
+        mooo_assert!(slot_index < self.len());
         let base = (PAGE_HEADER_SIZE + slot_index * SLOT_SIZE) as usize;
         let raw = self.raw.as_ref();
 
@@ -259,6 +283,10 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
     }
 
     fn write_slot(&mut self, slot_index: u16, offset: u16, len: u16) {
+        mooo_assert!(
+            slot_index <= self.len(),
+            "we shouldnt be writing past the next available slot"
+        );
         let base = (PAGE_HEADER_SIZE + slot_index * SLOT_SIZE) as usize;
         let raw = self.raw.as_mut();
         SerializedU16::from(offset).write_to_prefix(&mut raw[base..]);
@@ -424,6 +452,7 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> BtreePage<Buf> {
     /// Moves the upper half of entries into `right_page`, which must be empty.
     /// Compacts both sides.
     pub(super) fn redistribute_into(&mut self, right_page: &mut Self) {
+        mooo_assert!(right_page.is_initialized());
         mooo_assert!(right_page.len() == 0);
 
         let mut cloned_left_raw = [0u8; PAGE_SIZE];
