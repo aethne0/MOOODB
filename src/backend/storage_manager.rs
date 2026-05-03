@@ -1,7 +1,9 @@
 // TODO all these unsafe bits should just be one method that gets the index and the &but at the same
 // time to ensure its safe
+//
 // TODO on a IO failure of any kinda during a write-tx we should abort and then truncate (were
 // actually doing this but it needs to be improved)
+//
 // TODO we need some sort of "spill" for mega-huge write-tx's where the working set cant fit in
 // memory - right now tests can stall easily if they do a larger than memory initial write-set
 
@@ -52,7 +54,7 @@ pub(crate) enum PagerErr {
     Integrity,
 }
 
-pub(super) struct Pager {
+pub(crate) struct StorageManager {
     file:            File,
     frames:          Box<[FrameHeader]>,
     pages:           Box<[FrameBuffer]>,
@@ -67,10 +69,10 @@ pub(super) struct Pager {
     writer_lock:     Mutex<FxHashMap<u64, usize>>,
 }
 
-unsafe impl Sync for Pager {}
+unsafe impl Sync for StorageManager {}
 
-impl Pager {
-    pub(super) fn new(count: usize, file: File) -> Result<Self, PagerErr> {
+impl StorageManager {
+    pub(crate) fn new(count: usize, file: File) -> Result<Self, PagerErr> {
         let temp_header = SuperblockHeader::new_zeroed();
 
         // these are all our heap allocations
@@ -147,7 +149,6 @@ impl Pager {
     #[must_use = "RAII WriteTxHdl releases when dropped"]
     pub(crate) fn write_tx<'tx>(&'tx self) -> WriteTx<'tx> {
         let mut lock = self.writer_lock.lock().unwrap();
-        eprintln!("locklen {}", lock.len());
         lock.clear(); // TODO this maybe is pretty expensive, actually?
 
         let mut superblock = self
@@ -174,6 +175,7 @@ impl Pager {
             fl_prev_lag_crs: RefCell::new(freelist_cursor),
             fl_prev_lag_cnt: 0,
             pgid_freed_head: PGID_NULL,
+            page_limit:      self.frames.len() / 2,
         }
     }
 
@@ -250,7 +252,6 @@ impl Pager {
             return None;
         };
 
-        frame.usage.fetch_add(1, Ordering::Relaxed);
         Some(WrHdl {
             frame:       frame,
             frame_inner: frame_guard,
@@ -275,7 +276,6 @@ impl Pager {
             return None;
         }
 
-        frame.usage.fetch_add(1, Ordering::Relaxed);
         Some(RdHdl {
             frame:       frame,
             frame_inner: frame_guard,
@@ -285,6 +285,7 @@ impl Pager {
         })
     }
 
+    /// This will return a frame with a usage counter set to 0
     #[must_use = "RAII RdHdl releases when dropped"]
     fn scan_for_eviction_candidate(&self) -> WrHdl<'_> {
         let mut checked_count = 0;
@@ -315,18 +316,18 @@ impl Pager {
                 .unwrap();
             mooo_assert!(frame_usage_ctr != u64::MAX);
 
-            if frame_usage_ctr == 1 {
-                // We check for 1, not 0, because it was incremented by `latch_try_write`
+            if frame_usage_ctr == 0 {
                 return whdl;
             }
         }
     }
 
     #[must_use = "RAII WrHdl releases when dropped"]
-    fn get_frame_write_index(&self, frame_index: usize) -> WrHdl<'_> {
+    fn get_frame_write_index(&self, frame_idx: usize) -> WrHdl<'_> {
         let whdl = self
-            .latch_try_write(frame_index)
-            .expect(&format!("must be uncontested (frame_idx:{})", frame_index));
+            .latch_try_write(frame_idx)
+            .expect(&format!("must be uncontested (frame_idx:{})", frame_idx));
+        whdl.frame.usage.fetch_add(1, Ordering::Relaxed);
         whdl
     }
 
@@ -349,6 +350,7 @@ impl Pager {
                             continue;
                         }
                         Some(rhdl) => {
+                            rhdl.frame.usage.fetch_add(1, Ordering::Relaxed);
                             return Ok(rhdl);
                         }
                     }
@@ -390,6 +392,7 @@ impl Pager {
 
                     self.io_read(&mut whdl, pgid)?;
 
+                    whdl.frame.usage.fetch_add(1, Ordering::Relaxed);
                     return Ok(whdl.downgrade());
                 }
             }
@@ -414,12 +417,12 @@ impl Pager {
                     "frame should have same pgid that it is filed under in the dir"
                 );
                 whdl.frame_inner.state = FrameState::InTx;
+                whdl.frame.usage.fetch_add(1, Ordering::Relaxed);
                 return Ok(whdl);
             }
             None => {
                 let mut whdl = self.scan_for_eviction_candidate();
                 let frame_old_pgid = replace(&mut whdl.frame_inner.pgid, pgid);
-                whdl.frame_inner.state = FrameState::InTx;
 
                 dir.insert(pgid, whdl.frame.index);
                 drop(dir);
@@ -433,6 +436,8 @@ impl Pager {
                 old_dir.remove(&frame_old_pgid);
                 drop(old_dir);
 
+                whdl.frame_inner.state = FrameState::InTx;
+                whdl.frame.usage.fetch_add(1, Ordering::Relaxed);
                 return Ok(whdl);
             }
         };
@@ -447,13 +452,14 @@ impl Pager {
         mooo_assert!(pgid_valid(pgid));
         let entry = self.shard_dirs[hash_u64_modulo(pgid, SHARD_CNT)].lock().unwrap().remove(&pgid);
         mooo_assert!(entry.is_some(), "should have been resident");
+        whdl.frame.usage.store(0, Ordering::Relaxed);
         whdl.frame_inner.state = FrameState::Evictable;
     }
 }
 
 // ------------ frame types ------------------------------------------------------------------------
 
-// #[repr(align(4096))]
+#[repr(align(4096))]
 struct FrameBuffer(UnsafeCell<[u8; PAGE_SIZE]>);
 
 impl FrameBuffer {
@@ -501,7 +507,7 @@ impl FrameHeader {
 // ------------ WrHdl ------------------------------------------------------------------------------
 
 /// Exclusive frame write-handle
-pub(super) struct WrHdl<'pager> {
+pub(crate) struct WrHdl<'pager> {
     pub(super) buf: &'pager mut [u8; PAGE_SIZE],
     frame:          &'pager FrameHeader,
     frame_inner:    LatchWriteGuard<'pager, FrameInner>,
@@ -546,7 +552,7 @@ impl<'pager> WrHdl<'pager> {
 // ------------ RdHdl ------------------------------------------------------------------------------
 
 /// Shared frame read-handle
-pub(super) struct RdHdl<'pager> {
+pub(crate) struct RdHdl<'pager> {
     frame:          &'pager FrameHeader,
     frame_inner:    LatchReadGuard<'pager, FrameInner>,
     pub(super) buf: &'pager [u8; PAGE_SIZE],
@@ -569,7 +575,7 @@ impl<'pager> RdHdl<'pager> {
 // -------------------------------------------------------------------------------------------------
 
 #[derive(Clone, Copy)]
-pub(super) enum Durability {
+pub(crate) enum Durability {
     /// New pages will reside in the page buffer and be marked them as dirty, but no IO operations
     /// will be done - they will be lazily written out by evictions or by explicit flush calls
     Lazy,
@@ -585,11 +591,11 @@ impl<'tx> ReadTx<'tx> {
     }
 }
 
-pub(super) trait PageReader<'tx> {
+pub(crate) trait PageReader<'tx> {
     fn get_page_read(&self, pgid: u64) -> Result<RdHdl<'tx>, PagerErr>;
 }
 
-pub(super) trait PageWriter<'tx> {
+pub(crate) trait PageWriter<'tx> {
     /// This will give a writeable page from a requested `pgid`, which can mean one of two things
     /// - This `pgid` is from a prev tx, in which case we will copy `pgid`'s frame's contents
     ///    to a new page, and return that new page
@@ -673,8 +679,8 @@ mod tx_registry {
 //                                                               .▀  ▀ ▀▀▀  ▀  ▀ ▀▀▀▀▀•  ▀▀▀ •▀▀ ▀▀
 // -------------------------------------------------------------------------------------------------
 
-pub(super) struct ReadTx<'tx> {
-    pager:      &'tx Pager,
+pub(crate) struct ReadTx<'tx> {
+    pager:      &'tx StorageManager,
     superblock: SuperblockHeader,
 }
 
@@ -685,7 +691,7 @@ impl Drop for ReadTx<'_> {
 }
 
 impl ReadTx<'_> {
-    pub(super) fn get_catalog_root_pgid(&self) -> u64 {
+    pub(crate) fn get_catalog_root_pgid(&self) -> u64 {
         self.superblock.pgid_catalog.get()
     }
 }
@@ -704,8 +710,8 @@ impl<'tx> PageReader<'tx> for ReadTx<'tx> {
 //                                                             ▀▀▀▀ ▀▪.▀  ▀▀▀▀ ▀▀▀  ▀▀▀  ▀▀▀ •▀▀ ▀▀
 // -------------------------------------------------------------------------------------------------
 
-pub(super) struct WriteTx<'tx> {
-    pager:           &'tx Pager,
+pub(crate) struct WriteTx<'tx> {
+    pager:           &'tx StorageManager,
     superblock:      SuperblockHeader,
     /// This gets set after successful commit, to stop some drop cleanup stuff from happening
     not_commited:    bool,
@@ -720,6 +726,7 @@ pub(super) struct WriteTx<'tx> {
     // to check if a given page was created by us (in `get_page_write`).
     // TODO well have to think about this once we implement in-tx spill as well
     pages_allocated: MutexGuard<'tx, FxHashMap<u64, usize>>,
+    page_limit:      usize,
 }
 
 impl Drop for WriteTx<'_> {
@@ -739,24 +746,20 @@ impl Drop for WriteTx<'_> {
 }
 
 impl<'tx> WriteTx<'tx> {
-    // TEMP
-    pub(super) fn freelistpgid(&self) -> u64 {
-        self.superblock.pgid_freelist.get()
-    }
-
-    pub(super) fn get_txid(&self) -> u64 {
+    pub(crate) fn get_txid(&self) -> u64 {
         self.superblock.txid.get()
     }
 
-    pub(super) fn get_catalog_root_pgid(&self) -> u64 {
+    pub(crate) fn get_catalog_root_pgid(&self) -> u64 {
         self.superblock.pgid_catalog.get()
     }
 
-    pub(super) fn set_catalog_root_pgid(&mut self, pgid: u64) {
+    pub(crate) fn set_catalog_root_pgid(&mut self, pgid: u64) {
         self.superblock.pgid_catalog.set(pgid);
     }
 
-    pub(super) fn commit(mut self, durability: Durability) -> Result<(), PagerErr> {
+    pub(crate) fn commit(mut self, durability: Durability) -> Result<(), PagerErr> {
+        eprintln!("used {}", self.pages_allocated.len());
         let (should_write, should_fsync) = match durability {
             Durability::Lazy => (false, false),
             Durability::Flush => (true, false),
@@ -925,6 +928,11 @@ impl<'tx> PageWriter<'tx> for WriteTx<'tx> {
 
     /// Bump allocates - also adds page to our dirty-page linked list
     fn get_page_alloc<'op>(&'op mut self) -> Result<WrHdl<'tx>, PagerErr> {
+        mooo_assert!(
+            self.pages_allocated.len() < self.page_limit,
+            "write_tx must fit within {} pages at current page-buffer size",
+            self.page_limit
+        );
         let pgid = match self.freelist_prev_next()? {
             Some(entry) => {
                 let pgid = entry.pgid.get();
@@ -939,6 +947,7 @@ impl<'tx> PageWriter<'tx> for WriteTx<'tx> {
 
         let whdl = self.pager.get_frame_write_pgid(pgid)?;
         self.pages_allocated.insert(pgid, whdl.frame.index);
+
         Ok(whdl)
     }
 

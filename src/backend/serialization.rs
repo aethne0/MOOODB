@@ -8,8 +8,8 @@ use crate::mooo_assert;
 
 // ------------ Common Page Header Prefix ----------------------------------------------------------
 
-pub(super) const PAGE_HEADER_SIZE: u16 = 0x40;
-pub(super) const END_OF_PAGE: u16 = PAGE_SIZE as u16 - 1;
+pub(crate) const PAGE_HEADER_SIZE: u16 = 0x40;
+pub(crate) const END_OF_PAGE: u16 = PAGE_SIZE as u16 - 1;
 
 /// The first 32 bytes of every page on disk, regardless of page type.
 ///
@@ -22,20 +22,20 @@ pub(super) const END_OF_PAGE: u16 = PAGE_SIZE as u16 - 1;
 /// ```
 #[derive(Clone)]
 #[repr(C)]
-pub(super) struct PagePrefix {
-    pub(super) checksum: SerializedU64,
-    pub(super) pgid:     SerializedU64,
-    pub(super) txid:     SerializedU64,
-    pub(super) pgtype:   SerializedU64,
+pub(crate) struct PagePrefix {
+    pub(crate) checksum: SerializedU64,
+    pub(crate) pgid:     SerializedU64,
+    pub(crate) txid:     SerializedU64,
+    pub(crate) pgtype:   SerializedU64,
 }
 unsafe impl Serialized for PagePrefix {}
 
 /// Where to start checksumming, we want to compute checksum using only the bytes AFTER the
 /// checksum, or else writing the checksum itself will invalidate itself.
-pub(super) const CHECKSUM_START_OFFSET: usize = offset_of!(PagePrefix, pgid);
+pub(crate) const CHECKSUM_START_OFFSET: usize = offset_of!(PagePrefix, pgid);
 
 impl PagePrefix {
-    pub(super) fn new(pgid: u64, checksum: u64, txid: u64, pgtype: SerializedU64) -> Self {
+    pub(crate) fn new(pgid: u64, checksum: u64, txid: u64, pgtype: SerializedU64) -> Self {
         Self {
             checksum: checksum.into(),
             pgid:     pgid.into(),
@@ -49,17 +49,17 @@ impl PagePrefix {
 
 #[derive(Debug, Clone, Copy)]
 #[repr(C)]
-pub(super) struct FreeEntry {
-    pub(super) txid: SerializedU64,
-    pub(super) pgid: SerializedU48,
+pub(crate) struct FreeEntry {
+    pub(crate) txid: SerializedU64,
+    pub(crate) pgid: SerializedU48,
 }
 
 impl FreeEntry {
-    pub(super) fn new(txid: impl Into<SerializedU64>, pgid: impl Into<SerializedU48>) -> Self {
+    pub(crate) fn new(txid: impl Into<SerializedU64>, pgid: impl Into<SerializedU48>) -> Self {
         Self { txid: txid.into(), pgid: pgid.into() }
     }
 
-    pub(super) fn txid_bound(txid: impl Into<SerializedU64>) -> Self {
+    pub(crate) fn txid_bound(txid: impl Into<SerializedU64>) -> Self {
         Self { txid: txid.into(), pgid: 0.into() }
     }
 }
@@ -70,28 +70,28 @@ unsafe impl Serialized for FreeEntry {}
 /// most-significant 48 bits are pgid, lower are slot
 #[derive(Clone, Copy, PartialEq, Eq)]
 #[repr(C)]
-pub(super) struct HeapPtr(SerializedU64);
+pub(crate) struct HeapPtr(SerializedU64);
 impl HeapPtr {
-    pub(super) fn new(pgid: u64, slot_index: u16) -> Self {
+    pub(crate) fn new(pgid: u64, slot_index: u16) -> Self {
         mooo_assert!(pgid_valid(pgid));
         let val = (pgid << 16) | (slot_index as u64);
         Self(val.into())
     }
 
-    pub(super) fn set_pgid(&mut self, pgid: u64) {
+    pub(crate) fn set_pgid(&mut self, pgid: u64) {
         mooo_assert!(pgid_valid(pgid));
         self.0 = ((pgid << 16) | (self.0.get() & 0xffff)).into();
     }
 
-    pub(super) fn set_slot(&mut self, slot_index: u16) {
+    pub(crate) fn set_slot(&mut self, slot_index: u16) {
         self.0 = ((self.0.get() & 0xffff_ffff_ffff_0000) | (slot_index as u64)).into();
     }
 
-    pub(super) fn pgid(&self) -> u64 {
+    pub(crate) fn pgid(&self) -> u64 {
         (self.0.get() & 0xffff_ffff_ffff_0000) >> 16
     }
 
-    pub(super) fn slot(&self) -> u16 {
+    pub(crate) fn slot(&self) -> u16 {
         (self.0.get() & 0xffff) as u16
     }
 }
@@ -117,7 +117,7 @@ impl Into<SerializedU64> for HeapPtr {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(transparent)]
-pub(super) struct SerializedU64(pub(super) [u8; 8]);
+pub(crate) struct SerializedU64(pub(crate) [u8; 8]);
 unsafe impl Serialized for SerializedU64 {}
 
 impl PartialOrd for SerializedU64 {
@@ -133,11 +133,11 @@ impl Ord for SerializedU64 {
 }
 
 impl SerializedU64 {
-    pub(super) const fn get(&self) -> u64 {
+    pub(crate) const fn get(&self) -> u64 {
         u64::from_be_bytes(self.0)
     }
 
-    pub(super) fn set(&mut self, val: u64) {
+    pub(crate) fn set(&mut self, val: u64) {
         self.0 = val.to_be_bytes();
     }
 }
@@ -162,7 +162,7 @@ impl Display for SerializedU64 {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(transparent)]
-pub(super) struct SerializedU32([u8; 4]);
+pub(crate) struct SerializedU32([u8; 4]);
 unsafe impl Serialized for SerializedU32 {}
 
 impl PartialOrd for SerializedU32 {
@@ -178,11 +178,11 @@ impl Ord for SerializedU32 {
 }
 
 impl SerializedU32 {
-    pub(super) const fn get(&self) -> u32 {
+    pub(crate) const fn get(&self) -> u32 {
         u32::from_be_bytes(self.0)
     }
 
-    pub(super) fn set(&mut self, val: u32) {
+    pub(crate) fn set(&mut self, val: u32) {
         self.0 = val.to_be_bytes();
     }
 }
@@ -207,7 +207,7 @@ impl Display for SerializedU32 {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(transparent)]
-pub(super) struct SerializedU16([u8; 2]);
+pub(crate) struct SerializedU16([u8; 2]);
 unsafe impl Serialized for SerializedU16 {}
 
 impl PartialOrd for SerializedU16 {
@@ -223,11 +223,11 @@ impl Ord for SerializedU16 {
 }
 
 impl SerializedU16 {
-    pub(super) const fn get(&self) -> u16 {
+    pub(crate) const fn get(&self) -> u16 {
         u16::from_be_bytes(self.0)
     }
 
-    pub(super) fn set(&mut self, val: u16) {
+    pub(crate) fn set(&mut self, val: u16) {
         self.0 = val.to_be_bytes();
     }
 }
@@ -250,7 +250,7 @@ impl Display for SerializedU16 {
 /// serialized form.
 /// # SAFETY
 /// POD `#[repr(C)]` or `#[repr(transparent)]` only!!
-pub(super) unsafe trait Serialized: Sized {
+pub(crate) unsafe trait Serialized: Sized {
     fn as_bytes(&self) -> &[u8] {
         unsafe { std::slice::from_raw_parts(self as *const Self as *const u8, size_of::<Self>()) }
     }
@@ -287,7 +287,7 @@ pub(super) unsafe trait Serialized: Sized {
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 #[repr(transparent)]
-pub(super) struct SerializedU48(pub(super) [u8; 6]);
+pub(crate) struct SerializedU48(pub(crate) [u8; 6]);
 unsafe impl Serialized for SerializedU48 {}
 
 const U48MAX: u64 = 0xffff_ffff_ffff;
@@ -305,13 +305,13 @@ impl Ord for SerializedU48 {
 }
 
 impl SerializedU48 {
-    pub(super) fn get(&self) -> u64 {
+    pub(crate) fn get(&self) -> u64 {
         let mut buf = [0u8; 8];
         buf[2..].copy_from_slice(&self.0);
         u64::from_be_bytes(buf)
     }
 
-    pub(super) fn set(&mut self, val: u64) {
+    pub(crate) fn set(&mut self, val: u64) {
         assert!(val <= U48MAX);
         self.0.copy_from_slice(&val.to_be_bytes()[2..]);
     }

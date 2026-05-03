@@ -5,7 +5,7 @@
 //  ▀▀▀  ▀▀▀  ▀▀▀▀  ▀▀▀  ▀▀▀▀
 use std::env::current_dir;
 use std::fs::File;
-use std::fs::OpenOptions;
+use std::os::unix::fs::OpenOptionsExt;
 use std::time::Instant;
 
 use rand::rngs::ChaCha8Rng;
@@ -15,14 +15,10 @@ use rand::SeedableRng;
 
 use super::btree::Btree;
 use super::*;
+use crate::KiB;
+use crate::MiB;
 use crate::util::fmt_bytes;
 use crate::util::fmt_size;
-
-fn f_opts() -> OpenOptions {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.create(true).write(true).truncate(true).read(true);
-    opts
-}
 
 fn get_rand() -> ChaCha8Rng {
     ChaCha8Rng::seed_from_u64(0x1eaf_1eaf_1eaf_1eaf)
@@ -43,13 +39,8 @@ fn testfile() -> File {
     path.push(".test_dbs");
     std::fs::create_dir_all(&path).unwrap();
     path.push(format!("{}.moo", test_name));
-    std::fs::OpenOptions::new()
-        .read(true)
-        .truncate(true)
-        .create(true)
-        .write(true)
-        .open(&path)
-        .unwrap()
+    let mut opts = std::fs::OpenOptions::new();
+    opts.read(true).write(true).truncate(true).custom_flags(libc::O_DIRECT).open(&path).unwrap()
 }
 
 // ------------ Tests ------------------------------------------------------------------------------
@@ -59,7 +50,7 @@ fn deletoid_small() {
     eprintln!("");
     const SIZE: usize = 16 * 1024 * 1024;
     const FRAME_CNT: usize = SIZE / PAGE_SIZE;
-    let mgr = Pager::new(FRAME_CNT, testfile()).unwrap();
+    let mgr = StorageManager::new(FRAME_CNT, testfile()).unwrap();
 
     let mut rng = get_rand();
 
@@ -148,7 +139,7 @@ fn cursoroid() {
     eprintln!("");
     const SIZE: usize = 64 * 1024 * 1024;
     const FRAME_CNT: usize = SIZE / PAGE_SIZE;
-    let mgr = Pager::new(FRAME_CNT, testfile()).unwrap();
+    let mgr = StorageManager::new(FRAME_CNT, testfile()).unwrap();
 
     let mut rng = get_rand();
 
@@ -198,7 +189,7 @@ fn deletoid_2() {
     eprintln!("");
     const SIZE: usize = 8 * 1024 * 1024 * 1024;
     const FRAME_CNT: usize = SIZE / PAGE_SIZE;
-    let mgr = Pager::new(FRAME_CNT, testfile()).unwrap();
+    let mgr = StorageManager::new(FRAME_CNT, testfile()).unwrap();
 
     let mut rng = get_rand();
 
@@ -261,20 +252,20 @@ fn deletoid_2() {
 #[test]
 fn insertoid() {
     eprintln!("");
-    const SIZE: usize = 1024 * 1024 * 1024;
+    const SIZE: usize = MiB!(256);
     const FRAME_CNT: usize = SIZE / PAGE_SIZE;
-    let mgr = Pager::new(FRAME_CNT, testfile()).unwrap();
+    let mgr = StorageManager::new(FRAME_CNT, testfile()).unwrap();
 
     let mut rng = get_rand();
 
     const KEY_SIZE: usize = 22;
     const VAL_MASK: u64 = 0xffff_0000_0000_ffff;
 
-    const TX_CNT: usize = 10;
-    const INSERTS_PER_TX: usize = 50;
+    const TX_CNT: usize = 100;
+    const INSERTS_PER_TX: usize = 1000;
     const _CNT: usize = TX_CNT * INSERTS_PER_TX;
 
-    let dur = Durability::Flush;
+    let dur = Durability::Sync;
 
     {
         let mut tx = mgr.write_tx();

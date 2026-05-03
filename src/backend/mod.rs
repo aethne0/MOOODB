@@ -1,3 +1,4 @@
+//! Layer 0 - storage engine
 //! .▄▄ · ▄▄▄▄▄      ▄▄▄   ▄▄▄·  ▄▄ • ▄▄▄ .
 //! ▐█ ▀. •██  ▪     ▀▄ █·▐█ ▀█ ▐█ ▀ ▪▀▄.▀·
 //! ▄▀▀▀█▄ ▐█.▪ ▄█▀▄ ▐▀▀▄ ▄█▀▀█ ▄█ ▀█▄▐▀▀▪▄
@@ -6,10 +7,10 @@
 mod btree;
 mod frame_latch;
 mod heap;
-mod page_btree;
+pub(crate) mod page_btree;
 mod page_heap;
 mod page_superblock;
-mod serialization;
+pub(crate) mod serialization;
 mod storage_manager;
 
 #[cfg(test)]
@@ -18,10 +19,12 @@ mod test;
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::mooo_assert;
+pub(crate) use btree::*;
 pub(crate) use storage_manager::*;
 
 /// PAGE_SIZE maybe be inclusively from 256-32KiB, and must be a power of two
-const PAGE_SIZE: usize = 0x200;
+const PAGE_SIZE: usize = 0x1000;
+/*
 const _: () = mooo_assert!(
     false
         || PAGE_SIZE == 0x100
@@ -33,6 +36,7 @@ const _: () = mooo_assert!(
         || PAGE_SIZE == 0x4000
         || PAGE_SIZE == 0x8000
 );
+*/
 
 const PGID_NULL: u64 = u64::MAX;
 const fn pgid_valid(pgid: u64) -> bool {

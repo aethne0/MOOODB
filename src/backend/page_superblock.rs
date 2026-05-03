@@ -61,12 +61,12 @@ static COWS_AND_SUCH: [[u8; ART_SIZE]; 5] = [
 pub(super) fn copy_superblock_to_page(buf: &mut [u8; PAGE_SIZE], sb_header: &SuperblockHeader) {
     mooo_assert!(PAGE_SIZE - size_of::<SuperblockHeader>() >= ART_SIZE);
     sb_header.write_to_prefix(buf);
-    buf[size_of::<SuperblockHeader>()..PAGE_SIZE - ART_SIZE].fill(0);
+    buf[size_of::<SuperblockHeader>()..].fill(0);
     // insanely high performance branchless cow ascii art writer
     let id = sb_header.txid.get();
     let is_frog = (hash_u64_modulo(id, 256) == 57) as usize;
     let cow_index = hash_u64_modulo(id, 4) as usize;
     let index = cow_index * (1 - is_frog) + 4 * is_frog;
     // writes to end of page
-    buf[PAGE_SIZE - ART_SIZE..].copy_from_slice(&COWS_AND_SUCH[index]);
+    buf[128..128 + ART_SIZE].copy_from_slice(&COWS_AND_SUCH[index]);
 }
