@@ -1,12 +1,3 @@
-// TODO all these unsafe bits should just be one method that gets the index and the &but at the same
-// time to ensure its safe
-//
-// TODO on a IO failure of any kinda during a write-tx we should abort and then truncate (were
-// actually doing this but it needs to be improved)
-//
-// TODO we need some sort of "spill" for mega-huge write-tx's where the working set cant fit in
-// memory - right now tests can stall easily if they do a larger than memory initial write-set
-
 use std::cell::RefCell;
 use std::cell::UnsafeCell;
 use std::fs::File;
@@ -166,16 +157,16 @@ impl StorageManager {
         tx_registry::register(superblock.txid.get());
 
         WriteTx {
-            pager:           self,
-            superblock:      superblock,
-            not_commited:    true,
-            file_size_prev:  file_size_prev,
-            pages_allocated: lock,
-            fl_prev_crs:     RefCell::new(freelist_cursor.clone()),
-            fl_prev_lag_crs: RefCell::new(freelist_cursor),
-            fl_prev_lag_cnt: 0,
-            pgid_freed_head: PGID_NULL,
-            page_limit:      self.frames.len() / 2,
+            pager:                 self,
+            superblock:            superblock,
+            not_commited:          true,
+            file_size_prev:        file_size_prev,
+            pages_allocated:       lock,
+            fl_prev_crs:           RefCell::new(freelist_cursor.clone()),
+            fl_prev_lag_crs:       RefCell::new(freelist_cursor),
+            fl_prev_lag_cnt:       0,
+            pgid_freed_head:       PGID_NULL,
+            pages_allocated_limit: self.frames.len() / 2,
         }
     }
 
@@ -711,22 +702,22 @@ impl<'tx> PageReader<'tx> for ReadTx<'tx> {
 // -------------------------------------------------------------------------------------------------
 
 pub(crate) struct WriteTx<'tx> {
-    pager:           &'tx StorageManager,
-    superblock:      SuperblockHeader,
+    pager:                 &'tx StorageManager,
+    superblock:            SuperblockHeader,
     /// This gets set after successful commit, to stop some drop cleanup stuff from happening
-    not_commited:    bool,
+    not_commited:          bool,
     /// For cleaning up pages that were spilled before commit, in the event of cancellation
-    file_size_prev:  u64,
-    fl_prev_crs:     RefCell<Cursor>,
-    fl_prev_lag_crs: RefCell<Cursor>,
-    fl_prev_lag_cnt: usize,
-    pgid_freed_head: u64,
+    file_size_prev:        u64,
+    pgid_freed_head:       u64,
+    fl_prev_crs:           RefCell<Cursor>,
+    fl_prev_lag_crs:       RefCell<Cursor>,
+    fl_prev_lag_cnt:       usize,
     // we could simplify this into just an array, but then wed have to do a lookup via the pager
     // every single time we wanted to use one of our own pages, and itd also be much less efficient
     // to check if a given page was created by us (in `get_page_write`).
     // TODO well have to think about this once we implement in-tx spill as well
-    pages_allocated: MutexGuard<'tx, FxHashMap<u64, usize>>,
-    page_limit:      usize,
+    pages_allocated:       MutexGuard<'tx, FxHashMap<u64, usize>>,
+    pages_allocated_limit: usize,
 }
 
 impl Drop for WriteTx<'_> {
@@ -735,6 +726,7 @@ impl Drop for WriteTx<'_> {
             for (_, &frame_index) in self.pages_allocated.iter() {
                 self.pager.abandon_allocated_frame(frame_index);
             }
+            // TODO do this properly
             self.pager
                 .file
                 .set_len(self.file_size_prev)
@@ -929,9 +921,9 @@ impl<'tx> PageWriter<'tx> for WriteTx<'tx> {
     /// Bump allocates - also adds page to our dirty-page linked list
     fn get_page_alloc<'op>(&'op mut self) -> Result<WrHdl<'tx>, PagerErr> {
         mooo_assert!(
-            self.pages_allocated.len() < self.page_limit,
+            self.pages_allocated.len() < self.pages_allocated_limit,
             "write_tx must fit within {} pages at current page-buffer size",
-            self.page_limit
+            self.pages_allocated_limit
         );
         let pgid = match self.freelist_prev_next()? {
             Some(entry) => {
