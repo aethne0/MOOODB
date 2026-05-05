@@ -63,6 +63,51 @@ pub(crate) struct StorageManager {
 unsafe impl Sync for StorageManager {}
 
 impl StorageManager {
+    pub(crate) fn open(count: usize, file: File, create: bool) -> Result<Self, PagerErr> {
+        let temp_header = SuperblockHeader::new_zeroed();
+
+        // these are all our heap allocations
+        let mut alloc_map = FxHashMap::default();
+        alloc_map.reserve(65536);
+
+        let pager = Self {
+            file:            file,
+            frames:          (0..count).map(|i| FrameHeader::new(i)).collect(),
+            pages:           (0..count).map(|_| FrameBuffer::zeros()).collect(),
+            shard_dirs:      (0..SHARD_CNT).map(|_| Mutex::new(FxHashMap::default())).collect(),
+            eviction_hand:   0.into(),
+            writer_lock:     Mutex::new(alloc_map),
+            superblock_curr: RwLock::new(temp_header),
+        };
+
+        {
+            let rhdl_1 = pager.get_frame_read_pgid(0)?;
+            let rhdl_2 = pager.get_frame_read_pgid(1)?;
+            let superblock_1 =
+                SuperblockHeader::ref_from_bytes(&rhdl_1.buf[0..size_of::<SuperblockHeader>()]);
+            let cheksum_good_1 = compute_checksum(rhdl_1.buf) == superblock_1.checksum.get();
+            let superblock_2 =
+                SuperblockHeader::ref_from_bytes(&rhdl_2.buf[0..size_of::<SuperblockHeader>()]);
+            let cheksum_good_2 = compute_checksum(rhdl_2.buf) == superblock_2.checksum.get();
+
+            let superblock = if superblock_1.txid.get() > superblock_2.txid.get() {
+                mooo_assert!(cheksum_good_1);
+                superblock_1
+            } else {
+                mooo_assert!(cheksum_good_2);
+                superblock_2
+            };
+
+            if create {
+                panic!("trying to overwrite existing db");
+            };
+
+            *pager.superblock_curr.write().unwrap() = superblock.clone();
+        }
+
+        Ok(pager)
+    }
+
     pub(crate) fn new(count: usize, file: File) -> Result<Self, PagerErr> {
         let temp_header = SuperblockHeader::new_zeroed();
 
@@ -751,7 +796,6 @@ impl<'tx> WriteTx<'tx> {
     }
 
     pub(crate) fn commit(mut self, durability: Durability) -> Result<(), PagerErr> {
-        eprintln!("used {}", self.pages_allocated.len());
         let (should_write, should_fsync) = match durability {
             Durability::Lazy => (false, false),
             Durability::Flush => (true, false),

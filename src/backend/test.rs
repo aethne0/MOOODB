@@ -5,7 +5,9 @@
 //  ▀▀▀  ▀▀▀  ▀▀▀▀  ▀▀▀  ▀▀▀▀
 use std::env::current_dir;
 use std::fs::File;
+use std::hint::black_box;
 use std::os::unix::fs::OpenOptionsExt;
+use std::path::PathBuf;
 use std::time::Instant;
 
 use rand::rngs::ChaCha8Rng;
@@ -15,10 +17,9 @@ use rand::SeedableRng;
 
 use super::btree::Btree;
 use super::*;
-use crate::KiB;
-use crate::MiB;
 use crate::util::fmt_bytes;
 use crate::util::fmt_size;
+use crate::MiB;
 
 fn get_rand() -> ChaCha8Rng {
     ChaCha8Rng::seed_from_u64(0x1eaf_1eaf_1eaf_1eaf)
@@ -31,6 +32,10 @@ fn rfill(buf: &mut [u8], rng: &mut ChaCha8Rng) {
     for b in buf.iter_mut() {
         *b = (*b % RANGE) + 0x61;
     }
+}
+
+fn rfill_raw(buf: &mut [u8], rng: &mut ChaCha8Rng) {
+    rng.fill_bytes(buf);
 }
 
 fn testfile() -> File {
@@ -251,18 +256,17 @@ fn deletoid_2() {
 
 #[test]
 fn insertoid() {
-    eprintln!("");
-    const SIZE: usize = MiB!(256);
+    const SIZE: usize = MiB!(4096);
     const FRAME_CNT: usize = SIZE / PAGE_SIZE;
     let mgr = StorageManager::new(FRAME_CNT, testfile()).unwrap();
 
     let mut rng = get_rand();
 
-    const KEY_SIZE: usize = 22;
+    const KEY_SIZE: usize = 128;
     const VAL_MASK: u64 = 0xffff_0000_0000_ffff;
 
-    const TX_CNT: usize = 100;
-    const INSERTS_PER_TX: usize = 1000;
+    const TX_CNT: usize = 10_000;
+    const INSERTS_PER_TX: usize = 20;
     const _CNT: usize = TX_CNT * INSERTS_PER_TX;
 
     let dur = Durability::Sync;
@@ -276,16 +280,14 @@ fn insertoid() {
 
     let start = Instant::now();
 
-    for _ in 0..TX_CNT {
+    for i in 0..TX_CNT {
         let mut tx = mgr.write_tx();
         let mut btree = Btree::from_pgid(tx.get_catalog_root_pgid());
 
         for _i in 0..=INSERTS_PER_TX {
-            let mut key = [0u8; KEY_SIZE];
-            rfill(&mut key, &mut rng);
-            let val: u64 = rng.random::<u64>() | VAL_MASK;
-            // key[0..8].copy_from_slice(&(0x8000_0000_0000_0000 - i as u64).to_be_bytes());
-            btree.insert(&mut tx, &key, &val.to_be_bytes()).unwrap();
+            let mut entry = [0u8; KEY_SIZE];
+            rfill(&mut entry, &mut rng);
+            btree.insert(&mut tx, &entry[0..KEY_SIZE / 2], &entry[KEY_SIZE / 2..]).unwrap();
         }
 
         /*
@@ -295,20 +297,30 @@ fn insertoid() {
         {}
         */
 
-        let now = Instant::now();
-        let meta = btree.meta(&tx).unwrap();
-        eprintln!(
-            "[ len {} | pages {} | pages(leaf) {} | pages(inner) {} | bytes {} ] [ {:.2} / sec ]",
-            meta.entry_cnt,
-            meta.page_cnt_total,
-            meta.page_cnt_leaf,
-            meta.page_cnt_inner,
-            fmt_size(meta.bytes as usize),
-            meta.entry_cnt as f64 / now.duration_since(start).as_secs_f64(),
-        );
-
         tx.set_catalog_root_pgid(btree.get_root_pgid());
         tx.commit(dur).unwrap();
+
+        if i % 100 == 1 {
+            let now = Instant::now();
+            /*
+            let meta = btree.meta(&tx).unwrap();
+            eprintln!(
+                "[{:04}] - [ len {} | pages {} | pages(leaf) {} | pages(inner) {} | bytes {} ] [ {:.2} / sec ]",
+                i,
+                meta.entry_cnt,
+                meta.page_cnt_total,
+                meta.page_cnt_leaf,
+                meta.page_cnt_inner,
+                fmt_size(meta.bytes as usize),
+                meta.entry_cnt as f64 / now.duration_since(start).as_secs_f64(),
+            );
+            */
+            eprintln!(
+                "[{:04}] [ {:.2} / sec ]",
+                i,
+                i as f64 / now.duration_since(start).as_secs_f64(),
+            );
+        }
 
         /*
         let tx = mgr.read_tx();
@@ -321,5 +333,58 @@ fn insertoid() {
             eprintln!("{:?}", e.key);
         }
         */
+    }
+}
+
+#[test]
+fn readbig() {
+    eprintln!("");
+    const SIZE: usize = 1024 * 1024 * 1024;
+    const FRAME_CNT: usize = SIZE / PAGE_SIZE;
+
+    let mut opts = std::fs::OpenOptions::new();
+    let file = opts.read(true).custom_flags(libc::O_DIRECT).open("/xblk/test_dbs/big.moo").unwrap();
+
+    let mgr = StorageManager::open(FRAME_CNT, file, false).unwrap();
+
+    const THREADS: usize = 16;
+
+    for threads_ in 0..=THREADS {
+        let threads = threads_.max(1);
+
+        let to_look = 16 * 1_000_00 / threads;
+        let bar_1 = std::sync::Barrier::new(threads);
+
+        let start = Instant::now();
+        std::thread::scope(|s| {
+            for _t in 0..threads {
+                s.spawn(|| {
+                    bar_1.wait();
+                    let tx = mgr.read_tx();
+                    let mut cursor = Btree::from_pgid(tx.get_catalog_root_pgid()).cursor();
+                    let mut counter = to_look;
+
+                    while let Some(res) = cursor
+                        .next(&tx, |key, val| Whatever { key: key.to_vec(), val: val.to_vec() })
+                        .unwrap()
+                    {
+                        black_box(&res);
+                        counter -= 1;
+                        if counter == 0 {
+                            break;
+                        }
+                    }
+                });
+            }
+        });
+
+        let end = Instant::now();
+        eprintln!(
+            "{} reads in {:.03}s | {:.0} / sec | {} threads",
+            threads * to_look,
+            end.duration_since(start).as_secs_f64(),
+            (threads * to_look) as f64 / end.duration_since(start).as_secs_f64(),
+            threads,
+        );
     }
 }
