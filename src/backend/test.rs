@@ -7,7 +7,6 @@ use std::env::current_dir;
 use std::fs::File;
 use std::hint::black_box;
 use std::os::unix::fs::OpenOptionsExt;
-use std::path::PathBuf;
 use std::time::Instant;
 
 use rand::rngs::ChaCha8Rng;
@@ -18,7 +17,6 @@ use rand::SeedableRng;
 use super::btree::Btree;
 use super::*;
 use crate::util::fmt_bytes;
-use crate::util::fmt_size;
 use crate::MiB;
 
 fn get_rand() -> ChaCha8Rng {
@@ -359,7 +357,7 @@ fn readbig() {
     for threads_ in 0..=THREADS {
         let threads = threads_.max(1);
 
-        let to_look = 16 * 2_000_00 / threads;
+        let to_look = THREADS * 200000 / threads;
         let bar_1 = std::sync::Barrier::new(threads);
 
         let start = Instant::now();

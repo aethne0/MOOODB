@@ -168,18 +168,14 @@ impl StorageManager {
 
     #[must_use = "RAII ReadTxHdl releases when dropped"]
     pub(crate) fn read_tx<'tx>(&'tx self) -> ReadTx<'tx> {
-        let superblock = {
-            // we need to hold this guard while we put our value in the registry
-            let curr_guard = self.superblock_curr.read().expect("todo");
-            let current = curr_guard.clone();
+        // we need to hold this guard while we put our value in the registry
+        let curr_guard = self.superblock_curr.read().expect("todo");
+        let curr_superblock = curr_guard.clone();
 
-            let txid = current.txid.get();
-            tx_registry::register(txid);
+        let txid = curr_superblock.txid.get();
+        let registry_idx = tx_registry::register(txid);
 
-            current
-        };
-
-        ReadTx { pager: self, superblock }
+        ReadTx { pager: self, superblock: curr_superblock, registry_idx: registry_idx }
     }
 
     #[must_use = "RAII WriteTxHdl releases when dropped"]
@@ -199,11 +195,14 @@ impl StorageManager {
         let file_size_prev = self.file.metadata().expect("todo").len();
         let freelist_cursor = Btree::from_pgid(freelist_pgid.get()).cursor();
 
-        tx_registry::register(superblock.txid.get());
+        // it is safe for us to register here without holding the superblock RWLock, because we have
+        // the writer-lock and we know nobody else will be reading from the registry
+        let registry_idx = tx_registry::register(superblock.txid.get());
 
         WriteTx {
             pager:                 self,
             superblock:            superblock,
+            registry_idx:          registry_idx,
             not_commited:          true,
             file_size_prev:        file_size_prev,
             pages_allocated:       lock,
@@ -656,52 +655,76 @@ pub(crate) trait PageWriter<'tx> {
 //  Thread-local Tx Registry                ▐█▌·▪▐█·█▌    ▐█•█▌▐█▄▄▌▐█▄▪▐█▐█▌▐█▄▪▐█ ▐█▌·▐█•█▌ ▐█▀·.
 //                                          ▀▀▀ •▀▀ ▀▀    .▀  ▀ ▀▀▀ ·▀▀▀▀ ▀▀▀ ▀▀▀▀  ▀▀▀ .▀  ▀  ▀ •
 // -------------------------------------------------------------------------------------------------
-
+/// This is our mechanism for keeping track of live txs that are "relying" on a certain txid for
+/// their tx. We support 64 threads accessing at any given time, beyond that threads will spin
+/// waiting for a slot.
+///
+/// We have a u64 `FREE_SLOT_BITMASK` which is a bitmask of indicies in `TXID_SLOTS` that are unused
+/// by any threads currently. 1 bit signifies "used". At registration a thread will try to CAS a bit
+/// from 0->1 "claiming" that slot. For deregistration we simply atomically mask the bit back to 0.
+///
+/// After claiming a slot the thread/tx will set its slot from `NULL_TXID_HIGH` -> `txid`. Claiming
+/// a slot and doing this set are NOT atomic, so registration has to be done while holding a
+/// read/write lock on the superblock or with some other gaurantee of protection. See `write_tx` and
+/// `read_tx`.
+///
+/// A `WriteTx`, when going to free a page, will scan the entire `TXID_SLOTS` array and check the
+/// min `txid` that is being "relied upon" by a reader thread still, to avoid overwriting pages that
+/// may still be read from. Unused slots are set to `TXID_NULL_HIGH` (`u64::MAX`) so they will not
+/// influence the naive min scan.
+///
+/// It is the callers responsibility to keep track of which slot they have "claimed", and to pass it
+/// back for `deregister` once they`re done.
 mod tx_registry {
     use std::sync::atomic::AtomicU64;
-    use std::sync::atomic::AtomicUsize;
     use std::sync::atomic::Ordering;
 
     use super::TXID_NULL_HIGH;
     use crate::mooo_assert;
 
-    const MAX_THREADS: usize = 256;
-    static NEXT_ID: AtomicUsize = AtomicUsize::new(0);
-    fn get_next_thread_local_index() -> usize {
-        let next = NEXT_ID.fetch_add(1, Ordering::Relaxed);
-        mooo_assert!(next < MAX_THREADS);
-        next
+    const fn mask_for_slot(slot_idx: usize) -> u64 {
+        0b1 << (63 - slot_idx)
     }
 
-    // possibly these should be spaced out for a cache-line each
-    static COUNTERS: [AtomicU64; MAX_THREADS] =
-        [const { AtomicU64::new(TXID_NULL_HIGH) }; MAX_THREADS];
-    thread_local! {
-        static THREAD_INDEX: usize = get_next_thread_local_index();
+    static FREE_SLOT_BITMASK: AtomicU64 = AtomicU64::new(0);
+    static TXID_SLOTS: [AtomicU64; 64] = [const { AtomicU64::new(TXID_NULL_HIGH) }; 64];
+
+    pub(super) fn register(txid: u64) -> usize {
+        mooo_assert!(txid != TXID_NULL_HIGH);
+
+        let slot_idx = loop {
+            let mask = FREE_SLOT_BITMASK.load(Ordering::Acquire);
+            let slot = mask.leading_ones();
+            if slot == 64 {
+                std::hint::spin_loop();
+                continue;
+            }
+            let new_mask = mask | mask_for_slot(slot as usize);
+            if FREE_SLOT_BITMASK
+                .compare_exchange(mask, new_mask, Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                break slot as usize;
+            }
+        };
+
+        let txid_old = TXID_SLOTS[slot_idx].swap(txid, Ordering::Acquire);
+        mooo_assert!(
+            txid_old == TXID_NULL_HIGH,
+            "slot's txid should have been TXID_NULL_HIGH if it wasn't registered by another thread"
+        );
+        slot_idx
     }
 
-    pub(super) fn register(tx_id: u64) {
-        mooo_assert!(tx_id != TXID_NULL_HIGH);
-        THREAD_INDEX.with(|&thread_index| {
-            COUNTERS[thread_index]
-                .compare_exchange(TXID_NULL_HIGH, tx_id, Ordering::Release, Ordering::Relaxed)
-                .expect("tried to take re-entrant read guard");
-        });
-    }
-
-    pub(super) fn deregister() {
-        THREAD_INDEX.with(|&thread_index| {
-            COUNTERS[thread_index].store(TXID_NULL_HIGH, Ordering::Release);
-        });
+    pub(super) fn deregister(slot_idx: usize) {
+        TXID_SLOTS[slot_idx].store(TXID_NULL_HIGH, Ordering::Relaxed);
+        FREE_SLOT_BITMASK.fetch_and(!mask_for_slot(slot_idx), Ordering::Release);
     }
 
     pub(super) fn get_min() -> u64 {
-        // its ok if our max index gets stale, because the new thread we didnt see will definitely
-        // have a tx_id GE to any of these
-        let count = NEXT_ID.load(Ordering::Relaxed);
         let mut earliest = TXID_NULL_HIGH;
-        for i in 0..count {
-            earliest = earliest.min(COUNTERS[i].load(Ordering::Acquire));
+        for i in 0..64 {
+            earliest = earliest.min(TXID_SLOTS[i].load(Ordering::Acquire));
         }
         earliest
     }
@@ -716,13 +739,14 @@ mod tx_registry {
 // -------------------------------------------------------------------------------------------------
 
 pub(crate) struct ReadTx<'tx> {
-    pager:      &'tx StorageManager,
-    superblock: SuperblockHeader,
+    pager:        &'tx StorageManager,
+    superblock:   SuperblockHeader,
+    registry_idx: usize,
 }
 
 impl Drop for ReadTx<'_> {
     fn drop(&mut self) {
-        tx_registry::deregister();
+        tx_registry::deregister(self.registry_idx);
     }
 }
 
@@ -749,6 +773,7 @@ impl<'tx> PageReader<'tx> for ReadTx<'tx> {
 pub(crate) struct WriteTx<'tx> {
     pager:                 &'tx StorageManager,
     superblock:            SuperblockHeader,
+    registry_idx:          usize,
     /// This gets set after successful commit, to stop some drop cleanup stuff from happening
     not_commited:          bool,
     /// For cleaning up pages that were spilled before commit, in the event of cancellation
@@ -778,7 +803,7 @@ impl Drop for WriteTx<'_> {
                 .expect("TODO couldn't truncate file during tx cancellation");
         }
 
-        tx_registry::deregister();
+        tx_registry::deregister(self.registry_idx);
     }
 }
 
