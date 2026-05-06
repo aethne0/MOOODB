@@ -249,7 +249,7 @@ impl StorageManager {
             .read_exact_at(whdl.buf, pgid * PAGE_SIZE as u64)
             .map_err(|e| PagerErr::Io(e.kind()))?;
 
-        let checksum = compute_checksum(&whdl.buf[CHECKSUM_START_OFFSET..]);
+        let checksum = compute_checksum(whdl.buf);
         let header = PagePrefix::mut_from_prefix(whdl.buf);
         let ok_checksum = header.checksum.get() == checksum;
         let ok_pgid = header.pgid.get() == pgid;
@@ -571,7 +571,7 @@ impl<'pager> WrHdl<'pager> {
         header.txid.set(txid);
 
         // Checksum must computed after other sets!
-        let checksum = compute_checksum(&self.buf[CHECKSUM_START_OFFSET..]);
+        let checksum = compute_checksum(self.buf);
         let header = PagePrefix::mut_from_prefix(self.buf);
         header.checksum.set(checksum);
     }

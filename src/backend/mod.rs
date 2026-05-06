@@ -18,7 +18,7 @@ mod test;
 
 use xxhash_rust::xxh3::xxh3_64;
 
-use crate::mooo_assert;
+use crate::{backend::serialization::CHECKSUM_START_OFFSET, mooo_assert};
 pub(crate) use btree::*;
 pub(crate) use storage_manager::*;
 
@@ -57,5 +57,5 @@ const fn hash_u64_modulo(mut pgid: u64, modulo: usize) -> usize {
 }
 
 fn compute_checksum(bytes: &[u8]) -> u64 {
-    xxh3_64(bytes)
+    xxh3_64(&bytes[CHECKSUM_START_OFFSET..])
 }

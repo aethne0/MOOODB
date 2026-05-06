@@ -45,7 +45,13 @@ fn testfile() -> File {
     std::fs::create_dir_all(&path).unwrap();
     path.push(format!("{}.moo", test_name));
     let mut opts = std::fs::OpenOptions::new();
-    opts.read(true).write(true).truncate(true).custom_flags(libc::O_DIRECT).open(&path).unwrap()
+    opts.read(true)
+        .create(true)
+        .write(true)
+        .truncate(true)
+        .custom_flags(libc::O_DIRECT)
+        .open(&path)
+        .unwrap()
 }
 
 // ------------ Tests ------------------------------------------------------------------------------
@@ -266,7 +272,7 @@ fn insertoid() {
     const VAL_MASK: u64 = 0xffff_0000_0000_ffff;
 
     const TX_CNT: usize = 10_000;
-    const INSERTS_PER_TX: usize = 20;
+    const INSERTS_PER_TX: usize = 100;
     const _CNT: usize = TX_CNT * INSERTS_PER_TX;
 
     let dur = Durability::Sync;
@@ -316,9 +322,10 @@ fn insertoid() {
             );
             */
             eprintln!(
-                "[{:04}] [ {:.2} / sec ]",
+                "[{:04}] [ {:.2} transactions / sec ] [ {:.0} entries / sec ]",
                 i,
                 i as f64 / now.duration_since(start).as_secs_f64(),
+                (i * INSERTS_PER_TX) as f64 / now.duration_since(start).as_secs_f64(),
             );
         }
 
@@ -339,7 +346,7 @@ fn insertoid() {
 #[test]
 fn readbig() {
     eprintln!("");
-    const SIZE: usize = 1024 * 1024 * 1024;
+    const SIZE: usize = 8 * 1024 * 1024 * 1024;
     const FRAME_CNT: usize = SIZE / PAGE_SIZE;
 
     let mut opts = std::fs::OpenOptions::new();
@@ -352,7 +359,7 @@ fn readbig() {
     for threads_ in 0..=THREADS {
         let threads = threads_.max(1);
 
-        let to_look = 16 * 1_000_00 / threads;
+        let to_look = 16 * 2_000_00 / threads;
         let bar_1 = std::sync::Barrier::new(threads);
 
         let start = Instant::now();
@@ -387,4 +394,63 @@ fn readbig() {
             threads,
         );
     }
+}
+
+#[test]
+fn demooid() {
+    const SIZE: usize = MiB!(256);
+    const FRAME_CNT: usize = SIZE / PAGE_SIZE;
+    let mgr = StorageManager::new(FRAME_CNT, testfile()).unwrap();
+
+    let mut rng = get_rand();
+
+    const TX_CNT: usize = 10_000;
+    const INSERTS_PER_TX: usize = 100;
+    const _CNT: usize = TX_CNT * INSERTS_PER_TX;
+
+    let dur = Durability::Sync;
+
+    {
+        let mut tx = mgr.write_tx();
+
+        let mut btree = Btree::new(&mut tx).unwrap();
+
+        for _ in 0..10 {
+            let mut key = [0u8; 6];
+            let mut val = [0u8; 24];
+            rfill(&mut key, &mut rng);
+
+            rfill(&mut val, &mut rng);
+            for char in val.iter_mut() {
+                *char -= 32;
+            }
+
+            btree.insert(&mut tx, &key, &val).unwrap();
+        }
+
+        tx.set_catalog_root_pgid(btree.get_root_pgid());
+
+        tx.commit(dur).unwrap();
+    }
+
+    let mut tx = mgr.write_tx();
+
+    let mut btree = Btree::from_pgid(tx.get_catalog_root_pgid());
+
+    for _ in 0..1 {
+        let mut key = [0u8; 6];
+        let mut val = [0u8; 24];
+        rfill(&mut key, &mut rng);
+
+        rfill(&mut val, &mut rng);
+        for char in val.iter_mut() {
+            *char -= 32;
+        }
+
+        btree.insert(&mut tx, &key, &val).unwrap();
+    }
+
+    tx.set_catalog_root_pgid(btree.get_root_pgid());
+
+    tx.commit(dur).unwrap();
 }
