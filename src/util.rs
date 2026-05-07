@@ -3,7 +3,7 @@ pub(crate) fn fmt_bytes(bytes: &[u8]) -> String {
     format!("[{}]", inner.join(" "))
 }
 
-pub(crate) fn fmt_size(size: usize) -> String {
+pub fn fmt_size(size: usize) -> String {
     if size == 0 {
         return "0B".to_string();
     }

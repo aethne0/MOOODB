@@ -20,7 +20,7 @@ enum Dir {
 
 /// It is the responsibility of the caller to update anything that points to `root_pgid`
 #[derive(Clone, Copy)]
-pub(crate) struct Btree {
+pub struct Btree {
     root_pgid: u64,
 }
 
@@ -51,7 +51,7 @@ impl Btree {
 
     /// For opening an EXISTING btree
     #[must_use]
-    pub(crate) fn from_pgid(root_pgid: u64) -> Self {
+    pub fn from_pgid(root_pgid: u64) -> Self {
         mooo_assert!(pgid_valid(root_pgid));
         Self { root_pgid }
     }
@@ -175,7 +175,7 @@ impl Btree {
         Ok(meta)
     }
 
-    pub(crate) fn cursor(&self) -> Cursor {
+    pub fn cursor(&self) -> Cursor {
         Cursor::new(self.root_pgid)
     }
 
@@ -536,6 +536,7 @@ impl Btree {
         Ok(Some(to_delete))
     }
 
+    #[must_use]
     fn try_borrow_from_sibling<'tx, R: PageReader<'tx> + PageWriter<'tx>>(
         tx: &mut R, whdl: &mut WrHdl<'tx>, whdl_parent: &mut WrHdl<'tx>, dir_to_sibling: Dir,
         slotidx_parent_to_leaf: u16,
@@ -638,9 +639,9 @@ impl Btree {
 // NOTE: cursors do not hold any pins, pin-holding for optimization should be done at the tx level
 
 #[derive(Clone)]
-pub(crate) struct Cursor {
+pub struct Cursor {
     pub(super) btree: Btree,
-    traversal:        FixedArray<(u64, u16), TRAVERSAL_LENGTH>, // TODO could store frame idx
+    traversal:        FixedArray<(u64, u16), TRAVERSAL_LENGTH>,
     slot_idx:         u16,
     needs_page_adv:   bool,
     is_exhausted:     bool,
@@ -669,16 +670,72 @@ impl<'tx> Cursor {
         self.is_exhausted = false;
     }
 
-    pub(crate) fn seek<R: PageReader<'tx>, T>(
-        &mut self, _tx: &R, _read_into_owned: impl FnOnce(&[u8], &[u8]) -> T,
-    ) -> Result<Option<T>, PagerErr> {
-        // this is complicated - we should pop the stack only as much as we need to to get to our
-        // sought key
-        todo!()
+    // TODO this cursor is all fucked up because we don't just initialize when its constructed, but
+    // we shouldnt really anyway because we don't want to assume the caller is going to seek the
+    // start position
+
+    // TODO
+    pub fn seek_first<R: PageReader<'tx>>(&mut self, tx: &R) -> Result<bool, PagerErr> {
+        self.seek(tx, b"")
+    }
+
+    /// Positions the cursor at the first entry >= `key`.
+    /// Returns `true` if the key was matched exactly, `false` if positioned at the next entry.
+    /// If no entry >= `key` exists, the cursor is exhausted and `false` is returned.
+    pub fn seek<R: PageReader<'tx>>(&mut self, tx: &R, key: &[u8]) -> Result<bool, PagerErr> {
+        self.reinit();
+
+        if self.btree.root_pgid == PGID_NULL {
+            self.is_exhausted = true;
+            return Ok(false);
+        }
+
+        let mut next_pgid = self.btree.root_pgid;
+        let leaf_rhdl = loop {
+            let rhdl = tx.get_page_read(next_pgid)?;
+            let curr_page = BtreePage::from_buffer_ref(rhdl.buf);
+
+            match curr_page.get_page_type() {
+                BtreePageType::Inner => {
+                    let (pgid_entry, slot) = curr_page.get_traversal_next_page(key).unwrap();
+                    next_pgid = pgid_from_bytes(pgid_entry);
+                    self.traversal.push((rhdl.get_pgid(), slot));
+                }
+                BtreePageType::Leaf => {
+                    self.traversal.push((rhdl.get_pgid(), SLOT_INDEX_NULL));
+                    break rhdl;
+                }
+            }
+        };
+
+        let leaf_page = BtreePage::from_buffer_ref(leaf_rhdl.buf);
+        match leaf_page.find_slot_from_key(key) {
+            SearchResult::Found(slot_idx) => {
+                self.slot_idx = slot_idx;
+                Ok(true)
+            }
+            SearchResult::NotFound(slot_idx) => {
+                self.slot_idx = slot_idx;
+                Ok(false)
+            }
+            // key > all entries on this leaf; it falls in a gap before the next leaf
+            SearchResult::Right => {
+                let leaf_len = leaf_page.len();
+                drop(leaf_page);
+                drop(leaf_rhdl);
+                if leaf_len == 0 {
+                    self.is_exhausted = true;
+                    return Ok(false);
+                }
+                self.slot_idx = leaf_len - 1;
+                self.advance_and_check_exhausted(tx)?;
+                Ok(false)
+            }
+        }
     }
 
     /// visits current entry but does not advance cursor head
-    pub(crate) fn peek<R: PageReader<'tx>, T>(
+    pub fn peek<R: PageReader<'tx>, T>(
         &mut self, tx: &R, read_into_owned: impl FnOnce(&[u8], &[u8]) -> T,
     ) -> Result<Option<T>, PagerErr> {
         // This will only be Some if we were uninitialized
@@ -697,6 +754,10 @@ impl<'tx> Cursor {
             return Ok(None);
         }
 
+        if self.traversal.len() == 0 {
+            self.seek_first(tx)?;
+        }
+
         let (pgid, _) = *self.traversal.last_ref();
         let rhdl = rhdl_opt.unwrap_or(tx.get_page_read(pgid)?);
         let page = BtreePage::from_buffer_ref(rhdl.buf);
@@ -706,16 +767,25 @@ impl<'tx> Cursor {
     }
 
     /// advances then visits
-    pub(crate) fn next<T, R: PageReader<'tx>>(
+    pub fn next<T, R: PageReader<'tx>>(
         &mut self, tx: &R, read_into_owned: impl FnOnce(&[u8], &[u8]) -> T,
     ) -> Result<Option<T>, PagerErr> {
-        let Some(rhdl) = self.advance_and_check_exhausted(tx)? else {
+        if self.is_exhausted {
             return Ok(None);
-        };
+        }
 
+        if self.traversal.len() == 0 {
+            self.seek_first(tx)?;
+        }
+
+        let rhdl = tx.get_page_read(self.traversal.last_ref().0)?;
         let page = BtreePage::from_buffer_ref(rhdl.buf);
         let (key, val) = page.key_val_slices_from_slot(self.slot_idx);
-        Ok(Some(read_into_owned(key, val)))
+        let res = Ok(Some(read_into_owned(key, val)));
+
+        self.advance_and_check_exhausted(tx)?;
+
+        res
     }
 
     /// visits current entry but does not advance cursor head

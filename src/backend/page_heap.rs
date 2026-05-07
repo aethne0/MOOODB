@@ -131,7 +131,7 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> HeapPage<Buf> {
 
     pub(super) fn delete_slot_entry(&mut self, slot_index: u16) {
         mooo_assert!(slot_index < self.len());
-        let (offset, len) = self.offset_len_from_slot(slot_index);
+        let (_offset, len) = self.offset_len_from_slot(slot_index);
 
         let del = (PAGE_HEADER_SIZE + slot_index * SLOT_SIZE) as usize;
         let end = (PAGE_HEADER_SIZE + self.len() * SLOT_SIZE) as usize;
@@ -142,7 +142,7 @@ impl<Buf: AsRef<[u8]> + AsMut<[u8]>> HeapPage<Buf> {
 
         #[cfg(debug_assertions)]
         {
-            self.raw.as_mut()[offset as usize..(offset + len) as usize].fill(0);
+            self.raw.as_mut()[_offset as usize..(_offset + len) as usize].fill(0);
             let stale = (PAGE_HEADER_SIZE + self.len() * SLOT_SIZE) as usize;
             self.raw.as_mut()[stale..stale + SLOT_SIZE as usize].fill(0);
         }

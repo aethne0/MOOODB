@@ -10,6 +10,7 @@ use std::sync::atomic::Ordering;
 use std::sync::Mutex;
 use std::sync::MutexGuard;
 use std::sync::RwLock;
+use std::time::Instant;
 
 use rustc_hash::FxHashMap;
 
@@ -40,12 +41,20 @@ const SHARD_CNT: usize = 256;
 const TXID_NULL_HIGH: u64 = u64::MAX;
 
 #[derive(Debug, Clone, Copy)]
-pub(crate) enum PagerErr {
+pub enum PagerErr {
     Io(std::io::ErrorKind),
     Integrity,
 }
 
-pub(crate) struct StorageManager {
+pub(crate) struct Stats {
+    pub(crate) page_reads:   AtomicU64,
+    pub(crate) page_writes:  AtomicU64,
+    pub(crate) cache_hits:   AtomicU64,
+    pub(crate) cache_misses: AtomicU64,
+    pub(crate) nanos_waited: AtomicU64,
+}
+
+pub struct StorageManager {
     file:            File,
     frames:          Box<[FrameHeader]>,
     pages:           Box<[FrameBuffer]>,
@@ -58,12 +67,14 @@ pub(crate) struct StorageManager {
     // we put the boxed freed-pages array in this mutex so write-txs can reuse it instead of
     // reallocating each time
     writer_lock:     Mutex<FxHashMap<u64, usize>>,
+
+    pub(crate) stats: Stats,
 }
 
 unsafe impl Sync for StorageManager {}
 
 impl StorageManager {
-    pub(crate) fn open(count: usize, file: File, create: bool) -> Result<Self, PagerErr> {
+    pub fn open(count: usize, file: File, create: bool) -> Result<Self, PagerErr> {
         let temp_header = SuperblockHeader::new_zeroed();
 
         // these are all our heap allocations
@@ -78,6 +89,13 @@ impl StorageManager {
             eviction_hand:   0.into(),
             writer_lock:     Mutex::new(alloc_map),
             superblock_curr: RwLock::new(temp_header),
+            stats:           Stats {
+                page_reads:   0.into(),
+                page_writes:  0.into(),
+                cache_hits:   0.into(),
+                cache_misses: 0.into(),
+                nanos_waited: 0.into(),
+            },
         };
 
         {
@@ -123,6 +141,13 @@ impl StorageManager {
             eviction_hand:   0.into(),
             writer_lock:     Mutex::new(alloc_map),
             superblock_curr: RwLock::new(temp_header),
+            stats:           Stats {
+                page_reads:   0.into(),
+                page_writes:  0.into(),
+                cache_hits:   0.into(),
+                cache_misses: 0.into(),
+                nanos_waited: 0.into(),
+            },
         };
 
         // page 0&1 are reserved for superblocks
@@ -167,7 +192,7 @@ impl StorageManager {
     // ------------ tx -----------------------------------------------------------------------------
 
     #[must_use = "RAII ReadTxHdl releases when dropped"]
-    pub(crate) fn read_tx<'tx>(&'tx self) -> ReadTx<'tx> {
+    pub fn read_tx<'tx>(&'tx self) -> ReadTx<'tx> {
         // we need to hold this guard while we put our value in the registry
         let curr_guard = self.superblock_curr.read().expect("todo");
         let curr_superblock = curr_guard.clone();
@@ -233,6 +258,7 @@ impl StorageManager {
             .map_err(|e| PagerErr::Io(e.kind()))
         {
             Ok(_) => {
+                self.stats.page_writes.fetch_add(1, Ordering::Relaxed);
                 whdl.frame_inner.state = FrameState::Evictable;
                 Ok(())
             }
@@ -244,9 +270,17 @@ impl StorageManager {
     fn io_read(&self, whdl: &mut WrHdl<'_>, pgid: u64) -> Result<(), PagerErr> {
         mooo_assert!(pgid_valid(pgid));
 
+        let start = Instant::now();
+
         self.file
             .read_exact_at(whdl.buf, pgid * PAGE_SIZE as u64)
             .map_err(|e| PagerErr::Io(e.kind()))?;
+        self.stats.page_reads.fetch_add(1, Ordering::Relaxed);
+
+        let end = Instant::now();
+        self.stats
+            .nanos_waited
+            .fetch_add(end.duration_since(start).as_nanos() as u64, Ordering::Relaxed);
 
         let checksum = compute_checksum(whdl.buf);
         let header = PagePrefix::mut_from_prefix(whdl.buf);
@@ -386,6 +420,7 @@ impl StorageManager {
                         }
                         Some(rhdl) => {
                             rhdl.frame.usage.fetch_add(1, Ordering::Relaxed);
+                            self.stats.cache_hits.fetch_add(1, Ordering::Relaxed);
                             return Ok(rhdl);
                         }
                     }
@@ -425,6 +460,7 @@ impl StorageManager {
                     old_dir.remove(&frame_pgid);
                     drop(old_dir);
 
+                    self.stats.cache_misses.fetch_add(1, Ordering::Relaxed);
                     self.io_read(&mut whdl, pgid)?;
 
                     whdl.frame.usage.fetch_add(1, Ordering::Relaxed);
@@ -587,7 +623,7 @@ impl<'pager> WrHdl<'pager> {
 // ------------ RdHdl ------------------------------------------------------------------------------
 
 /// Shared frame read-handle
-pub(crate) struct RdHdl<'pager> {
+pub struct RdHdl<'pager> {
     frame:          &'pager FrameHeader,
     frame_inner:    LatchReadGuard<'pager, FrameInner>,
     pub(super) buf: &'pager [u8; PAGE_SIZE],
@@ -626,7 +662,7 @@ impl<'tx> ReadTx<'tx> {
     }
 }
 
-pub(crate) trait PageReader<'tx> {
+pub trait PageReader<'tx> {
     fn get_page_read(&self, pgid: u64) -> Result<RdHdl<'tx>, PagerErr>;
 }
 
@@ -738,7 +774,7 @@ mod tx_registry {
 //                                                               .▀  ▀ ▀▀▀  ▀  ▀ ▀▀▀▀▀•  ▀▀▀ •▀▀ ▀▀
 // -------------------------------------------------------------------------------------------------
 
-pub(crate) struct ReadTx<'tx> {
+pub struct ReadTx<'tx> {
     pager:        &'tx StorageManager,
     superblock:   SuperblockHeader,
     registry_idx: usize,
@@ -751,7 +787,7 @@ impl Drop for ReadTx<'_> {
 }
 
 impl ReadTx<'_> {
-    pub(crate) fn get_catalog_root_pgid(&self) -> u64 {
+    pub fn get_catalog_root_pgid(&self) -> u64 {
         self.superblock.pgid_catalog.get()
     }
 }

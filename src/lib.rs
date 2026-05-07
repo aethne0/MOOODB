@@ -35,8 +35,8 @@
 // TODO
 #![allow(dead_code)]
 
-pub(crate) mod collections;
-pub(crate) mod util;
+pub mod collections;
+pub mod util;
 
 pub mod assert;
 pub mod backend;

@@ -7,6 +7,9 @@ use std::env::current_dir;
 use std::fs::File;
 use std::hint::black_box;
 use std::os::unix::fs::OpenOptionsExt;
+use std::sync::atomic::AtomicU64;
+use std::sync::atomic::Ordering;
+use std::time::Duration;
 use std::time::Instant;
 
 use rand::rngs::ChaCha8Rng;
@@ -17,6 +20,7 @@ use rand::SeedableRng;
 use super::btree::Btree;
 use super::*;
 use crate::util::fmt_bytes;
+use crate::util::fmt_size;
 use crate::MiB;
 
 fn get_rand() -> ChaCha8Rng {
@@ -179,6 +183,7 @@ fn cursoroid() {
     {
         let tx = mgr.read_tx();
         let mut cursor = Btree::from_pgid(tx.get_catalog_root_pgid()).cursor();
+        cursor.seek_first(&tx).unwrap();
 
         while let Some(res) =
             cursor.next(&tx, |key, val| Whatever { key: key.to_vec(), val: val.to_vec() }).unwrap()
@@ -188,6 +193,7 @@ fn cursoroid() {
     }
 }
 
+#[derive(Debug)]
 struct Whatever {
     key: Vec<u8>,
     val: Vec<u8>,
@@ -344,29 +350,36 @@ fn insertoid() {
 #[test]
 fn readbig() {
     eprintln!("");
-    const SIZE: usize = 8 * 1024 * 1024 * 1024;
+    const SIZE: usize = 64 * 1024 * 1024;
     const FRAME_CNT: usize = SIZE / PAGE_SIZE;
 
-    let mut opts = std::fs::OpenOptions::new();
-    let file = opts.read(true).custom_flags(libc::O_DIRECT).open("/xblk/test_dbs/big.moo").unwrap();
-
-    let mgr = StorageManager::open(FRAME_CNT, file, false).unwrap();
-
     const THREADS: usize = 16;
+    let mut opts = std::fs::OpenOptions::new();
 
-    for threads_ in 0..=THREADS {
-        let threads = threads_.max(1);
+    for threads in 1..=THREADS {
+        let file =
+            opts.read(true).custom_flags(libc::O_DIRECT).open("/xblk/test_dbs/big.moo").unwrap();
 
-        let to_look = THREADS * 200000 / threads;
+        let mgr = StorageManager::open(FRAME_CNT, file, false).unwrap();
+
+        let to_look = THREADS * 2_000_0 / threads;
         let bar_1 = std::sync::Barrier::new(threads);
+
+        let atom = AtomicU64::new(0);
 
         let start = Instant::now();
         std::thread::scope(|s| {
             for _t in 0..threads {
                 s.spawn(|| {
+                    let mut rng = ChaCha8Rng::seed_from_u64(atom.fetch_add(1, Ordering::Relaxed));
                     bar_1.wait();
                     let tx = mgr.read_tx();
                     let mut cursor = Btree::from_pgid(tx.get_catalog_root_pgid()).cursor();
+
+                    let mut key = [0u8; 8];
+                    rfill(&mut key, &mut rng);
+
+                    cursor.seek(&tx, &key).unwrap();
                     let mut counter = to_look;
 
                     while let Some(res) = cursor
@@ -451,4 +464,139 @@ fn demooid() {
     tx.set_catalog_root_pgid(btree.get_root_pgid());
 
     tx.commit(dur).unwrap();
+}
+
+#[test]
+fn sequential() {
+    eprintln!("");
+    const SIZE: usize = 1024 * 1024;
+    const FRAME_CNT: usize = SIZE / PAGE_SIZE;
+
+    let mut opts = std::fs::OpenOptions::new();
+    let file = opts.read(true).custom_flags(libc::O_DIRECT).open("/xblk/test_dbs/big.moo").unwrap();
+
+    eprintln!("FILE: /xblk/test_dbs/big.moo {}", fmt_size(file.metadata().unwrap().len() as usize));
+    let mgr = StorageManager::open(FRAME_CNT, file, false).unwrap();
+
+    let mut rng = ChaCha8Rng::seed_from_u64(120391245);
+
+    let mut key = [0u8; 2];
+    rfill(&mut key, &mut rng);
+
+    eprintln!("pagesize {}", fmt_size(PAGE_SIZE));
+    eprintln!("1 thread ");
+
+    eprintln!("SEQUENTIAL entries for prefix: {}\n", str::from_utf8(&key).unwrap(),);
+
+    let start = Instant::now();
+    let tx = mgr.read_tx();
+    let mut cursor = Btree::from_pgid(tx.get_catalog_root_pgid()).cursor();
+    cursor.seek(&tx, &key).unwrap();
+
+    eprintln!("(show every 10000'th entry)");
+    let mut counter = 0;
+    loop {
+        let x =
+            cursor.next(&tx, |key, val| Whatever { key: key.to_vec(), val: val.to_vec() }).unwrap();
+
+        if let Some(res) = x {
+            if res.key[0..key.len()] != key {
+                break;
+            }
+
+            black_box(&res);
+            if counter % 10000 == 0 {
+                eprintln!(
+                    "{:05}: {} -> {}",
+                    counter,
+                    unsafe { str::from_utf8_unchecked(&res.key) },
+                    unsafe { str::from_utf8_unchecked(&res.val) }
+                );
+            }
+            counter += 1;
+        }
+    }
+    let end = Instant::now();
+    eprintln!(
+        "\n{} entries took {:.2} ms",
+        counter,
+        1000.0 * end.duration_since(start).as_secs_f64()
+    );
+    let hits = mgr.stats.cache_hits.load(Ordering::Relaxed);
+    let misses = mgr.stats.cache_misses.load(Ordering::Relaxed);
+
+    eprintln!(
+        "{} page-cache hits, {} misses/loads from disk ({:.2}% hit rate)",
+        hits,
+        misses,
+        100.0 * hits as f64 / (hits + misses) as f64
+    );
+    let waited = mgr.stats.nanos_waited.load(Ordering::Relaxed) as f64 / 1000_000.0;
+    eprintln!(
+        "~{:.2} ms waited for io ({:.2}%)",
+        waited,
+        100.0 * waited / (end.duration_since(start).as_nanos() as f64 / 1000_000.0)
+    );
+    eprintln!(
+        "~{:.2} ms active",
+        (end.duration_since(start).as_nanos() as f64 / 1000_000.0) - waited
+    );
+
+    eprintln!("\n");
+}
+
+// #[test]
+fn random_batches() {
+    eprintln!("");
+    const SIZE: usize = 1024 * 1024;
+    const FRAME_CNT: usize = SIZE / PAGE_SIZE;
+
+    let mut opts = std::fs::OpenOptions::new();
+    let file = opts.read(true).custom_flags(libc::O_DIRECT).open("/xblk/test_dbs/big.moo").unwrap();
+
+    eprintln!("FILE: /xblk/test_dbs/big.moo {}", fmt_size(file.metadata().unwrap().len() as usize));
+    let mgr = StorageManager::open(FRAME_CNT, file, false).unwrap();
+
+    let mut rng = ChaCha8Rng::seed_from_u64(129940);
+
+    eprintln!("pagesize {}", fmt_size(PAGE_SIZE));
+    eprintln!("1 thread ");
+
+    const LEN: usize = 5;
+    const BATCHES: usize = 8;
+    eprintln!("RANDOM {} batches of len-{} prefixes", LEN, BATCHES);
+
+    let tx = mgr.read_tx();
+    let mut cursor = Btree::from_pgid(tx.get_catalog_root_pgid()).cursor();
+
+    loop {
+        let mut key = [0u8; LEN];
+        rfill(&mut key, &mut rng);
+        let start = Instant::now();
+        cursor.seek(&tx, &key).unwrap();
+        eprintln!("-> Prefix: {}", unsafe { str::from_utf8_unchecked(&key) });
+
+        for i in 0..30 {
+            let x = cursor
+                .next(&tx, |key, val| Whatever { key: key.to_vec(), val: val.to_vec() })
+                .unwrap();
+
+            if let Some(res) = x {
+                if res.key[0..key.len()] != key {
+                    break;
+                }
+
+                black_box(&res);
+                eprintln!(
+                    "{:05}: {} -> {}",
+                    i,
+                    unsafe { str::from_utf8_unchecked(&res.key) },
+                    unsafe { str::from_utf8_unchecked(&res.val) }
+                );
+            }
+        }
+        let end = Instant::now();
+        eprintln!("took {:.2} ms", 1000.0 * end.duration_since(start).as_secs_f64());
+        std::thread::sleep(Duration::from_millis(500));
+    }
 }

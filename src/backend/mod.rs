@@ -4,14 +4,14 @@
 //! ▄▀▀▀█▄ ▐█.▪ ▄█▀▄ ▐▀▀▄ ▄█▀▀█ ▄█ ▀█▄▐▀▀▪▄
 //! ▐█▄▪▐█ ▐█▌·▐█▌.▐▌▐█•█▌▐█ ▪▐▌▐█▄▪▐█▐█▄▄▌
 //!  ▀▀▀▀  ▀▀▀  ▀█▄▀▪.▀  ▀ ▀  ▀ ·▀▀▀▀  ▀▀▀
-mod btree;
+pub mod btree;
 mod frame_latch;
 mod heap;
 pub(crate) mod page_btree;
 mod page_heap;
 mod page_superblock;
 pub(crate) mod serialization;
-mod storage_manager;
+pub mod storage_manager;
 
 #[cfg(test)]
 mod test;
@@ -19,8 +19,8 @@ mod test;
 use xxhash_rust::xxh3::xxh3_64;
 
 use crate::{backend::serialization::CHECKSUM_START_OFFSET, mooo_assert};
-pub(crate) use btree::*;
-pub(crate) use storage_manager::*;
+// pub(crate) use btree::*;
+use storage_manager::*;
 
 /// PAGE_SIZE maybe be inclusively from 256-32KiB, and must be a power of two
 const PAGE_SIZE: usize = 0x1000;
