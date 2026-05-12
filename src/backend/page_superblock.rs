@@ -16,6 +16,7 @@ pub(super) struct SuperblockHeader {
 
 pub(super) const PGTYPE_SUPERBLOCK: SerializedU64 = SerializedU64(*b"\0SupaBlk");
 
+// SAFETY see note in serialization.rs
 unsafe impl Serialized for SuperblockHeader {}
 
 impl std::ops::Deref for SuperblockHeader {

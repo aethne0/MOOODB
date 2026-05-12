@@ -40,3 +40,7 @@ pub mod util;
 
 pub mod assert;
 pub mod backend;
+
+// TODO
+// could rx superblock acquisition just be a Atomicu8 with value 0 or 1 ? This should be safe
+// because we have only 1 writer

@@ -275,7 +275,7 @@ fn insertoid() {
     const KEY_SIZE: usize = 128;
     const VAL_MASK: u64 = 0xffff_0000_0000_ffff;
 
-    const TX_CNT: usize = 10_000;
+    const TX_CNT: usize = 1_000;
     const INSERTS_PER_TX: usize = 100;
     const _CNT: usize = TX_CNT * INSERTS_PER_TX;
 
@@ -362,7 +362,7 @@ fn readbig() {
 
         let mgr = StorageManager::open(FRAME_CNT, file, false).unwrap();
 
-        let to_look = THREADS * 2_000_0 / threads;
+        let to_look = THREADS * 20_000 / threads;
         let bar_1 = std::sync::Barrier::new(threads);
 
         let atom = AtomicU64::new(0);

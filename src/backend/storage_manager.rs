@@ -71,6 +71,9 @@ pub struct StorageManager {
     pub(crate) stats: Stats,
 }
 
+// SAFETY: The only non-Sync field is `pages` (UnsafeCell). `pages[i]` is only ever accessed
+// after acquiring `frames[i].latch` — exclusively for `&mut` (`latch_try_write`) and shared for `&`
+// (`latch_read_and_check`). `WrHdl`/`RdHdl` hold the guard, bounding the reference lifetime.
 unsafe impl Sync for StorageManager {}
 
 impl StorageManager {
@@ -436,14 +439,14 @@ impl StorageManager {
                     dir.insert(pgid, whdl.frame.index);
                     drop(dir);
 
-                    // frame is dirty so we have to write out we do this while the frame is still in
-                    // the old dir, because if we remove it before hand the following race can
-                    // happen
+                    // frame is dirty so we have to write out. We do this while the frame is still
+                    // in the old dir, because if we remove it before hand the following race can
+                    // happen:
                     //
                     // 1. we (thread A) remove it from dir
                     // 2. thread B wants the page, looks in dir, doesnt find it
                     // 3. thread B tries to load off disk -> We havent written it out yet though, so
-                    //    theyll load non-existent/stale data.
+                    //    they'll load non-existent/stale data.
                     //
                     // We need thread B to wait on our loading lock instead, and then see the frame
                     // has been evicted, and THEN load it in (because well then have written it out)
@@ -578,7 +581,7 @@ impl FrameHeader {
 // ------------ WrHdl ------------------------------------------------------------------------------
 
 /// Exclusive frame write-handle
-pub(crate) struct WrHdl<'pager> {
+pub struct WrHdl<'pager> {
     pub(super) buf: &'pager mut [u8; PAGE_SIZE],
     frame:          &'pager FrameHeader,
     frame_inner:    LatchWriteGuard<'pager, FrameInner>,
@@ -666,18 +669,20 @@ pub trait PageReader<'tx> {
     fn get_page_read(&self, pgid: u64) -> Result<RdHdl<'tx>, PagerErr>;
 }
 
-pub(crate) trait PageWriter<'tx> {
-    /// This will give a writeable page from a requested `pgid`, which can mean one of two things
-    /// - This `pgid` is from a prev tx, in which case we will copy `pgid`'s frame's contents
-    ///    to a new page, and return that new page
-    /// - This `pgid` is from the current tx, in which case well return that `pgid`'s frame
+pub trait PageWriter<'tx> {
+    /// This will give a writeable page from a requested `pgid`, which can mean one of two things:
+    /// - This `pgid` is from a prev tx, meaning it is "read only", in which case we will copy
+    ///   `pgid`'s frame's contents to a new page, and return that new page
+    /// - This `pgid` is from the current tx, in which case well return that same `pgid`
     ///
     /// This method should also handle page freeing - in the former case, when an old page is
-    /// copied, that old page should be added to any sort of free-list that the implementor
-    /// maintains. This part is optional and up to the implementor - endlessly bump-allocating and
-    /// "leaking" pages is "correct".
+    /// copied, that old page (and its ancestors) will be added to the tx's freelist, which will be
+    /// commited at the end of the tx (unless aborted).
     ///
-    /// NOTE it is the implementors job to set the `pgid` of this handed our WrHdl
+    /// Note: This does not CoW the ancestor pages!
+    ///
+    /// The returned `WrHdl` will have the *new* `pgid` either way (which may be the one that was
+    /// requested).
     fn get_page_write<'op>(&'op mut self, pgid: u64) -> Result<WrHdl<'tx>, PagerErr>;
     fn get_page_alloc<'op>(&'op mut self) -> Result<WrHdl<'tx>, PagerErr>;
     /// NOTE **drop corresponding `WrHdl`/`RdHdl` before calling this!**
@@ -688,7 +693,7 @@ pub(crate) trait PageWriter<'tx> {
 //                                         ▄▄▄▄▄▐▄• ▄     ▄▄▄  ▄▄▄ . ▄▄ • ▪  .▄▄ · ▄▄▄▄▄▄▄▄   ▄· ▄▌
 //                                         •██   █▌█▌▪    ▀▄ █·▀▄.▀·▐█ ▀ ▪██ ▐█ ▀. •██  ▀▄ █·▐█▪██▌
 //                                          ▐█.▪ ·██·     ▐▀▀▄ ▐▀▀▪▄▄█ ▀█▄▐█·▄▀▀▀█▄ ▐█.▪▐▀▀▄ ▐█▌▐█▪
-//  Thread-local Tx Registry                ▐█▌·▪▐█·█▌    ▐█•█▌▐█▄▄▌▐█▄▪▐█▐█▌▐█▄▪▐█ ▐█▌·▐█•█▌ ▐█▀·.
+//  Tx Registry                             ▐█▌·▪▐█·█▌    ▐█•█▌▐█▄▄▌▐█▄▪▐█▐█▌▐█▄▪▐█ ▐█▌·▐█•█▌ ▐█▀·.
 //                                          ▀▀▀ •▀▀ ▀▀    .▀  ▀ ▀▀▀ ·▀▀▀▀ ▀▀▀ ▀▀▀▀  ▀▀▀ .▀  ▀  ▀ •
 // -------------------------------------------------------------------------------------------------
 /// This is our mechanism for keeping track of live txs that are "relying" on a certain txid for

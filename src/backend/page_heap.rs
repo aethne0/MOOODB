@@ -24,6 +24,7 @@ pub(super) struct HeapPageHeader {
     pub(super) lower_ptr:  SerializedU16,
 }
 const _: () = mooo_assert!(size_of::<HeapPageHeader>() == PAGE_HEADER_SIZE as usize);
+// SAFETY see note in serialization.rs
 unsafe impl Serialized for HeapPageHeader {}
 
 const PGTYPE_HEAP: SerializedU64 = SerializedU64(*b"\0Heap\0\0\0");

@@ -21,8 +21,11 @@ impl<T, const LENGTH: usize> FixedArray<T, LENGTH> {
         Self { arr: [const { MaybeUninit::uninit() }; LENGTH], head: 0 }
     }
 
+    /// Allocates memory for capacity slots but does NOT initialize anything
     pub(crate) fn new_boxed() -> Box<Self> {
         unsafe {
+            // SAFETY this is only allocating memory, safety is still provided by `head` asserts on
+            // accessor methods
             let mut b: Box<MaybeUninit<Self>> = Box::new_uninit();
             let ptr = b.as_mut_ptr();
 
@@ -33,8 +36,20 @@ impl<T, const LENGTH: usize> FixedArray<T, LENGTH> {
         }
     }
 
+    pub(crate) const fn len(&self) -> usize {
+        self.head
+    }
+
     pub(crate) const fn capacity(&self) -> usize {
         LENGTH
+    }
+
+    pub(crate) const fn is_full(&self) -> bool {
+        self.head == LENGTH
+    }
+
+    pub(crate) const fn is_empty(&self) -> bool {
+        self.head == 0
     }
 
     /// drops members
@@ -86,18 +101,6 @@ impl<T, const LENGTH: usize> FixedArray<T, LENGTH> {
     pub(crate) const fn last_mut(&mut self) -> &mut T {
         mooo_assert!(self.head > 0);
         unsafe { self.arr[self.head - 1].assume_init_mut() }
-    }
-
-    pub(crate) const fn len(&self) -> usize {
-        self.head
-    }
-
-    pub(crate) const fn is_full(&self) -> bool {
-        self.head == LENGTH
-    }
-
-    pub(crate) const fn is_empty(&self) -> bool {
-        self.head == 0
     }
 
     pub(crate) const fn pop(&mut self) -> Option<T> {

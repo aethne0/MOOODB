@@ -1,11 +1,9 @@
-use std::ops::AddAssign;
-
 use super::page_btree::*;
+use super::pgid_valid;
 use super::serialization::*;
 use super::storage_manager::*;
 use super::PagerErr;
-use crate::backend::pgid_valid;
-use crate::backend::PGID_NULL;
+use super::PGID_NULL;
 use crate::collections::FixedArray;
 use crate::mooo_assert;
 
@@ -514,12 +512,12 @@ impl Btree {
             pgid_from_bytes(page_parent.key_val_slices_from_slot(slotidx_parent_to_sibling).1);
         let rhdl_sibling = tx.get_page_read(pgid_sibling)?;
 
-        let can_merge = {
+        if {
             let rhdl_sib = tx.get_page_read(pgid_sibling)?;
             let page_sib = BtreePage::from_buffer_ref(rhdl_sib.buf);
-            page.could_merge_with(&page_sib)
-        };
-        if !can_merge {
+            let can_merge_with_sib = page.could_merge_with(&page_sib);
+            !can_merge_with_sib
+        } {
             return Ok(None);
         };
 
@@ -549,12 +547,13 @@ impl Btree {
         };
         let pgid_sibling_old =
             pgid_from_bytes(page_parent.key_val_slices_from_slot(slotidx_parent_to_sibling).1);
-        let can_borrow = {
+
+        if {
             let rhdl_sib = tx.get_page_read(pgid_sibling_old)?;
             let page_sib = BtreePage::from_buffer_ref(rhdl_sib.buf);
-            page_sib.is_full_enough_without_last()
-        };
-        if !can_borrow {
+            let can_borrow_from_sib = page_sib.is_full_enough_without_last();
+            !can_borrow_from_sib
+        } {
             return Ok(None);
         };
 
@@ -636,7 +635,7 @@ impl Btree {
 //  Cursor                                                     ▐███▌▐█▄█▌▐█•█▌▐█▄▪▐█▐█▌.▐▌▐█•█▌
 //                                                             ·▀▀▀  ▀▀▀ .▀  ▀ ▀▀▀▀  ▀█▄▀▪.▀  ▀
 // ---------------------------------------------------------------------------------------------
-// NOTE: cursors do not hold any pins, pin-holding for optimization should be done at the tx level
+// NOTE cursors do not hold any pins, pin-holding for optimization should be done at the tx level
 
 #[derive(Clone)]
 pub struct Cursor {
@@ -669,10 +668,6 @@ impl<'tx> Cursor {
         self.needs_page_adv = false;
         self.is_exhausted = false;
     }
-
-    // TODO this cursor is all fucked up because we don't just initialize when its constructed, but
-    // we shouldnt really anyway because we don't want to assume the caller is going to seek the
-    // start position
 
     // TODO
     pub fn seek_first<R: PageReader<'tx>>(&mut self, tx: &R) -> Result<bool, PagerErr> {
@@ -899,7 +894,7 @@ pub(crate) struct BtreeMeta {
     pub(crate) bytes:          u64,
 }
 
-impl AddAssign for BtreeMeta {
+impl std::ops::AddAssign for BtreeMeta {
     fn add_assign(&mut self, rhs: Self) {
         self.page_cnt_total += rhs.page_cnt_total;
         self.page_cnt_leaf += rhs.page_cnt_leaf;
